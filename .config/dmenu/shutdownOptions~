@@ -1,0 +1,3 @@
+shutdown now
+restart now
+pkill -u franzs

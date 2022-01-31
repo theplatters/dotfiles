@@ -48,6 +48,7 @@ set $reboot sudo -A reboot
 set $lock i3lock
 set $suspend sudo systemctl suspend
 set $hibernate sudo -A systemctl hibernate
+set $ds ~/.config/dmenu
 
 # #---Gaps---# #
 for_window [class="^.*"] border pixel 1
@@ -212,9 +213,9 @@ client.focused #657b83 #657b83 #657b83 #657b83
 
 # #-----Bindings-----# #
 
-bindsym $mod+Shift+s exec "/usr/local/bin/dmenu_scripts/prompt.sh 'Shutdown?' 'shutdown now'"
-bindsym $mod+Control+s exec "/usr/local/bin/dmenu_scripts/executeFromFile.sh /usr/local/bin/dmenu_scripts/shutdownOptions 'Do'"
-bindsym $mod+Shift+f exec --no-startup-id "/usr/local/bin/dmenu_scripts/fromFile.sh /usr/local/bin/dmenu_scripts/urls 'Open: ' 'firefox'"
+bindsym $mod+Shift+s exec "$ds/prompt.sh 'Shutdown?' 'shutdown now'"
+bindsym $mod+Control+s exec "$ds/executeFromFile.sh ~/.config/dmenu/shutdownOptions 'Do'"
+bindsym $mod+Shift+f exec --no-startup-id "$ds/fromFile.sh $ds/urls 'Open ' 'firefox'"
 bindsym $mod+Control+f exec firefox
 #bindsym $mod+Control+e exec 
 bindsym $mod+Shift+t exec "pkill compton"
