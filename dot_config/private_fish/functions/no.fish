@@ -1,3 +1,7 @@
 function no
-    nvim $(fd $argv | fzf --preview "cat {}")
+    set file (fd $argv | fzf --preview "cat {}")
+    if test -n $file
+        cd (dirname $file)
+        nvim (basename $file)
+    end
 end
