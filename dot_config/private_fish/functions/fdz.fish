@@ -1,11 +1,5 @@
 function fdz
-    set file (fd . $argv | fzf \
-        --preview "bat --style=numbers --color=always {} || cat {}" \
-        --bind "change:reload:(fd . $argv; rg --files-with-matches --no-messages {q}) | sort -u || true" \
-        --query "" \
-        --phony \
-        --preview-window=right:60%)
-
+    set file (fd . $argv | fzf --preview "bat --style=numbers --color=always {} || cat {}" --bind "ctrl-f:reload:rg --files-with-matches --no-messages {q} || true" --phony --query "")
     if test -d $file
         cd $file
     else
