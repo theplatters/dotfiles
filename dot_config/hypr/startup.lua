@@ -1,0 +1,6 @@
+hl.on("hyprland.start", function()
+	hl.exec_cmd(TERMINAL)
+	hl.exec_cmd("quickshell & hyprpaper & nm-applet")
+	hl.exec_cmd("evolution")
+	hl.exec_cmd("wl-paste --watch cliphist store")
+end)
