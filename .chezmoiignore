@@ -1,0 +1,40 @@
+# .chezmoiignore – global ignores (patterns match TARGET paths, not source paths)
+# See https://www.chezmoi.io/reference/special-files/chezmoiignore/
+# This file itself is a template; `#` starts a comment (must be preceded by whitespace if not at line start).
+
+# --- VCS internals: never version nested repos (e.g. quickshell/.git, kitty-themes/.git) ---
+**/.git
+**/.git/**
+
+# --- Node.js: reinstall via package.json / bun.lock, never vendor ---
+**/node_modules
+**/node_modules/**
+
+# --- Python caches ---
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.pytest_cache/**
+**/.mypy_cache
+**/.mypy_cache/**
+**/.ruff_cache
+**/.ruff_cache/**
+
+# --- Rust / Cargo build outputs ---
+**/target
+**/target/**
+
+# --- Virtualenvs ---
+**/.venv
+**/.venv/**
+**/venv
+**/venv/**
+
+# --- Editors / OS / backups ---
+**/.DS_Store
+**/*.swp
+**/*.swo
+**/*~
+**/*.bak

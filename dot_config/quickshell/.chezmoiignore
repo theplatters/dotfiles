@@ -1,0 +1,14 @@
+# Quickshell dev artifacts – kept on disk, not versioned in dotfiles.
+# Scoped to .config/quickshell (this file only applies to this subdirectory).
+# Global ** patterns in the top-level .chezmoiignore already cover these;
+# listed here explicitly so `chezmoi ignored` is self-documenting per project.
+
+.config/quickshell/.git
+.config/quickshell/.git/**
+.config/quickshell/.pytest_cache
+.config/quickshell/.pytest_cache/**
+.config/quickshell/**/target
+.config/quickshell/**/target/**
+.config/quickshell/**/__pycache__
+.config/quickshell/**/__pycache__/**
+.config/quickshell/**/*.pyc

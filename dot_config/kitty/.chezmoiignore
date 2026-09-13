@@ -1,0 +1,6 @@
+# kitty vendored themes – don't version the nested upstream git repo.
+# Scoped to .config/kitty (this file only applies to this subdirectory).
+# Theme files themselves stay managed; only the nested .git is excluded.
+
+.config/kitty/kitty-themes/.git
+.config/kitty/kitty-themes/.git/**

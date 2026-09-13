@@ -1,0 +1,5 @@
+# opencode deps – reinstall via package.json / bun.lock, never vendor.
+# Scoped to .config/opencode (this file only applies to this subdirectory).
+
+.config/opencode/node_modules
+.config/opencode/node_modules/**
