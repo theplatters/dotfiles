@@ -163,6 +163,7 @@ PanelWindow {
                         Text {
                             text: "󰅖"
                             color: Theme.red
+                            font.family: Theme.iconFontFamily
                             font.pixelSize: 14
                             MouseArea {
                                 anchors.fill: parent

@@ -245,6 +245,7 @@ Rectangle {
                         Text {
                             text: "󰃭"
                             color: Theme.text
+                            font.family: Theme.iconFontFamily
                             font.pixelSize: 14
                             anchors.verticalCenter: parent.verticalCenter
                         }
@@ -358,6 +359,7 @@ Rectangle {
                             anchors.centerIn: parent
                             text: "󰝚"
                             color: Theme.subtext1
+                            font.family: Theme.iconFontFamily
                             font.pixelSize: 14
                         }
                         MouseArea {

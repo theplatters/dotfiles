@@ -156,6 +156,7 @@ Item {
                         anchors.centerIn: parent
                         text: modelData.icon
                         color: isFocused ? Theme.base : (specBtn.hovered ? Theme.text : (isActive ? Theme.text : Theme.surface2))
+                        font.family: Theme.iconFontFamily
                         font.pixelSize: 14
                         font.bold: isFocused
                         

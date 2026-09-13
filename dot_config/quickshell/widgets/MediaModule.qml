@@ -53,6 +53,7 @@ Item {
         Text {
             text: "󰝚"
             color: Theme.subtext1
+            font.family: Theme.iconFontFamily
             font.pixelSize: 14
             anchors.verticalCenter: parent.verticalCenter
         }
@@ -85,6 +86,7 @@ Item {
             Text {
                 text: "󰒮"
                 color: root.activePlayer && root.activePlayer.canGoPrevious ? Theme.text : Theme.surface2
+                font.family: Theme.iconFontFamily
                 font.pixelSize: 16
                 anchors.verticalCenter: parent.verticalCenter
 
@@ -99,6 +101,7 @@ Item {
             Text {
                 text: root.activePlayer && root.activePlayer.isPlaying ? "󰏤" : "󰐊"
                 color: root.activePlayer && root.activePlayer.canTogglePlaying ? Theme.text : Theme.surface2
+                font.family: Theme.iconFontFamily
                 font.pixelSize: 16
                 anchors.verticalCenter: parent.verticalCenter
 
@@ -113,6 +116,7 @@ Item {
             Text {
                 text: "󰒭"
                 color: root.activePlayer && root.activePlayer.canGoNext ? Theme.text : Theme.surface2
+                font.family: Theme.iconFontFamily
                 font.pixelSize: 16
                 anchors.verticalCenter: parent.verticalCenter
 

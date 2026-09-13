@@ -16,6 +16,7 @@ Rectangle {
         anchors.centerIn: parent
         text: "󰹑"
         color: Theme.subtext1
+        font.family: Theme.iconFontFamily
         font.pixelSize: 18
     }
 

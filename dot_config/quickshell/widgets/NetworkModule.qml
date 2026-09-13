@@ -71,6 +71,7 @@ Item {
         Text {
             id: wifiIcon
             color: Theme.subtext1
+            font.family: Theme.iconFontFamily
             font.pixelSize: 14
             anchors.verticalCenter: parent.verticalCenter
             text: root.connectionType === "ethernet" ? "󰈀" : root.wifiIcon(root.signalStrength)
@@ -90,6 +91,7 @@ Item {
         Text {
             id: btIcon
             color: Theme.subtext1
+            font.family: Theme.iconFontFamily
             font.pixelSize: 13
             anchors.verticalCenter: parent.verticalCenter
             text: root.bluetoothEnabled ? "󰂯" : "󰂲"

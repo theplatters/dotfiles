@@ -35,6 +35,20 @@ QtObject {
 
     readonly property string fontFamily: Qt.fontFamilies().indexOf("Inter") >= 0 ? "Inter" : "Noto Sans"
     readonly property string fallbackFontFamily: "Noto Sans"
+    // Icon glyphs (audio/network/battery/media/etc.) live in the Unicode
+    // Private Use Area and are only provided by Nerd Fonts. PUA codepoints
+    // never fall back automatically, so icon Text items must set
+    // font.family: Theme.iconFontFamily explicitly — installing the font
+    // alone is not enough.
+    readonly property string iconFontFamily: {
+        var fams = Qt.fontFamilies();
+        var prefs = ["Symbols Nerd Font", "JetBrainsMono Nerd Font", "BlexMono Nerd Font", "BlexMono Nerd Font Mono", "BlexMono Nerd Font Propo", "CaskaydiaCove Nerd Font", "FiraCode Nerd Font"];
+        for (var i = 0; i < prefs.length; ++i) {
+            if (fams.indexOf(prefs[i]) >= 0)
+                return prefs[i];
+        }
+        return "Noto Sans";
+    }
     readonly property int controlRadius: 12
     readonly property int cardRadius: 16
     readonly property int largeRadius: 20

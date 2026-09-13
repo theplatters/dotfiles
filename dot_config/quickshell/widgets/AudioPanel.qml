@@ -108,6 +108,7 @@ Item {
             Text {
                 text: root.defaultSink && root.defaultSink.audio && root.defaultSink.audio.muted ? "󰝟" : "󰕾"
                 color: root.defaultSink && root.defaultSink.audio && root.defaultSink.audio.muted ? Theme.red : Theme.subtext1
+                font.family: Theme.iconFontFamily
                 font.pixelSize: 18
             }
         }
@@ -198,6 +199,7 @@ Item {
                         Text {
                             text: audioRow.streamNode ? "󰝚" : (modelData.isSink ? "󰓃" : "󰍬")
                             color: Theme.text
+                            font.family: Theme.iconFontFamily
                             font.pixelSize: 16
                             Layout.alignment: Qt.AlignVCenter
                         }
@@ -264,6 +266,7 @@ Item {
                         Text {
                             text: audioRow.muted ? "󰝟" : "󰕾"
                             color: audioRow.muted ? Theme.red : Theme.text
+                            font.family: Theme.iconFontFamily
                             font.pixelSize: 14
 
                             MouseArea {

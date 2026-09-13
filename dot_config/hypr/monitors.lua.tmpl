@@ -1,0 +1,28 @@
+{{- /* Per-host monitor layout managed by chezmoi.
+     - archlinux (desktop): DP-1 landscape + DP-2 vertical (transform 3 = 270°)
+     - default/laptop: eDP-1 internal panel
+*/ -}}
+{{- if eq .chezmoi.hostname "archlinux" -}}
+hl.monitor({
+	output = "DP-1",
+	mode = "2560x1440@144.00",
+	position = "0x0",
+	scale = 1,
+})
+
+-- Second monitor, vertical/portrait (270°)
+hl.monitor({
+	output = "DP-2",
+	mode = "2560x1440@59.95",
+	position = "2560x0",
+	scale = 1,
+	transform = 3,
+})
+{{- else -}}
+hl.monitor({
+	output = "eDP-1",
+	mode = "1920x1080@60.00100",
+	position = "0x0",
+	scale = 1.2,
+})
+{{- end }}

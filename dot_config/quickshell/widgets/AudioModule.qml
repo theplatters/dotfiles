@@ -32,6 +32,7 @@ Item {
         Text {
             id: iconText
             color: root.isMuted ? Theme.red : Theme.accentMuted
+            font.family: Theme.iconFontFamily
             font.pixelSize: 14
             anchors.verticalCenter: parent.verticalCenter
             text: {

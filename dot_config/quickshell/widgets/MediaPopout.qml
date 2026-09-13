@@ -158,6 +158,7 @@ PopupWindow {
                     visible: root.selectedPlayer && root.selectedPlayer.canRaise
                     text: "󰍉"
                     color: Theme.subtext1
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 15
 
                     MouseArea {
@@ -171,6 +172,7 @@ PopupWindow {
                     visible: root.selectedPlayer && root.selectedPlayer.canQuit
                     text: "󰅖"
                     color: Theme.red
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 15
 
                     MouseArea {
@@ -243,6 +245,7 @@ PopupWindow {
                         anchors.centerIn: parent
                         text: "󰝚"
                         color: Theme.subtext1
+                        font.family: Theme.iconFontFamily
                         font.pixelSize: 36
                         visible: root.artUrl(root.selectedPlayer) === ""
                     }
@@ -332,6 +335,7 @@ PopupWindow {
                 Text {
                     text: "󰒮"
                     color: root.selectedPlayer && root.selectedPlayer.canGoPrevious ? Theme.text : Theme.surface2
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 22
 
                     MouseArea {
@@ -345,6 +349,7 @@ PopupWindow {
                 Text {
                     text: root.selectedPlayer && root.selectedPlayer.isPlaying ? "󰏤" : "󰐊"
                     color: root.selectedPlayer && root.selectedPlayer.canTogglePlaying ? Theme.text : Theme.surface2
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 26
 
                     MouseArea {
@@ -358,6 +363,7 @@ PopupWindow {
                 Text {
                     text: "󰒭"
                     color: root.selectedPlayer && root.selectedPlayer.canGoNext ? Theme.text : Theme.surface2
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 22
 
                     MouseArea {
@@ -379,6 +385,7 @@ PopupWindow {
                 Text {
                     text: "󰕾"
                     color: Theme.text
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 13
                     visible: root.selectedPlayer && root.selectedPlayer.volumeSupported
                 }

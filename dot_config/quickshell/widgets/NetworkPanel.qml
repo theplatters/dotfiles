@@ -534,6 +534,7 @@ Item {
                 Text {
                     text: "󰈀"
                     color: root.wiredDevice && root.wiredDevice.connected ? Theme.green : Theme.subtext0
+                    font.family: Theme.iconFontFamily
                     font.pixelSize: 17
                 }
 
@@ -619,6 +620,7 @@ Item {
                     Text {
                         text: networkRow.busy ? "󰤫" : root.signalIcon(modelData?.signalStrength ?? 0)
                         color: networkRow.active ? Theme.text : Theme.subtext1
+                        font.family: Theme.iconFontFamily
                         font.pixelSize: 16
                     }
 
@@ -648,6 +650,7 @@ Item {
                     Text {
                         text: networkRow.protectedNetwork ? "󰌾" : ""
                         color: Theme.subtext1
+                        font.family: Theme.iconFontFamily
                         font.pixelSize: 12
                         visible: networkRow.protectedNetwork
                     }
@@ -727,6 +730,7 @@ Item {
                     Text {
                         text: bluetoothRow.busy ? "󰂱" : root.bluetoothIcon(modelData)
                         color: modelData.connected ? Theme.text : Theme.subtext1
+                        font.family: Theme.iconFontFamily
                         font.pixelSize: 16
                     }
 
@@ -759,6 +763,7 @@ Item {
                     Text {
                         text: modelData.trusted ? "󰓎" : ""
                         color: Theme.subtext1
+                        font.family: Theme.iconFontFamily
                         font.pixelSize: 12
                         visible: modelData.trusted
                     }

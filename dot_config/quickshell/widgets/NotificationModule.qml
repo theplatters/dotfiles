@@ -79,6 +79,7 @@ Item {
             anchors.centerIn: parent
             text: "󰂚"
             color: notifModel.count > 0 ? Theme.text : Theme.subtext1
+            font.family: Theme.iconFontFamily
             font.pixelSize: 18
         }
         

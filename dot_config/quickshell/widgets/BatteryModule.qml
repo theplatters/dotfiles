@@ -46,6 +46,7 @@ Item {
 
         Text {
             color: Theme.subtext1
+            font.family: Theme.iconFontFamily
             font.pixelSize: 14
             anchors.verticalCenter: parent.verticalCenter
             text: {
