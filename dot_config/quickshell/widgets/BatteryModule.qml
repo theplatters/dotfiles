@@ -1,15 +1,43 @@
 import QtQuick
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Services.UPower
 import "../theme"
 
 Item {
     id: root
-    width: layout.implicitWidth
-    height: layout.implicitHeight
+    implicitWidth: layout.implicitWidth
+    implicitHeight: layout.implicitHeight
+    width: implicitWidth
+    height: implicitHeight
 
-    readonly property real percentage: UPower.displayDevice.percentage
+    property bool compact: false
+    property var batteryPopup: null
+    property var controlCenter: null
+    property bool hovered: mouseArea.containsMouse
+    
+    readonly property real percentage: UPower.displayDevice.percentage * 100
     readonly property int state: UPower.displayDevice.state // 1: Charging, 2: Discharging
+    
+    readonly property string timeRemaining: {
+        let seconds = 0;
+        if (root.state === 1) {
+            seconds = UPower.displayDevice.timeToFull;
+        } else if (root.state === 2) {
+            seconds = UPower.displayDevice.timeToEmpty;
+        }
+        
+        if (seconds <= 0) return "";
+        
+        let hours = Math.floor(seconds / 3600);
+        let minutes = Math.floor((seconds % 3600) / 60);
+        
+        if (hours > 0) {
+            return hours + "h " + minutes + "m";
+        } else {
+            return minutes + "m";
+        }
+    }
 
     Row {
         id: layout
@@ -17,7 +45,7 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
-            color: Theme.green
+            color: Theme.subtext1
             font.pixelSize: 14
             anchors.verticalCenter: parent.verticalCenter
             text: {
@@ -41,13 +69,24 @@ Item {
         }
 
         Text {
-            color: Theme.green
+            visible: !root.compact
+            color: Theme.text
             font.pixelSize: 12
             anchors.verticalCenter: parent.verticalCenter
             text: {
                 if (!UPower.displayDevice.ready) return "..."
                 return Math.round(root.percentage) + "%"
             }
+        }
+    }
+
+    MouseArea {
+        id: mouseArea
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+            if (root.controlCenter) root.controlCenter.toggleSection(3);
         }
     }
 }

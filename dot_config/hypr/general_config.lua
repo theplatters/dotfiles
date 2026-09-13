@@ -1,17 +1,11 @@
 hl.config({
 	general = {
-		gaps_in = 5,
-		gaps_out = 10,
-		border_size = 2,
+		gaps_in = 8,
+		gaps_out = 16,
+		border_size = 1,
 		col = {
-			active_border = {
-				colors = {
-					"rgba(33ccffee)",
-					"rgba(00ff99ee)",
-				},
-				angle = 45,
-			},
-			inactive_border = "rgba(595959aa)",
+			active_border = "rgba(1D1D1Dff)",
+			inactive_border = "rgba(ffffff1f)",
 		},
 		-- Set to true to enable resizing windows by clicking and dragging on borders and gaps
 		resize_on_border = false,
@@ -22,7 +16,7 @@ hl.config({
 		layout = "dwindle",
 	},
 	decoration = {
-		rounding = 10,
+		rounding = 16,
 		rounding_power = 2,
 
 		-- Change transparency of focused and unfocused windows
@@ -31,21 +25,26 @@ hl.config({
 
 		shadow = {
 			enabled = true,
-			range = 4,
-			render_power = 3,
-			color = 0xee1a1a1a,
+			range = 20,
+			render_power = 2,
+			color = 0x55000000,
 		},
 
 		blur = {
-			enabled = true,
-			size = 3,
-			passes = 1,
-			vibrancy = 0.1696,
+			enabled = false,
+		},
+
+		glow = {
+			enabled = false,
 		},
 	},
 
 	animations = {
 		enabled = true,
+	},
+	misc = {
+		force_default_wallpaper = 0,
+		disable_hyprland_logo = true,
 	},
 })
 

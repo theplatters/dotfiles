@@ -9,11 +9,12 @@ hl.bind(mainMod .. " + E", hl.dsp.exec_cmd(FILEMANAGER))
 hl.bind(mainMod .. " +SHIFT +  E", hl.dsp.exec_cmd(EMOJI))
 hl.bind(mainMod .. " + V", hl.dsp.window.float({ action = "toggle" }))
 hl.bind(mainMod .. " + R", hl.dsp.exec_cmd(MENU))
+hl.bind(mainMod .. " + SPACE", hl.dsp.global("quickshell:commandPalette"))
 hl.bind(mainMod .. " + P", hl.dsp.window.pseudo())
 hl.bind(mainMod .. " + J", hl.dsp.layout("togglesplit")) -- dwindle only
 hl.bind(mainMod .. " + B", hl.dsp.exec_cmd(BROWSER))
 hl.bind(mainMod .. " + F", hl.dsp.window.fullscreen({ action = "toggle" }))
-hl.bind(mainMod .. " + Q", hl.dsp.window.kill())
+hl.bind(mainMod .. " + Q", hl.dsp.window.close())
 hl.bind(mainMod .. " + C", hl.dsp.global("quickshell:clipboard"))
 -- Move focus with mainMod + arrow keys
 hl.bind(mainMod .. " + left", hl.dsp.focus({ direction = "left" }))
@@ -35,7 +36,7 @@ hl.bind(mainMod .. " + SHIFT + S", hl.dsp.window.move({ workspace = "special:mag
 
 -- Evolution magic workspace
 hl.bind(mainMod .. " + L", hl.dsp.workspace.toggle_special("evolution"))
-hl.bind(mainMod .. " + SHIFT + L", hl.dsp.window.move({ workspace = "special:evolution" }))
+hl.bind(mainMod .. " + N", hl.dsp.workspace.toggle_special("journal"))
 
 -- Scroll through existing workspaces with mainMod + scroll
 hl.bind(mainMod .. " + mouse_down", hl.dsp.focus({ workspace = "e+1" }))

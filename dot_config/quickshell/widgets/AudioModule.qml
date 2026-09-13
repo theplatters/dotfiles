@@ -5,20 +5,24 @@ import "../theme"
 
 Item {
     id: root
-    width: layout.implicitWidth
-    height: layout.implicitHeight
+    implicitWidth: layout.implicitWidth
+    implicitHeight: layout.implicitHeight
+    width: implicitWidth
+    height: implicitHeight
+    
+    readonly property var sink: Pipewire.defaultAudioSink
 
-    property var sink: Pipewire.defaultAudioSink
-
-    // Track the default sink to get volume updates
     PwObjectTracker {
         objects: [root.sink]
     }
 
-    readonly property bool isMuted: root.sink?.audio?.muted ?? false
-    readonly property real volume: root.sink?.audio?.volume ?? 0
+    readonly property bool hasSink: !!root.sink && !!root.sink.audio
+    readonly property bool isMuted: root.hasSink && root.sink.audio.muted
+    readonly property real volume: root.hasSink ? root.sink.audio.volume : 0
 
     property var audioPopup: null
+    property var controlCenter: null
+    property bool hovered: false
 
     Row {
         id: layout
@@ -27,7 +31,7 @@ Item {
 
         Text {
             id: iconText
-            color: root.isMuted ? Theme.red : Theme.pink
+            color: root.isMuted ? Theme.red : Theme.accentMuted
             font.pixelSize: 14
             anchors.verticalCenter: parent.verticalCenter
             text: {
@@ -42,34 +46,32 @@ Item {
             
             Behavior on scale {
                 NumberAnimation {
-                    duration: 200
-                    easing.type: Easing.OutBack
+                    duration: Theme.motionPanel
+                    easing.type: Easing.OutCubic
                 }
             }
 
             Behavior on color {
-                ColorAnimation { duration: 200 }
+                ColorAnimation { duration: Theme.motionPanel }
             }
         }
 
         Text {
-            color: root.isMuted ? Theme.subtext0 : Theme.pink
+            color: root.isMuted ? Theme.subtext0 : Theme.text
             font.pixelSize: 12
             anchors.verticalCenter: parent.verticalCenter
-            text: root.isMuted ? "Muted" : Math.round(root.volume * 100) + "%"
+            text: root.hasSink ? (root.isMuted ? "Muted" : Math.round(root.volume * 100) + "%") : "No audio"
             opacity: root.isMuted ? 0.7 : 1.0
 
             Behavior on opacity {
-                NumberAnimation { duration: 200 }
+                NumberAnimation { duration: Theme.motionPanel }
             }
 
             Behavior on color {
-                ColorAnimation { duration: 200 }
+                ColorAnimation { duration: Theme.motionPanel }
             }
         }
     }
-
-    property bool hovered: false
 
     MouseArea {
         anchors.fill: parent
@@ -79,15 +81,16 @@ Item {
         onExited: root.hovered = false
         onClicked: (mouse) => {
             if (mouse.button === Qt.RightButton) {
-                if (root.audioPopup) root.audioPopup.toggle(audioContainer);
+                if (root.controlCenter) root.controlCenter.toggleSection(0);
+                else if (root.audioPopup) root.audioPopup.toggle(parent);
             } else {
-                if (root.sink?.audio) {
+                if (root.hasSink) {
                     root.sink.audio.muted = !root.sink.audio.muted;
                 }
             }
         }
         onWheel: (wheel) => {
-            if (root.sink?.audio) {
+            if (root.hasSink) {
                 let delta = wheel.angleDelta.y > 0 ? 0.02 : -0.02;
                 root.sink.audio.volume = Math.max(0, Math.min(1, root.sink.audio.volume + delta));
             }

@@ -1,14 +1,6 @@
 hl.monitor({
-	output = "DP-1",
-	mode = "2560x1440@144.00",
+	output = "eDP-1",
+	mode = "1920x1080@60.00100",
 	position = "0x0",
-	scale = 1,
-})
-
-hl.monitor({
-	output = "DP-2",
-	mode = "2560x1440@59.95",
-	position = "2560x0",
-	scale = 1,
-	transform = 3,
+	scale = 1.2,
 })

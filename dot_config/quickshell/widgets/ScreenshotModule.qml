@@ -7,13 +7,15 @@ Rectangle {
     id: root
     height: 32
     width: 32
-    radius: Theme.radius
+    radius: Theme.controlRadius
+    border.color: Theme.border
+    border.width: 1
     color: Theme.mantle
 
     Text {
         anchors.centerIn: parent
         text: "󰹑"
-        color: Theme.blue
+        color: Theme.subtext1
         font.pixelSize: 18
     }
 

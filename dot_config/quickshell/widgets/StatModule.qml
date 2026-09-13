@@ -5,28 +5,35 @@ import "../theme"
 
 Item {
     id: root
+    implicitWidth: layout.implicitWidth
+    implicitHeight: layout.implicitHeight
+    width: implicitWidth
+    height: implicitHeight
+    
     property string label: ""
     property var command: []
     property int interval: 5000
     property color textColor: Theme.text
+    property bool compact: false
     
-    width: layout.implicitWidth
-    height: layout.implicitHeight
-
     Row {
         id: layout
         spacing: 5
         anchors.verticalCenter: parent.verticalCenter
+
         Text {
+            visible: !root.compact
             text: root.label
             color: root.textColor
             font.pixelSize: 12
+            anchors.verticalCenter: parent.verticalCenter
         }
         Text {
             id: valueText
             text: "..."
             color: root.textColor
             font.pixelSize: 12
+            anchors.verticalCenter: parent.verticalCenter
         }
     }
 

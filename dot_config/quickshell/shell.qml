@@ -5,22 +5,32 @@ import Quickshell.Wayland
 import Quickshell.Hyprland
 import Quickshell.Services.Notifications
 import "./widgets"
-import "./sidebar"
 
 ShellRoot {
     NotificationServer {
         id: notifServer
+        property bool inhibit: false
         actionsSupported: true
         bodyMarkupSupported: true
     }
 
-    Sidebar {
-        id: sideMenu
+    PasswordPopup {
+        id: passwordPopup
     }
 
-    GlobalShortcut {
-        name: "clipboard"
-        onPressed: sideMenu.showTab(3)
+    CommandPalette {
+        id: commandPalette
+    }
+
+    ProjectPlanner {
+        id: projectPlanner
+    }
+
+    Connections {
+        target: commandPalette
+        function onProjectPlanningRequested() {
+            projectPlanner.open()
+        }
     }
 
     PanelWindow {
@@ -34,14 +44,19 @@ ShellRoot {
         implicitHeight: 40
         
         // Exclude from layout so windows don't overlap it
-        exclusionMode: ExclusionMode.Exclusive
+        exclusionMode: ExclusionMode.Auto
         
         MediaPopout {
             id: mediaPopout
         }
 
-        AudioPopup {
-            id: audioPopup
+        ControlCenter {
+            id: controlCenter
+            anchorItem: bar.trayAnchor
+            trayScope: bar
+            barWindow: barWindow
+            notifServer: notifServer
+            passwordPopup: passwordPopup
         }
 
         NotificationPopout {
@@ -49,10 +64,10 @@ ShellRoot {
         }
 
         Bar {
+            id: bar
             notifServer: notifServer
             mediaPopout: mediaPopout
-            audioPopup: audioPopup
-            onToggleSidebar: sideMenu.toggle()
+            controlCenter: controlCenter
         }
     }
 }

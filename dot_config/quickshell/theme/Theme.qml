@@ -1,20 +1,51 @@
 pragma Singleton
+
 import QtQuick
 
 QtObject {
-    readonly property color bg: "transparent"
-    readonly property color base: "#24273a"
-    readonly property color mantle: "#1e2030"
-    readonly property color surface0: "#292b2e"
-    readonly property color text: "#cad3f5"
-    
-    readonly property color red: "#ed8796"
-    readonly property color green: "#a6da95"
-    readonly property color mauve: "#c6a0f6"
-    readonly property color teal: "#8bd5ca"
-    readonly property color pink: "#f5bde6"
-    readonly property color blue: "#268bd2"
-    readonly property color base3: "#fdf6e3"
+    // Rich-black hierarchy. Keep all surfaces here so modules do not invent
+    // their own shades (and so the bar remains readable on OLED displays).
+    //
+    readonly property color transparent: "#07070700"
+    readonly property color bg: "#070707"
+    readonly property color base: "#0C0C0C"
+    readonly property color mantle: "#111111"
+    readonly property color surface0: "#161616"
+    readonly property color surface1: "#1D1D1D"
+    readonly property color surface2: "#262626"
 
-    readonly property int radius: 16
+    readonly property color text: "#F5F5F5"
+    readonly property color subtext1: "#A1A1A1"
+    readonly property color subtext0: "#6F6F6F"
+
+    readonly property color border: "#1D1D1D"
+    readonly property color focusBorder: "#33F5F5F5"
+    readonly property color accent: "#D6D6D6"
+    readonly property color accentMuted: "#969696"
+
+    // Compatibility aliases for modules that use semantic state colors. They
+    // are intentionally muted so ordinary controls stay monochrome.
+    readonly property color red: "#C59D9D"
+    readonly property color green: "#A8B6A4"
+    readonly property color mauve: "#C8C8C8"
+    readonly property color teal: "#A8B8B8"
+    readonly property color pink: "#BDBDBD"
+    readonly property color blue: "#AAB3BD"
+    readonly property color base3: "#F5F5F5"
+
+    readonly property string fontFamily: Qt.fontFamilies().indexOf("Inter") >= 0 ? "Inter" : "Noto Sans"
+    readonly property string fallbackFontFamily: "Noto Sans"
+    readonly property int controlRadius: 12
+    readonly property int cardRadius: 16
+    readonly property int largeRadius: 20
+    readonly property int radius: 16 // compatibility alias
+    // Shared control sizing. WidgetButton targets a 40-44px touch height;
+    // WidgetIconButton keeps a 44px hit target with a centered 22px glyph
+    // so tab, journal, panel, close, and history controls stay coherent.
+    readonly property int controlMinHeight: 40
+    readonly property int iconButtonSize: 44
+    readonly property int iconSize: 22
+    readonly property int motionFast: 140
+    readonly property int motionPanel: 200
+    readonly property int motionExit: 220
 }

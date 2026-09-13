@@ -12,20 +12,24 @@ PanelWindow {
     
     anchors {
         top: true
-        right: true
+        left: true
     }
     
     margins {
         top: 50
-        right: 15
+        left: 15
     }
     
-    width: 350
-    height: mainLayout.implicitHeight
+    implicitWidth: 350
+    implicitHeight: mainLayout.implicitHeight
     color: "transparent"
     
-    // Make sure we don't block clicks when empty
-    visible: activeNotifs.count > 0
+    // DND: ControlCenter toggles notifServer.inhibit; banners hide while set.
+    // History in NotificationModule still collects independently.
+    readonly property bool inhibited: !!root.notifServer && root.notifServer.inhibit === true
+
+    // Make sure we don't block clicks when empty or inhibited
+    visible: activeNotifs.count > 0 && !root.inhibited
     
     ListModel {
         id: activeNotifs
@@ -35,15 +39,26 @@ PanelWindow {
         target: root.notifServer
         enabled: !!root.notifServer
         
-        onNotification: (n) => {
+        function onNotification(n) {
+            // DND suppresses incoming banners; history (NotificationModule)
+            // is the sole tracking owner and still collects independently.
+            if (root.inhibited) return;
             // Check for updates to existing notification
             for (let i = 0; i < activeNotifs.count; i++) {
                 if (activeNotifs.get(i).notifId === n.id) {
                     activeNotifs.setProperty(i, "summary", n.summary);
                     activeNotifs.setProperty(i, "body", n.body);
+                    activeNotifs.setProperty(i, "appName", n.appName);
                     return;
                 }
             }
+
+            // Banner holds a bare reference only: never set tracked, never
+            // call dismiss/expire here. History owns tracking and closure;
+            // banner expiry/hiding only removes the banner row.
+            n.closed.connect((reason) => {
+                root.removeBanner(n.id);
+            });
 
             // Add to active notifications
             activeNotifs.append({
@@ -54,19 +69,44 @@ PanelWindow {
                 "notifObj": n
             });
         }
-        
-        onNotificationClosed: (n) => {
-            root.dismiss(n.id);
-        }
     }
     
-    function dismiss(id) {
+    // Model-only removal: banner expiry, DND hiding, and remote closure must
+    // not untrack or dismiss history. Clearing tracked is equivalent to
+    // dismiss(), so never touch tracked here.
+    function removeBanner(id) {
         for (let i = 0; i < activeNotifs.count; i++) {
             if (activeNotifs.get(i).notifId === id) {
                 activeNotifs.remove(i);
                 break;
             }
         }
+    }
+
+    // Explicit user action: dismiss the notification itself so history (sole
+    // tracking owner) also closes via its closed handler. Remove the banner
+    // row optimistically; the closed handler then finds nothing (no double
+    // remove).
+    function userDismiss(id) {
+        for (let i = 0; i < activeNotifs.count; i++) {
+            if (activeNotifs.get(i).notifId === id) {
+                let n = activeNotifs.get(i).notifObj;
+                activeNotifs.remove(i);
+                if (n) n.dismiss();
+                break;
+            }
+        }
+    }
+
+    function clearBanners() {
+        // Model only: hiding banners (e.g. DND) never dismisses history.
+        for (let i = activeNotifs.count - 1; i >= 0; --i) {
+            activeNotifs.remove(i);
+        }
+    }
+
+    onInhibitedChanged: {
+        if (root.inhibited) root.clearBanners();
     }
 
     ColumnLayout {
@@ -82,19 +122,20 @@ PanelWindow {
                 height: innerLayout.implicitHeight + 24
                 color: Theme.base
                 radius: 12
-                border.color: Theme.mauve
+                 border.color: Theme.border
                 border.width: 1
                 
                 // Entry animation
                 opacity: 0
                 Component.onCompleted: opacity = 1
-                Behavior on opacity { NumberAnimation { duration: 250 } }
+                 Behavior on opacity { NumberAnimation { duration: Theme.motionPanel; easing.type: Easing.OutCubic } }
                 
                 Timer {
                     id: dismissTimer
                     interval: 6000
                     running: !mouseArea.containsMouse
-                    onTriggered: root.dismiss(notifId)
+                    // Expiry hides the banner only; history retains it.
+                    onTriggered: root.removeBanner(notifId)
                 }
 
                 ColumnLayout {
@@ -114,7 +155,7 @@ PanelWindow {
                         }
                         Text {
                             text: appName
-                            color: Theme.teal
+                            color: Theme.subtext1
                             font.pixelSize: 10
                             font.italic: true
                         }
@@ -125,7 +166,7 @@ PanelWindow {
                             font.pixelSize: 14
                             MouseArea {
                                 anchors.fill: parent
-                                onClicked: root.dismiss(notifId)
+                                onClicked: root.userDismiss(notifId)
                             }
                         }
                     }
@@ -147,15 +188,17 @@ PanelWindow {
                     anchors.fill: parent
                     hoverEnabled: true
                     onClicked: {
-                        if (notifObj && notifObj.actions) {
-                            for (let i = 0; i < notifObj.actions.length; i++) {
-                                if (notifObj.actions[i].identifier === "default") {
-                                    notifObj.actions[i].invoke();
+                        let target = notifObj;
+                        if (target && target.actions) {
+                            for (let i = 0; i < target.actions.length; i++) {
+                                if (target.actions[i].identifier === "default") {
+                                    target.actions[i].invoke();
                                     break;
                                 }
                             }
                         }
-                        root.dismiss(notifId);
+                        // Explicit activation dismisses (history closes too).
+                        root.userDismiss(notifId);
                     }
                 }
             }

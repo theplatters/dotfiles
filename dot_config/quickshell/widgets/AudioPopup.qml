@@ -1,25 +1,22 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
-import Quickshell.Wayland
-import Quickshell.Services.Pipewire
 import "../theme"
 
+// Thin legacy wrapper around AudioPanel for backcompat.
+// New code should use ControlCenter; no instances remain in shell.qml.
 PopupWindow {
     id: root
-    
+
     property var anchorItem: null
+    property alias activeTab: panel.activeTab
+    property bool requestedOpen: false
+    property bool closing: false
+
     visible: false
-    
-    width: 300
-    height: 300
-    
-    color: Theme.base
-    
-    Process {
-        id: wpctlProc
-    }
+    implicitWidth: 380
+    implicitHeight: 520
+    color: "transparent"
 
     anchor {
         window: QsWindow.window
@@ -27,91 +24,56 @@ PopupWindow {
         gravity: Edges.Bottom
     }
 
-    Rectangle {
-        anchors.fill: parent
-        color: Theme.base
-        radius: Theme.radius
-        border.color: Theme.pink
-        border.width: 2
+    function toggle(item) {
+        anchorItem = item;
+        root.setOpen(!requestedOpen);
+    }
 
-        ColumnLayout {
-            anchors.fill: parent
-            anchors.margins: 10
-            spacing: 10
-
-            Text {
-                text: "Audio Outputs"
-                color: Theme.pink
-                font.pixelSize: 16
-                font.bold: true
-                Layout.alignment: Qt.AlignHCenter
-            }
-
-            ListView {
-                id: sinkList
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                spacing: 5
-                clip: true
-                model: Pipewire.nodes
-
-                delegate: Rectangle {
-                    // Only show nodes that are sinks or the current default sink
-                    readonly property bool isDefault: Pipewire.defaultAudioSink && Pipewire.defaultAudioSink.id === modelData.id
-                    readonly property bool isActuallySink: modelData.isSink || (modelData.mediaClass && modelData.mediaClass.includes("Sink")) || isDefault
-                    visible: isActuallySink
-                    height: visible ? 45 : 0
-                    width: sinkList.width
-                    color: isDefault ? Theme.mauve : "transparent"
-                    radius: 8
-                    
-                    RowLayout {
-                        anchors.fill: parent
-                        anchors.margins: 10
-                        visible: parent.visible
-                        
-                        Text {
-                            text: (isDefault ? "󰓃 " : "󰓄 ") + (modelData.description || modelData.name)
-                            color: isDefault ? Theme.base : Theme.text
-                            font.pixelSize: 13
-                            Layout.fillWidth: true
-                            elide: Text.ElideRight
-                        }
-
-                        Text {
-                            text: Math.round((modelData.audio?.volume ?? 0) * 100) + "%"
-                            color: isDefault ? Theme.base : Theme.subtext0
-                            font.pixelSize: 11
-                            visible: modelData.audio !== null
-                        }
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: parent.visible
-                        hoverEnabled: true
-                        onEntered: if (!isDefault) parent.color = Theme.surface0
-                        onExited: if (!isDefault) parent.color = "transparent"
-                        onClicked: {
-                            // Use wpctl to set the default device in WirePlumber/Pipewire
-                            wpctlProc.command = ["wpctl", "set-default", modelData.id.toString()];
-                            wpctlProc.running = true;
-                            
-                            // Close the popup - the UI will update once Pipewire reports the change
-                            root.visible = false;
-                        }
-                    }
-                }
-            }
+    function setOpen(open) {
+        requestedOpen = open;
+        if (open) {
+            closing = false;
+            exitMotion.stop();
+            outer.opacity = 0;
+            outer.scale = 0.98;
+            if (!visible) visible = true;
+            enterMotion.restart();
+        } else if (visible && !closing) {
+            closing = true;
+            enterMotion.stop();
+            exitMotion.restart();
         }
     }
 
-    function toggle(item) {
-        if (visible) {
-            visible = false;
-        } else {
-            anchorItem = item;
-            visible = true;
+    Rectangle {
+        id: outer
+        anchors.fill: parent
+        color: Theme.base
+        radius: Theme.cardRadius
+        border.color: Theme.border
+        border.width: 1
+        opacity: 0
+        scale: 0.98
+
+        AudioPanel {
+            id: panel
+            anchors.fill: parent
+            anchors.margins: 12
         }
+    }
+
+    ParallelAnimation {
+        id: enterMotion
+        NumberAnimation { target: outer; property: "opacity"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
+        NumberAnimation { target: outer; property: "scale"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
+    }
+
+    SequentialAnimation {
+        id: exitMotion
+        ParallelAnimation {
+            NumberAnimation { target: outer; property: "opacity"; to: 0; duration: Theme.motionExit; easing.type: Easing.InCubic }
+            NumberAnimation { target: outer; property: "scale"; to: 0.98; duration: Theme.motionExit; easing.type: Easing.InCubic }
+        }
+        ScriptAction { script: { if (!root.requestedOpen) root.visible = false; root.closing = false; } }
     }
 }

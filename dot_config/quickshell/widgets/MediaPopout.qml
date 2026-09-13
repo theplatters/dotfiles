@@ -1,363 +1,503 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
-import Quickshell.Wayland
+import Quickshell.Services.Mpris
 import "../theme"
 
 PopupWindow {
     id: root
-    
+
     property var anchorItem: null
+    property var selectedPlayer: Mpris.players.values.find(player => player.isPlaying) || Mpris.players.values[0] || null
+    property bool requestedOpen: false
+    property bool closing: false
+
     visible: false
-    
-    width: 400
-    height: 350
-    
-    color: Theme.base
-    
+    implicitWidth: 430
+    implicitHeight: 410
+    color: "transparent"
+
     anchor {
         window: QsWindow.window
         rect: anchorItem ? Qt.rect(anchorItem.mapToGlobal(0, 0).x, anchorItem.mapToGlobal(0, 0).y + anchorItem.height + 8, anchorItem.width, 1) : Qt.rect(0, 48, 1, 1)
         gravity: Edges.Bottom
     }
 
+    function setOpen(open) {
+        requestedOpen = open;
+        if (open) {
+            closing = false;
+            exitMotion.stop();
+            selectDefaultPlayer();
+            panel.opacity = 0;
+            panel.scale = 0.98;
+            if (!visible) visible = true;
+            enterMotion.restart();
+        } else if (visible && !closing) {
+            closing = true;
+            enterMotion.stop();
+            exitMotion.restart();
+        }
+    }
+
+    function toggle(item) {
+        anchorItem = item;
+        setOpen(!requestedOpen);
+    }
+
+    function selectDefaultPlayer() {
+        const players = Mpris.players.values;
+        root.selectedPlayer = players.find(player => player.isPlaying)
+            || (root.selectedPlayer && players.indexOf(root.selectedPlayer) !== -1 ? root.selectedPlayer : null)
+            || players[0]
+            || null;
+    }
+
+    function pauseOtherPlayers(active) {
+        for (const player of Mpris.players.values) {
+            if (player !== active && player.canPause && player.isPlaying) {
+                player.pause();
+            }
+        }
+    }
+
+    function togglePlayer(player) {
+        if (!player || !player.canTogglePlaying) return;
+        if (!player.isPlaying) root.pauseOtherPlayers(player);
+        player.togglePlaying();
+    }
+
+    function title(player) {
+        return player ? (player.trackTitle || player.identity || "Unknown track") : "No media";
+    }
+
+    function artist(player) {
+        return player ? (player.trackArtist || player.trackAlbumArtist || player.identity || "") : "";
+    }
+
+    function artUrl(player) {
+        if (!player) return "";
+        if (player.trackArtUrl) return player.trackArtUrl;
+
+        const url = player.metadata["xesam:url"] || "";
+        if (url.indexOf("youtube.com/watch?v=") !== -1) {
+            const videoId = url.split("v=")[1].split("&")[0];
+            return "https://img.youtube.com/vi/" + videoId + "/0.jpg";
+        }
+        if (url.indexOf("youtu.be/") !== -1) {
+            const videoId = url.split("youtu.be/")[1].split("?")[0];
+            return "https://img.youtube.com/vi/" + videoId + "/0.jpg";
+        }
+
+        return "";
+    }
+
+    function formatTime(seconds) {
+        if (!seconds || seconds < 0) return "0:00";
+        const total = Math.floor(seconds);
+        const mins = Math.floor(total / 60);
+        const secs = total % 60;
+        return mins + ":" + (secs < 10 ? "0" : "") + secs;
+    }
+
+    function seekTo(player, ratio) {
+        if (player && player.positionSupported && player.lengthSupported && player.length > 0) {
+            player.position = Math.max(0, Math.min(player.length, ratio * player.length));
+        }
+    }
+
+    function nextLoopState(player) {
+        if (!player || !player.loopSupported) return;
+        if (player.loopState === MprisLoopState.None) {
+            player.loopState = MprisLoopState.Track;
+        } else if (player.loopState === MprisLoopState.Track) {
+            player.loopState = MprisLoopState.Playlist;
+        } else {
+            player.loopState = MprisLoopState.None;
+        }
+    }
+
     Rectangle {
+        id: panel
         anchors.fill: parent
         color: Theme.base
-        radius: Theme.radius
-        border.color: Theme.mauve
-        border.width: 2
+        radius: Theme.cardRadius
+        border.color: Theme.border
+        border.width: 1
+        opacity: 0
+        scale: 0.98
 
         ColumnLayout {
             anchors.fill: parent
-            anchors.margins: 15
-            spacing: 15
+            anchors.margins: 14
+            spacing: 12
 
-            Text {
-                text: "Active Players"
-                color: Theme.mauve
-                font.pixelSize: 16
-                font.bold: true
-            }
-
-            // Player Carousel
-            ListView {
-                id: playerList
+            RowLayout {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 120
-                orientation: ListView.Horizontal
-                spacing: 15
-                clip: true
-                model: playerModel
+                spacing: 10
 
-                delegate: Rectangle {
-                    width: 280
-                    height: 110
-                    color: Theme.mantle
-                    radius: 10
-                    border.color: Theme.surface0
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
 
-                    RowLayout {
+                    Text {
+                        text: "Media"
+                        color: Theme.text
+                        font.pixelSize: 16
+                        font.bold: true
+                    }
+
+                    Text {
+                        text: Mpris.players.values.length + (Mpris.players.values.length === 1 ? " player" : " players")
+                        color: Theme.subtext0
+                        font.pixelSize: 11
+                    }
+                }
+
+                Text {
+                    visible: root.selectedPlayer && root.selectedPlayer.canRaise
+                    text: "󰍉"
+                    color: Theme.subtext1
+                    font.pixelSize: 15
+
+                    MouseArea {
                         anchors.fill: parent
-                        anchors.margins: 10
-                        spacing: 10
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectedPlayer.raise()
+                    }
+                }
 
-                        Rectangle {
-                            width: 80
-                            height: 80
-                            color: Theme.surface0
-                            radius: 5
-                            clip: true
-                            
-                            Image {
-                                anchors.fill: parent
-                                source: model.artUrl || ""
-                                fillMode: Image.PreserveAspectCrop
-                                visible: source != ""
-                            }
-                            
-                            Text {
-                                anchors.centerIn: parent
-                                text: "󰝚"
-                                color: Theme.surface0
-                                font.pixelSize: 30
-                                visible: !model.artUrl
-                            }
-                        }
+                Text {
+                    visible: root.selectedPlayer && root.selectedPlayer.canQuit
+                    text: "󰅖"
+                    color: Theme.red
+                    font.pixelSize: 15
 
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 2
-
-                            Text {
-                                text: model.title
-                                color: Theme.text
-                                font.pixelSize: 14
-                                font.bold: true
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-
-                            Text {
-                                text: model.artist
-                                color: Theme.text
-                                font.pixelSize: 12
-                                opacity: 0.8
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-
-                            Row {
-                                spacing: 15
-                                Layout.topMargin: 5
-                                
-                                Text {
-                                    text: "󰒮"
-                                    color: Theme.teal
-                                    font.pixelSize: 18
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: root.playerControl(model.playerName, "previous")
-                                    }
-                                }
-                                Text {
-                                    text: model.status === "Playing" ? "󰏤" : "󰐊"
-                                    color: Theme.teal
-                                    font.pixelSize: 18
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: root.playerControl(model.playerName, "play-pause")
-                                    }
-                                }
-                                Text {
-                                    text: "󰒭"
-                                    color: Theme.teal
-                                    font.pixelSize: 18
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: root.playerControl(model.playerName, "next")
-                                    }
-                                }
-                            }
-                        }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectedPlayer.quit()
                     }
                 }
             }
 
-            Text {
-                text: "KDE Connect Devices"
-                color: Theme.mauve
-                font.pixelSize: 16
-                font.bold: true
-            }
-
             ListView {
-                id: deviceList
+                id: playerStrip
                 Layout.fillWidth: true
-                Layout.fillHeight: true
+                Layout.preferredHeight: Mpris.players.values.length > 1 ? 42 : 0
+                visible: Mpris.players.values.length > 1
+                orientation: ListView.Horizontal
                 spacing: 8
                 clip: true
-                model: deviceModel
+                model: Mpris.players
 
                 delegate: Rectangle {
-                    width: deviceList.width
-                    height: 45
-                    color: Theme.mantle
-                    radius: 8
-                    
-                    RowLayout {
+                    width: Math.max(92, playerName.implicitWidth + 26)
+                    height: 34
+                    radius: Theme.controlRadius
+                    color: root.selectedPlayer === modelData ? Theme.surface2 : Theme.mantle
+                    border.color: Theme.border
+                    border.width: 1
+
+                    Text {
+                        id: playerName
+                        anchors.centerIn: parent
+                        text: modelData.identity || modelData.desktopEntry || "Player"
+                        color: Theme.text
+                        font.pixelSize: 11
+                        font.bold: root.selectedPlayer === modelData
+                        elide: Text.ElideRight
+                        width: parent.width - 16
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+
+                    MouseArea {
                         anchors.fill: parent
-                        anchors.margins: 10
-                        
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectedPlayer = modelData
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 122
+                spacing: 12
+                visible: !!root.selectedPlayer
+
+                Rectangle {
+                    width: 112
+                    height: 112
+                    radius: Theme.controlRadius
+                    color: Theme.surface0
+                    clip: true
+
+                    Image {
+                        anchors.fill: parent
+                        source: root.artUrl(root.selectedPlayer)
+                        fillMode: Image.PreserveAspectCrop
+                        visible: source !== ""
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "󰝚"
+                        color: Theme.subtext1
+                        font.pixelSize: 36
+                        visible: root.artUrl(root.selectedPlayer) === ""
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    spacing: 6
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.title(root.selectedPlayer)
+                        color: Theme.text
+                        font.pixelSize: 15
+                        font.bold: true
+                        elide: Text.ElideRight
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.artist(root.selectedPlayer)
+                        color: Theme.subtext0
+                        font.pixelSize: 12
+                        elide: Text.ElideRight
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.selectedPlayer ? MprisPlaybackState.toString(root.selectedPlayer.playbackState) : ""
+                        color: Theme.subtext1
+                        font.pixelSize: 11
+                    }
+
+                    Item { Layout.fillHeight: true }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
                         Text {
-                            text: "󰄜 " + model.name
-                            color: Theme.text
-                            font.pixelSize: 13
+                            text: root.formatTime(root.selectedPlayer ? root.selectedPlayer.position : 0)
+                            color: Theme.subtext0
+                            font.pixelSize: 10
+                        }
+
+                        Rectangle {
                             Layout.fillWidth: true
-                        }
+                            height: 7
+                            radius: 4
+                            color: Theme.surface1
 
-                        Row {
-                            spacing: 10
-                            
                             Rectangle {
-                                width: 30; height: 30; radius: 5; color: Theme.surface0
-                                Text { anchors.centerIn: parent; text: "󰂚"; color: Theme.green }
-                                MouseArea {
-                                    anchors.fill: parent
-                                    onClicked: root.runCmd(["kdeconnect-cli", "-d", model.id, "--ping"])
+                                width: parent.width * (root.selectedPlayer && root.selectedPlayer.lengthSupported && root.selectedPlayer.length > 0 ? Math.min(1, root.selectedPlayer.position / root.selectedPlayer.length) : 0)
+                                height: parent.height
+                                radius: parent.radius
+                                color: Theme.text
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: root.selectedPlayer && root.selectedPlayer.positionSupported && root.selectedPlayer.lengthSupported
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: mouse => root.seekTo(root.selectedPlayer, mouse.x / width)
+                                onPositionChanged: mouse => {
+                                    if (pressed) root.seekTo(root.selectedPlayer, mouse.x / width);
                                 }
                             }
-                            
-                            Rectangle {
-                                width: 30; height: 30; radius: 5; color: Theme.surface0
-                                Text { anchors.centerIn: parent; text: "󰂞"; color: Theme.red }
-                                MouseArea {
-                                    anchors.fill: parent
-                                    onClicked: root.runCmd(["kdeconnect-cli", "-d", model.id, "--ring"])
-                                }
-                            }
+                        }
+
+                        Text {
+                            text: root.formatTime(root.selectedPlayer && root.selectedPlayer.lengthSupported ? root.selectedPlayer.length : 0)
+                            color: Theme.subtext0
+                            font.pixelSize: 10
                         }
                     }
                 }
             }
-        }
-    }
 
-    ListModel { id: playerModel }
-    ListModel { id: deviceModel }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 18
+                visible: !!root.selectedPlayer
 
-    Component {
-        id: playerMetadataComponent
-        Process {
-            property string playerName
-            stdout: StdioCollector { id: collector }
-            onExited: (exitCode) => {
-                if (exitCode === 0) {
-                    let rawText = collector.text.trim();
-                    let parts = rawText.split('|');
-                    if (parts.length >= 4) {
-                        let status = parts[0];
-                        let artist = parts[1];
-                        let title = parts[2];
-                        let artUrl = parts[3] || "";
-                        let xesamUrl = parts[4] || "";
-                        
-                        // YouTube Fallback
-                        if (artUrl === "" && (xesamUrl.includes("youtube.com/watch?v=") || xesamUrl.includes("youtu.be/"))) {
-                            let videoId = "";
-                            if (xesamUrl.includes("v=")) {
-                                videoId = xesamUrl.split('v=')[1].split('&')[0];
-                            } else {
-                                videoId = xesamUrl.split('be/')[1].split('?')[0];
-                            }
-                            artUrl = "https://img.youtube.com/vi/" + videoId + "/0.jpg";
+                Item { Layout.fillWidth: true }
+
+                Text {
+                    text: "󰒮"
+                    color: root.selectedPlayer && root.selectedPlayer.canGoPrevious ? Theme.text : Theme.surface2
+                    font.pixelSize: 22
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: root.selectedPlayer && root.selectedPlayer.canGoPrevious
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectedPlayer.previous()
+                    }
+                }
+
+                Text {
+                    text: root.selectedPlayer && root.selectedPlayer.isPlaying ? "󰏤" : "󰐊"
+                    color: root.selectedPlayer && root.selectedPlayer.canTogglePlaying ? Theme.text : Theme.surface2
+                    font.pixelSize: 26
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: root.selectedPlayer && root.selectedPlayer.canTogglePlaying
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.togglePlayer(root.selectedPlayer)
+                    }
+                }
+
+                Text {
+                    text: "󰒭"
+                    color: root.selectedPlayer && root.selectedPlayer.canGoNext ? Theme.text : Theme.surface2
+                    font.pixelSize: 22
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: root.selectedPlayer && root.selectedPlayer.canGoNext
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectedPlayer.next()
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: !!root.selectedPlayer
+
+                Text {
+                    text: "󰕾"
+                    color: Theme.text
+                    font.pixelSize: 13
+                    visible: root.selectedPlayer && root.selectedPlayer.volumeSupported
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 7
+                    radius: 4
+                    color: Theme.surface1
+                    visible: root.selectedPlayer && root.selectedPlayer.volumeSupported
+
+                    Rectangle {
+                        width: parent.width * Math.max(0, Math.min(1, root.selectedPlayer ? root.selectedPlayer.volume : 0))
+                        height: parent.height
+                        radius: parent.radius
+                        color: Theme.text
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: mouse => root.selectedPlayer.volume = Math.max(0, Math.min(1, mouse.x / width))
+                        onPositionChanged: mouse => {
+                            if (pressed) root.selectedPlayer.volume = Math.max(0, Math.min(1, mouse.x / width));
                         }
-
-                        playerModel.append({
-                            playerName: playerName,
-                            status: status,
-                            artist: artist,
-                            title: title,
-                            artUrl: artUrl
-                        });
                     }
                 }
-                destroy();
+
+                Text {
+                    text: root.selectedPlayer && root.selectedPlayer.volumeSupported ? Math.round(root.selectedPlayer.volume * 100) + "%" : ""
+                    color: Theme.subtext0
+                    font.pixelSize: 10
+                    visible: root.selectedPlayer && root.selectedPlayer.volumeSupported
+                }
             }
-        }
-    }
 
-    Component {
-        id: genericCmdComponent
-        Process {
-            onExited: destroy()
-        }
-    }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                visible: !!root.selectedPlayer
 
-    Process {
-        id: playerListProc
-        command: ["playerctl", "-l"]
-        running: false
-        stdout: StdioCollector { id: playerListCollector }
-        onExited: (exitCode) => {
-            if (exitCode === 0) {
-                playerModel.clear();
-                let rawText = playerListCollector.text.trim();
-                let players = rawText.split('\n');
-                for (let p of players) {
-                    let name = p.trim();
-                    if (name !== "") {
-                        root.fetchPlayerData(name);
+                Rectangle {
+                    height: 30
+                    width: 92
+                    radius: Theme.controlRadius
+                    color: root.selectedPlayer && root.selectedPlayer.shuffle ? Theme.surface2 : Theme.mantle
+                    border.color: Theme.border
+                    border.width: 1
+                    opacity: root.selectedPlayer && root.selectedPlayer.shuffleSupported ? 1 : 0.45
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Shuffle"
+                        color: Theme.text
+                        font.pixelSize: 11
+                        font.bold: root.selectedPlayer && root.selectedPlayer.shuffle
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: root.selectedPlayer && root.selectedPlayer.shuffleSupported
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectedPlayer.shuffle = !root.selectedPlayer.shuffle
                     }
                 }
-            }
-        }
-    }
 
-    function fetchPlayerData(playerName) {
-        let proc = playerMetadataComponent.createObject(root, {
-            playerName: playerName,
-            command: ["playerctl", "-p", playerName, "metadata", "--format", "{{status}}|{{artist}}|{{title}}|{{mpris:artUrl}}|{{xesam:url}}"]
-        });
-        proc.running = true;
-    }
+                Rectangle {
+                    height: 30
+                    width: 110
+                    radius: Theme.controlRadius
+                    color: root.selectedPlayer && root.selectedPlayer.loopState !== MprisLoopState.None ? Theme.surface2 : Theme.mantle
+                    border.color: Theme.border
+                    border.width: 1
+                    opacity: root.selectedPlayer && root.selectedPlayer.loopSupported ? 1 : 0.45
 
-    Process {
-        id: deviceListProc
-        command: ["kdeconnect-cli", "-l", "--id-name-only"]
-        running: false
-        stdout: StdioCollector { id: deviceListCollector }
-        onExited: (exitCode) => {
-            if (exitCode === 0) {
-                deviceModel.clear();
-                let rawText = deviceListCollector.text.trim();
-                let lines = rawText.split('\n');
-                for (let line of lines) {
-                    let cleaned = line.trim();
-                    if (cleaned === "") continue;
-                    
-                    // Handle format: "ID NAME" (space separated)
-                    let firstSpace = cleaned.indexOf(' ');
-                    if (firstSpace !== -1) {
-                        let id = cleaned.substring(0, firstSpace);
-                        let name = cleaned.substring(firstSpace + 1);
-                        deviceModel.append({ name: name, id: id });
+                    Text {
+                        anchors.centerIn: parent
+                        text: root.selectedPlayer ? "Loop " + MprisLoopState.toString(root.selectedPlayer.loopState) : "Loop"
+                        color: Theme.text
+                        font.pixelSize: 11
+                        font.bold: root.selectedPlayer && root.selectedPlayer.loopState !== MprisLoopState.None
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: root.selectedPlayer && root.selectedPlayer.loopSupported
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.nextLoopState(root.selectedPlayer)
                     }
                 }
+
+                Item { Layout.fillWidth: true }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                visible: Mpris.players.values.length === 0
+                text: "No active media players"
+                color: Theme.subtext0
+                font.pixelSize: 12
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
             }
         }
     }
 
-    function playerControl(name, cmd) {
-        if (cmd === "play" || cmd === "play-pause") {
-            // If we are starting playback, pause everyone else
-            for (let i = 0; i < playerModel.count; i++) {
-                let other = playerModel.get(i);
-                if (other.playerName !== name) {
-                    runCmd(["playerctl", "-p", other.playerName, "pause"]);
-                }
-            }
-        }
-        
-        runCmd(["playerctl", "-p", name, cmd]);
-        // Refresh after control
-        timer.restart();
+    ParallelAnimation {
+        id: enterMotion
+        NumberAnimation { target: panel; property: "opacity"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
+        NumberAnimation { target: panel; property: "scale"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
     }
 
-    function runCmd(cmd) {
-        let p = genericCmdComponent.createObject(root, { command: cmd });
-        p.running = true;
-    }
-
-    Timer {
-        id: timer
-        interval: 3000
-        running: root.visible
-        repeat: true
-        onTriggered: {
-            if (!playerListProc.running) playerListProc.running = true;
-            if (!deviceListProc.running) deviceListProc.running = true;
+    SequentialAnimation {
+        id: exitMotion
+        ParallelAnimation {
+            NumberAnimation { target: panel; property: "opacity"; to: 0; duration: Theme.motionExit; easing.type: Easing.InCubic }
+            NumberAnimation { target: panel; property: "scale"; to: 0.98; duration: Theme.motionExit; easing.type: Easing.InCubic }
         }
-    }
-    
-    onVisibleChanged: {
-        if (visible && anchorItem) {
-            // Re-trigger anchor evaluation
-            let item = anchorItem;
-            anchorItem = null;
-            anchorItem = item;
-        }
-    }
-    
-    function toggle(item) {
-        if (visible) {
-            visible = false;
-        } else {
-            anchorItem = item;
-            visible = true;
-            playerListProc.running = true;
-            deviceListProc.running = true;
-        }
+        ScriptAction { script: { if (!root.requestedOpen) root.visible = false; root.closing = false; } }
     }
 }
