@@ -24,6 +24,14 @@ ShellRoot {
 
     ProjectPlanner {
         id: projectPlanner
+        agenda: dailyAgenda
+    }
+
+    // Shared daily-agenda state: one date, one backend operation, and one
+    // Pomodoro timer for the clock popout and the planner Daily tab.
+    // It lives here (not in a popup) so closing a popup never stops it.
+    DailyAgenda {
+        id: dailyAgenda
     }
 
     Connections {
@@ -50,6 +58,12 @@ ShellRoot {
             id: mediaPopout
         }
 
+        CalendarPopout {
+            id: calendarPopout
+            anchorItem: bar.clockAnchor
+            agenda: dailyAgenda
+        }
+
         ControlCenter {
             id: controlCenter
             anchorItem: bar.trayAnchor
@@ -68,6 +82,7 @@ ShellRoot {
             notifServer: notifServer
             mediaPopout: mediaPopout
             controlCenter: controlCenter
+            calendarPopout: calendarPopout
         }
     }
 }

@@ -133,7 +133,8 @@ python3 scripts/project_planner.py --graph PATH files-read < read.json
 python3 scripts/project_planner.py --graph PATH files-git < page.json
 ```
 
-`LOGSEQ_GRAPH` selects the graph when `--graph` is omitted. Project worker
+`LOGSEQ_GRAPH` selects the graph when `--graph` is omitted, falling back to
+`logseqGraph` in `settings.json` (see `settings.example.json`). Project worker
 agents receive only their selected graph-relative page through `QS_PROJECT_PATH`.
 
 ## Project folder inspection (`file::` property)

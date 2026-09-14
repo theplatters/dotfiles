@@ -10,11 +10,10 @@ import re
 import stat
 import sys
 
-from logseq_common import (GraphError, MAX_FILE_BYTES, graph_path, markdown_files,
-                           page_name, read_lines, MAX_RESULTS)
+from logseq_common import (GraphError, MAX_FILE_BYTES, markdown_files,
+                           page_name, read_lines, MAX_RESULTS, resolve_graph)
 from logseq_todos import todos
 
-DEFAULT_GRAPH = "/home/franzs/Nextcloud/Documents/Notes"
 DATE = re.compile(r"^\d{4}_\d{2}_\d{2}$")
 
 
@@ -126,14 +125,15 @@ def append_journal(graph, text, date):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--graph", default=os.environ.get("LOGSEQ_GRAPH") or DEFAULT_GRAPH)
+    parser.add_argument("--graph", default=None,
+                        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
     sub = parser.add_subparsers(dest="command", required=True)
     todos_parser = sub.add_parser("todos"); todos_parser.add_argument("--query")
     found = sub.add_parser("search"); found.add_argument("query")
     add = sub.add_parser("append"); add.add_argument("--text", required=True); add.add_argument("--date")
     args = parser.parse_args(argv)
     try:
-        graph = graph_path(args.graph)
+        graph = resolve_graph(args.graph)
         if args.command == "todos": value = todos(graph, args.query)
         elif args.command == "search": value = search(graph, args.query)
         else: value = append_journal(graph, args.text, args.date)

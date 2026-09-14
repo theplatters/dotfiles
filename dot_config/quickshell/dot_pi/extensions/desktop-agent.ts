@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -9,7 +9,9 @@ const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const HELPER = join(EXTENSION_DIR, "../../scripts/logseq_graph.py");
 const PROJECT_HELPER = join(EXTENSION_DIR, "../../scripts/project_planner.py");
 const JOURNAL_HELPER = join(EXTENSION_DIR, "../../scripts/journal_assistant.py");
-const DEFAULT_GRAPH = "/home/franzs/Nextcloud/Documents/Notes";
+// The graph directory differs per machine: it is never hardwired here.
+// Resolution order is LOGSEQ_GRAPH, then logseqGraph in settings.json.
+const SETTINGS_FILENAME = "settings.json";
 const MAX_OUTPUT = 64 * 1024;
 const PROJECT_MAX_INPUT = 1024 * 1024;
 const PROJECT_MAX_OUTPUT = 1024 * 1024;
@@ -37,6 +39,67 @@ type JournalContextInput = Static<typeof journalContextSchema>;
 type JournalAppendInput = Static<typeof journalAppendSchema>;
 
 const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], details: {} });
+
+function expandUser(value: string): string {
+    if (value === "~") return process.env.HOME || value;
+    if (value.startsWith("~/")) return (process.env.HOME || "~") + value.slice(1);
+    return value;
+}
+
+function graphFromSettingsObject(data: Record<string, unknown>): string | undefined {
+    for (const key of ["logseqGraph", "logseq_graph", "LOGSEQ_GRAPH"]) {
+        const value = data[key];
+        if (typeof value === "string" && value.trim() !== "") return value.trim();
+    }
+    const nested = data["logseq"];
+    if (nested && typeof nested === "object") {
+        const inner = nested as Record<string, unknown>;
+        for (const key of ["graph", "path", "logseqGraph", "logseq_graph", "LOGSEQ_GRAPH"]) {
+            const value = inner[key];
+            if (typeof value === "string" && value.trim() !== "") return value.trim();
+        }
+    }
+    return undefined;
+}
+
+function candidateSettingsPaths(): string[] {
+    const out: string[] = [];
+    const override = (process.env.QUICKSHELL_SETTINGS || "").trim();
+    if (override) out.push(override);
+    out.push(join(EXTENSION_DIR, "../../" + SETTINGS_FILENAME));
+    const xdg = (process.env.XDG_CONFIG_HOME || "").trim();
+    if (xdg) out.push(join(xdg, "quickshell", SETTINGS_FILENAME));
+    const home = (process.env.HOME || "").trim();
+    if (home) out.push(join(home, ".config", "quickshell", SETTINGS_FILENAME));
+    return out;
+}
+
+function settingsGraphRaw(): string | undefined {
+    for (const candidate of candidateSettingsPaths()) {
+        let text: string;
+        try { text = readFileSync(expandUser(candidate), "utf8"); }
+        catch { continue; }
+        try {
+            const data = JSON.parse(text);
+            if (!data || typeof data !== "object") return undefined;
+            // First existing file wins, like the Python helper.
+            return graphFromSettingsObject(data as Record<string, unknown>);
+        } catch { return undefined; }
+    }
+    return undefined;
+}
+
+function resolveGraphRaw(): string | undefined {
+    const env = (process.env.LOGSEQ_GRAPH || "").trim();
+    if (env) return env;
+    return settingsGraphRaw();
+}
+
+function resolveGraph(): string {
+    const graph = resolveGraphRaw();
+    if (!graph) throw new Error("logseq graph is not configured; set LOGSEQ_GRAPH or logseqGraph in settings.json");
+    return graph;
+}
 
 function protectedPath(path: string): boolean {
     const parts = normalize(path).split("/").filter(Boolean);
@@ -156,11 +219,12 @@ async function ask(ctx: ExtensionContext, title: string, message: string): Promi
 function helper(ctx: ExtensionContext, args: string[], signal?: AbortSignal): Promise<unknown> {
     return new Promise((resolvePromise, reject) => {
         if (signal?.aborted) return reject(new Error("operation aborted"));
+        let graph: string;
         try {
-            const graph = process.env.LOGSEQ_GRAPH || DEFAULT_GRAPH;
-            if (protectedPath(isAbsolute(graph) ? normalize(graph) : resolve(ctx.cwd, graph)) || protectedPath(canonical(ctx.cwd, graph))) return reject(new Error("configured graph path is protected"));
+            graph = resolveGraph();
+            if (protectedPath(isAbsolute(expandUser(graph)) ? normalize(expandUser(graph)) : resolve(ctx.cwd, graph)) || protectedPath(canonical(ctx.cwd, expandUser(graph)))) return reject(new Error("configured graph path is protected"));
         } catch (e) { return reject(e); }
-        const child = spawn("python3", [HELPER, "--graph", process.env.LOGSEQ_GRAPH || DEFAULT_GRAPH, ...args], { cwd: ctx.cwd, shell: false });
+        const child = spawn("python3", [HELPER, "--graph", graph, ...args], { cwd: ctx.cwd, shell: false });
         const outChunks: Buffer[] = [], errChunks: Buffer[] = [];
         let outBytes = 0, errBytes = 0, outputOverflow = false, timedOut = false;
         const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, 10000);
@@ -187,9 +251,10 @@ function projectHelper(ctx: ExtensionContext, command: "page" | "update" | "file
         const projectPath = process.env.QS_PROJECT_PATH?.trim();
         if (!projectPath) return reject(new Error("project mode is not active"));
         if (signal?.aborted) return reject(new Error("operation aborted"));
-        let graph = process.env.LOGSEQ_GRAPH || DEFAULT_GRAPH;
+        let graph: string;
         try {
-            const graphCanonical = canonical(ctx.cwd, graph);
+            graph = resolveGraph();
+            const graphCanonical = canonical(ctx.cwd, expandUser(graph));
             const pageCanonical = canonical(ctx.cwd, projectPath);
             if (protectedPath(graphCanonical) || protectedPath(pageCanonical)) throw new Error("configured project path is protected");
         } catch (error) { return reject(error); }
@@ -269,9 +334,10 @@ function journalHelper(ctx: ExtensionContext, operation: "context" | "prepare" |
     return new Promise((resolvePromise, rejectPromise) => {
         if (signal?.aborted) return rejectPromise(new Error("operation aborted"));
         if (!journalMode()) return rejectPromise(new Error("journal mode is not active"));
-        let graph = process.env.LOGSEQ_GRAPH || DEFAULT_GRAPH;
+        let graph: string;
         try {
-            const graphCanonical = canonical(ctx.cwd, graph);
+            graph = resolveGraph();
+            const graphCanonical = canonical(ctx.cwd, expandUser(graph));
             if (protectedPath(graphCanonical)) throw new Error("configured graph path is protected");
         } catch (error) { return rejectPromise(error); }
         if (Buffer.byteLength(JSON.stringify(payload), "utf8") > JOURNAL_MAX_INPUT)

@@ -17,6 +17,35 @@ class GraphError(ValueError):
     pass
 
 
+def resolve_graph(value=None):
+    """Resolve a graph from CLI arg, env, or settings.json (in that order).
+
+    Empty or whitespace-only *value* counts as missing so QML callers can
+    pass ``""`` as "no override" and let ``LOGSEQ_GRAPH`` / settings.json
+    decide. Raises :class:`GraphError` with a clear hint when nothing is
+    configured.
+    """
+    if value is not None and str(value).strip():
+        return graph_path(value)
+    env = os.environ.get("LOGSEQ_GRAPH", "")
+    if isinstance(env, str) and env.strip():
+        return graph_path(env)
+    try:
+        from quickshell_settings import resolve_graph_raw
+    except ImportError as exc:
+        raise GraphError(
+            "logseq graph is not configured; set LOGSEQ_GRAPH "
+            "or logseqGraph in settings.json"
+        ) from exc
+    raw = resolve_graph_raw(None)
+    if raw:
+        return graph_path(raw)
+    raise GraphError(
+        "logseq graph is not configured; set LOGSEQ_GRAPH "
+        "or logseqGraph in settings.json"
+    )
+
+
 def graph_path(value):
     """Resolve a graph, rejecting paths which are unsafe to inspect."""
     path = Path(value).expanduser()

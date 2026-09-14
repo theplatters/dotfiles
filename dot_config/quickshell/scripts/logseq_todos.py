@@ -3,7 +3,7 @@
 import json
 import sys
 
-from logseq_common import GraphError, TASK, graph_path, markdown_files, page_name, read_lines, MAX_RESULTS
+from logseq_common import GraphError, TASK, markdown_files, page_name, read_lines, MAX_RESULTS, resolve_graph
 
 
 def todos(graph, query=None):
@@ -32,11 +32,12 @@ def todos(graph, query=None):
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("graph")
+    parser.add_argument("graph", nargs="?", default=None,
+                        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
     parser.add_argument("--query")
     args = parser.parse_args(argv)
     try:
-        print(json.dumps(todos(graph_path(args.graph), args.query), ensure_ascii=False))
+        print(json.dumps(todos(resolve_graph(args.graph), args.query), ensure_ascii=False))
         return 0
     except GraphError as exc:
         print(f"error: {exc}", file=sys.stderr)

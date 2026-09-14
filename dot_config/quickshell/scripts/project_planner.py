@@ -20,8 +20,7 @@ import time
 from typing import NoReturn
 
 from logseq_common import (GraphError, MAX_FILES, MAX_RESULTS, graph_path,
-                           markdown_files, page_name)
-from logseq_graph import DEFAULT_GRAPH
+                           markdown_files, page_name, resolve_graph)
 
 
 PAGE_LIMIT = 128 * 1024
@@ -577,7 +576,8 @@ def _read_input():
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--graph", default=os.environ.get("LOGSEQ_GRAPH") or DEFAULT_GRAPH)
+    parser.add_argument("--graph", default=None,
+                        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
     parser.add_argument("command", choices=("list", "page", "toggle", "update",
                                              "files-list", "files-read",
                                              "files-git"))
@@ -591,7 +591,7 @@ def main(argv=None):
             _arm_abort()
         except ImportError:
             pass
-        graph = graph_path(args.graph)
+        graph = resolve_graph(args.graph)
         if args.command == "list":
             value = list_projects(graph)
         else:

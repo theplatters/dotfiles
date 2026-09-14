@@ -17,7 +17,6 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_GRAPH = "/home/franzs/Nextcloud/Documents/Notes"
 SESSION_SUBTREE = ("quickshell", "project-sessions")
 PROJECT_SUBTREE = "projects"
 MAX_SESSION_SCAN = 2048
@@ -86,7 +85,20 @@ def _private_dir(path: Path) -> Path:
 def resolved_graph(value: str | None = None) -> Path:
     """Return the existing, canonical Logseq graph directory."""
 
-    raw = value or os.environ.get("LOGSEQ_GRAPH") or DEFAULT_GRAPH
+    raw = (value or "").strip() if isinstance(value, str) else value
+    if not raw:
+        raw = (os.environ.get("LOGSEQ_GRAPH") or "").strip()
+    if not raw:
+        try:
+            import quickshell_settings as _settings
+            raw = _settings.resolve_graph_raw(None) or ""
+        except ImportError:
+            raw = ""
+    if not raw:
+        raise SessionPathError(
+            "logseq graph is not configured; set LOGSEQ_GRAPH "
+            "or logseqGraph in settings.json"
+        )
     graph = _absolute(raw)
     try:
         graph = graph.resolve(strict=True)

@@ -22,8 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from logseq_common import (GraphError, SENSITIVE_NAMES as BASELINE_SENSITIVE_NAMES,
-                           graph_path)
-from logseq_graph import DEFAULT_GRAPH
+                           graph_path, resolve_graph)
 from project_planner import (LOCK_NAME, LOCK_TIMEOUT, _GraphLock)
 
 
@@ -693,11 +692,12 @@ def _emit(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--graph", default=os.environ.get("LOGSEQ_GRAPH") or DEFAULT_GRAPH)
+    parser.add_argument("--graph", default=None,
+                        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
     parser.add_argument("command", choices=("context", "prepare", "append"))
     try:
         args = parser.parse_args(argv)
-        graph = graph_path(args.graph)
+        graph = resolve_graph(args.graph)
         request = _read_input()
         if args.command == "context":
             value = _context_response(graph, request.get("query"))

@@ -16,7 +16,9 @@ Rectangle {
     property var networkPopup: null
     property var batteryPopup: null
     property var controlCenter: null
+    property var calendarPopout: null
     property alias trayAnchor: unifiedTray
+    property alias clockAnchor: clockContainer
 
     readonly property bool compactStats: width < 1400
     readonly property bool compactNetwork: width < 1200
@@ -256,8 +258,14 @@ Rectangle {
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
                         onEntered: clockContainer.color = Theme.surface0
                         onExited: clockContainer.color = Theme.mantle
+                        onClicked: {
+                            if (bar.calendarPopout) {
+                                bar.calendarPopout.toggle(clockContainer);
+                            }
+                        }
                     }
                 }
             }

@@ -5,7 +5,7 @@ the input to select a source:
 
 - `ai: prompt` sends a free-form prompt to the persistent Pi session.
 - `clip: text` (also `clipboard text` or `# text`) searches clipboard history.
-- `file: name` searches `PALETTE_FILE_ROOT` (default home) via `scripts/palette_files.py`, not `LOGSEQ_GRAPH` (`LOGSEQ_GRAPH` is for `logseq_todos`/`logseq_graph`/`project_planner`).
+- `file: name` searches `PALETTE_FILE_ROOT` (default home) via `scripts/palette_files.py`, not `LOGSEQ_GRAPH` (`LOGSEQ_GRAPH`/`settings.json` `logseqGraph` is for `logseq_todos`/`logseq_graph`/`project_planner`).
 - `> command` exposes save-only screenshots, screen actions for Pi, system
   actions, and Pi session controls. The screen actions are named `Capture
   region for Pi`, `Translate region with Pi`, and `Summarize region to Logseq`.

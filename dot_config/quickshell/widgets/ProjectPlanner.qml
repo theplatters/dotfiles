@@ -113,6 +113,10 @@ PanelWindow {
     // JournalAssistant owns a graph-scoped worker and keeps it independent of
     // selectedAgent.  The reference is only populated by the child below.
     property var journalChild: null
+    // Shared daily-agenda state (owned by shell.qml). The Daily tab and the
+    // clock CalendarPopout bind to the same object, so the date, drafts,
+    // and Pomodoro survive popup close/reopen.
+    property var agenda: null
 
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
@@ -147,7 +151,7 @@ PanelWindow {
     Process {
         id: listProcess
         command: ["python3", Quickshell.shellPath("scripts/project_planner.py"),
-            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "/home/franzs/Nextcloud/Documents/Notes/", "list"]
+            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "", "list"]
         workingDirectory: Quickshell.shellPath(".")
         stdout: StdioCollector { id: listOutput; waitForEnd: true }
         stderr: StdioCollector { id: listError; waitForEnd: true }
@@ -264,7 +268,7 @@ PanelWindow {
     function failure(label, code, detail) {
         let suffix = safeText(detail)
         return label + " failed" + (code ? " (exit " + code + ")" : "") +
-            (suffix ? ": " + suffix : "") + ". Check LOGSEQ_GRAPH and retry."
+            (suffix ? ": " + suffix : "") + ". Check LOGSEQ_GRAPH or settings.json and retry."
     }
 
     function filteredProjects() {
@@ -680,7 +684,30 @@ PanelWindow {
             agentCache[path] && agentCache[path].pendingApproval)
     }
 
+    // A daily-agenda completion write that fails must never silently
+    // re-target its frozen note: the draft stays until explicit
+    // cancel/save, and navigation stays blocked while it saves.
+    function applyAgendaPage(page) {
+        if (!page || typeof page !== "object" || typeof page.path !== "string") return
+        let path = String(page.path)
+        if (!path) return
+        let copy = Object.assign({}, pageCache)
+        copy[path] = page
+        pageCache = copy
+        if (path === selectedPath) {
+            // Read-only cache refresh only: never touches the agent,
+            // drafts, or the pending prompt handshake.
+            currentPage = page
+            staleToggle = false
+            if (root.activeTab === "projects") {
+                errorMessage = ""
+                notice = ""
+            }
+        }
+    }
+
     function blockedReason() {
+        if (root.agenda && root.agenda.completionSaving) return "Wait for the daily completion write to finish."
         if (root.activeTab === "journal" && root.journalChild && root.journalChild.blockedReason) {
             let journalReason = root.journalChild.blockedReason()
             if (journalReason) return journalReason
@@ -716,14 +743,38 @@ PanelWindow {
         // transitions must remain visible without being masked by stale
         // project/history diagnostics.
         if (root.activeTab === "journal") return root.notice
+        if (root.activeTab === "daily") {
+            let parts = []
+            if (root.agenda) {
+                if (root.agenda.agendaError) parts.push(root.agenda.agendaError)
+                else if (root.agenda.completionError) parts.push(root.agenda.completionError)
+                else if (root.agenda.agendaNotice) parts.push(root.agenda.agendaNotice)
+            }
+            if (root.notice) parts.push(root.notice)
+            return parts.join(" ")
+        }
         return root.errorMessage || root.agentError || root.historyLoadError || root.notice
     }
 
     function selectTab(target) {
-        target = target === "journal" ? "journal" : "projects"
+        target = target === "daily" ? "daily" : (target === "journal" ? "journal" : "projects")
         if (target === root.activeTab) return true
         let reason = root.tabBlockedReason(target)
         if (reason) { root.notice = reason; return false }
+        if (target === "daily") {
+            // Daily planning is a read/write surface over project pages
+            // with no agent of its own. Idle workers pause like the
+            // journal transition; busy workers block via blockedReason.
+            root.interactionGeneration++
+            root.pauseIdleAgents()
+            root.activeTab = "daily"
+            root.notice = ""
+            // Refresh the day view, respecting an in-flight request or an
+            // open completion draft (reload itself guards busy/saving).
+            if (root.agenda && !root.agenda.agendaBusy && !root.agenda.agendaRetiring
+                    && !root.agenda.completionSaving) root.agenda.reload()
+            return true
+        }
         if (target === "journal") {
             // Leaving projects is an idle pause only.  It cannot happen while
             // any selected worker is active because blockedReason guarded it.
@@ -842,6 +893,8 @@ PanelWindow {
         if (activeTab === "journal") {
             if (journalChild) journalChild.activate()
             if (journalChild) journalChild.focusComposer()
+        } else if (activeTab === "daily") {
+            if (agenda && !agenda.agendaBusy && !agenda.completionSaving) agenda.reload()
         } else {
             projectSearch.forceActiveFocus()
             if (selectedPath) selectedAgent = agentFor(selectedPath)
@@ -884,7 +937,7 @@ PanelWindow {
         listStarted = false
         listStartFailed = false
         listProcess.command = ["python3", Quickshell.shellPath("scripts/project_planner.py"),
-            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "/home/franzs/Nextcloud/Documents/Notes/", "list"]
+            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "", "list"]
         listTimeout.restart()
         listProcess.running = true
         return true
@@ -913,7 +966,7 @@ PanelWindow {
         pageStarted = false
         pageBusy = true
         pageProcess.command = ["python3", Quickshell.shellPath("scripts/project_planner.py"),
-            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "/home/franzs/Nextcloud/Documents/Notes/", "page"]
+            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "", "page"]
         pageTimeout.restart()
         pageProcess.stdinEnabled = true
         pageProcess.running = true
@@ -978,7 +1031,7 @@ PanelWindow {
         errorMessage = ""
         notice = "Writing checkbox…"
         toggleProcess.command = ["python3", Quickshell.shellPath("scripts/project_planner.py"),
-            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "/home/franzs/Nextcloud/Documents/Notes/", "toggle"]
+            "--graph", Quickshell.env("LOGSEQ_GRAPH") || "", "toggle"]
         toggleWarningTimer.restart()
         toggleProcess.stdinEnabled = true
         toggleProcess.running = true
@@ -1389,6 +1442,16 @@ PanelWindow {
         }
     }
 
+    // Daily-agenda writes return the authoritative page: refresh the cache
+    // without interrupting agent work.
+    Connections {
+        target: root.agenda
+        enabled: !!root.agenda
+        function onPageWritten(page) {
+            root.applyAgendaPage(page)
+        }
+    }
+
     Rectangle {
         id: backdrop
         anchors.fill: parent
@@ -1455,6 +1518,15 @@ PanelWindow {
                         checked: root.activeTab === "journal"
                         Accessible.name: "Journal assistant tab"
                         onClicked: root.selectTab("journal")
+                    }
+                    WidgetIconButton {
+                        text: "Daily"
+                        iconSource: "icons/history.svg"
+                        tooltipText: "Daily"
+                        checkable: true
+                        checked: root.activeTab === "daily"
+                        Accessible.name: "Daily planner tab"
+                        onClicked: root.selectTab("daily")
                     }
                     Text {
                         text: root.graphName
@@ -1953,6 +2025,27 @@ PanelWindow {
                         Layout.fillHeight: true
                         parentPlannerClose: root.close
                         Component.onCompleted: root.journalChild = journalAssistant
+                    }
+                    Rectangle {
+                        visible: root.activeTab === "daily"
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        color: "transparent"
+                        Accessible.name: "Daily planner"
+                        Flickable {
+                            id: dailyFlick
+                            anchors.fill: parent
+                            clip: true
+                            contentWidth: width
+                            contentHeight: dailyPlanner.implicitHeight
+                            boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                            DailyPlanner {
+                                id: dailyPlanner
+                                width: dailyFlick.width
+                                agenda: root.agenda
+                            }
+                        }
                     }
                 }
 

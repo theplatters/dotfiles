@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+# Per-machine settings (see settings.example.json). Never commit the real
+# logseqGraph path; every machine keeps its own copy.
+settings.json

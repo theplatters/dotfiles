@@ -6,7 +6,7 @@
  * rebuildModel/loadModeData; this component only fetches and reports.
  *
  * Owned state/processes:
- * - todoProcess (logseq_todos.py with LOGSEQ_GRAPH default),
+ * - todoProcess (logseq_todos.py with LOGSEQ_GRAPH/settings.json default),
  *   clipboardProcess (cliphist list), fileProcess (palette_files.py
  *   --query/--limit 40) + fileDelay Timer (180ms debounce).
  * - todos (var), clipboardText (string), fileRows (var), fileBusy (bool),
@@ -87,8 +87,10 @@ Item {
 
     Process {
         id: todoProcess
+        // Empty graph arg means "no override": logseq_todos.py resolves
+        // LOGSEQ_GRAPH, then logseqGraph in settings.json.
         command: ["python3", Quickshell.shellPath("scripts/logseq_todos.py"),
-            Quickshell.env("LOGSEQ_GRAPH") || "/home/franzs/Nextcloud/Documents/Notes/"]
+            Quickshell.env("LOGSEQ_GRAPH") || ""]
         stdout: StdioCollector { id: todoOutput }
         onExited: (code) => root.finishTodoLoad(code, todoOutput.text,
                                                 root.todoProcessGeneration)

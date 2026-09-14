@@ -11,6 +11,20 @@ Run directly with Quickshell (no build step for the shell itself):
 quickshell -c /home/franzs/.config/quickshell
 ```
 
+## Settings
+
+Per-machine settings live in `settings.json` (git-ignored; copy
+`settings.example.json` to get started):
+
+```json
+{"logseqGraph": "/home/user/Nextcloud/Documents/Notes"}
+```
+
+The Logseq graph is resolved as `--graph` > `LOGSEQ_GRAPH` >
+`logseqGraph` in `settings.json` (see
+`scripts/quickshell_settings.py`). `QUICKSHELL_SETTINGS` may point at an
+alternate settings file. There is no hardwired default path.
+
 ## Planner/journal/palette workers
 
 Project planner, journal, and command-palette workers all run through the
@@ -20,7 +34,8 @@ palette uses `--mode palette`: direct `pi --mode rpc --approve` with no
 scoped wrapper, scope vars cleared (`QS_PROJECT_PATH`,
 `QS_PROJECT_SESSION_SCOPE`, `QS_JOURNAL_MODE`,
 `QS_JOURNAL_SESSION_SCOPE`), and its general tool scope intact.
-`LOGSEQ_GRAPH`/`PI_CODING_AGENT_SESSION_DIR` are inherited, and scoped
+`LOGSEQ_GRAPH`/`PI_CODING_AGENT_SESSION_DIR` are inherited (helpers fall
+back to `settings.json` when `LOGSEQ_GRAPH` is unset), and scoped
 session dirs are pinned by `QS_*_SESSION_SCOPE` handshakes. Scoped
 project/journal wrappers keep their page/journal scopes. Rust
 owns Pi lifecycle/parsing, request correlation, and the approval

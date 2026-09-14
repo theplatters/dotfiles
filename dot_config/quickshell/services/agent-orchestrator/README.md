@@ -99,7 +99,9 @@ project mode sets `QS_PROJECT_PATH` and clears `QS_JOURNAL_MODE`/
 `QS_JOURNAL_SESSION_SCOPE`; journal mode sets `QS_JOURNAL_MODE=1` and an empty
 `QS_PROJECT_PATH`, clearing `QS_PROJECT_SESSION_SCOPE`. Each scoped wrapper
 then sets its own `QS_*_SESSION_SCOPE`.
-`LOGSEQ_GRAPH`/`PI_CODING_AGENT_SESSION_DIR` are inherited.
+`LOGSEQ_GRAPH`/`PI_CODING_AGENT_SESSION_DIR` are inherited (when
+`LOGSEQ_GRAPH` is unset, helpers fall back to `logseqGraph` in
+`settings.json`).
 
 The palette forwards `--session-dir`/`--session`/`--name`; scoped modes forward
 `--session`/`--pending-name`/`--new-session`.
@@ -276,3 +278,199 @@ are unaffected by this bridge:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
+
+## Phase 1 desktop-activity collector (`qs-desktop-context`)
+
+Standalone same-crate binary recording Hyprland focus/title/workspace
+activity to a private local SQLite DB. Phase 1 is collect + local query
+only: no QML wiring, no `ScopedAgent`/Pi bridge changes, no Pi protocol
+changes. Per-scope Pi bridges keep their idle/`stopIdle` behavior;
+nothing auto-starts this collector, and no worker consumes the DB yet
+(library API in `src/lib.rs`, or read-only `history` below).
+
+### Build
+
+Same locked release build as the bridge (repo root); produces both binaries:
+
+```sh
+cargo build --locked --release --manifest-path services/agent-orchestrator/Cargo.toml
+```
+
+```text
+services/agent-orchestrator/target/release/qs-agent-orchestrator
+services/agent-orchestrator/target/release/qs-desktop-context
+```
+
+### Run (Hyprland session only)
+
+Launch inside the Hyprland environment so `XDG_RUNTIME_DIR` /
+`HYPRLAND_INSTANCE_SIGNATURE` are inherited; without them the collector
+waits on `no hyprland sockets`. Optional `exec-once` (absolute checkout
+path, no auto-start otherwise):
+
+```text
+exec-once = /home/franzs/.config/quickshell/services/agent-orchestrator/target/release/qs-desktop-context
+```
+
+Discovery is strict (`discover_sockets_with`): explicit signatures must
+be safe single segments (`[A-Za-z0-9_.-]`, ≤128 chars), and both
+endpoints must be owned non-symlink sockets of the euid (files,
+foreign sockets, symlinks rejected). Without a signature, healthy
+candidates across modern and legacy bases are liveness-probed (200 ms):
+stale loses to live, but multiple *live* instances resolve to `None` —
+set `HYPRLAND_INSTANCE_SIGNATURE` explicitly.
+
+Deadlines: connect 2 s (`connect_bounded`); requests 4 s total, each
+wait capped by the remaining budget; idle read 1 s; coalesce ~50 ms.
+
+CLI (diagnostics to stderr; stdout carries ONLY history JSON in
+`history` mode):
+
+```text
+usage: qs-desktop-context [--db PATH] [collect] | history [--limit N] [--from START_MS --to END_MS [--limit N]]
+```
+
+- `collect` (default) holds the per-DB lock for life; exit 1 when the
+  lock is held or the DB cannot be prepared/opened, exit 2 on usage errors.
+- `history` is strictly read-only, never live `current`; missing DB →
+  `[]` (exit 0) with a not-run-yet note, bad limit/range → exit 1.
+- Only `--db`, `--limit`, `--from`/`--to`, `collect`, `history`,
+  `--help`/`-h` exist — no redaction/retention/follow/format flags.
+
+### Database location, strict permissions, per-DB lock
+
+Default `$XDG_STATE_HOME/quickshell/desktop-activity/activity.db`,
+else `$HOME/.local/state/…` (errors when neither resolves); `--db PATH`
+overrides fully. The lock is a per-database `<dbname>.lock` sibling
+(`lock_path_for`; `activity.db` → `activity.db.lock`, so two DBs in one
+directory never share a lock; `validate_lock_for_db` /
+`canonical_lock_path_for` reject alias escapes). One collector per DB:
+`flock(LOCK_EX|LOCK_NB)` held for life; a second exits 1 with
+`already locked`. Shutdown is `SIGTERM`/`SIGINT` to a polled flag
+(`SIGPIPE` ignored), followed by a bounded ~2 s final drain (deadline
+checked per row, ≤100 ms overrun for one in-flight append); clean drain
+ends in `shutting down` (exit 0), remainder ends in
+`shutdown incomplete: N pending` (exit 1, no durable spool).
+
+Strict, never an arbitrary `chmod`: missing parents are created `0700`
+from the outset, existing ancestors untouched; an existing leaf must
+already be an euid-owned real directory with no group/other bits and no
+symlink components, else startup fails unmodified. New DB/lock files are
+`0600`; existing DB, lock, and sidecars (`-wal`, `-shm`, `-journal`)
+must be euid-owned private regular files, never symlinks. WAL stays
+best-effort.
+
+Custom `--db` example — make the directory private first (a
+pre-existing `0755` leaf is rejected, not repaired):
+
+```sh
+BIN=services/agent-orchestrator/target/release/qs-desktop-context
+install -d -m 0700 /tmp/qs-test
+"$BIN" --db /tmp/qs-test/activity.db
+"$BIN" --db /tmp/qs-test/activity.db history --limit 5
+"$BIN" --db /tmp/qs-test/activity.db history --from 1700000000000 --to 1700003600000 --limit 20
+```
+
+### Schema and truly read-only history
+
+Schema (`SCHEMA_VERSION = 1`): singleton
+`schema_version(version INTEGER PRIMARY KEY)` + `activity(id
+AUTOINCREMENT, observed_at_ms, kind, source, snapshot_json)` +
+`idx_activity_time(observed_at_ms, id)`. Opens validate authoritatively
+before any mutation (transactional setup): foreign tables, newer
+versions, and multi-row `schema_version` are rejected
+(`IncompatibleSchema`) without modification.
+
+`history` uses `open_read_only`: creates nothing, takes no lock,
+`PRAGMA query_only=ON`. Missing DB → `[]` (exit 0); permission,
+unsafe-path, schema errors are distinct exit-1 failures. Queries (UTC
+epoch-ms, `limit` 1..=1000): recent newest-first (`DESC, DESC`); range
+start-inclusive/end-exclusive, oldest-first, ties by `id`.
+
+### Snapshots, dedup, bounded backlog
+
+Each snapshot runs four bounded queries per attempt
+(`j/activewindow` + `j/activeworkspace`, reread pair) for up to 3
+attempts: rereads must agree SEMANTICALLY (parsed focus/workspace fields
++ embedded workspace id, ignoring JSON formatting, geometry, counts, and
+other irrelevant metadata) and the window's embedded workspace must
+match the activeworkspace (special workspaces exempt); torn reads fail
+with `Timeout` instead of persisting an impossible mix, while I/O and
+shape errors (non-JSON/wrong-typed JSON) fail fast without retry.
+`{}` is valid empty; title commas preserved. Only whitelisted
+meaningful events trigger one reconciliation (paired bursts coalesced;
+EOF mid-coalesce ends disconnected with no snapshot on the dead
+subscription); malformed/oversize/cosmetic lines are ignored. Subscribe
+to `.socket2.sock` first, then snapshot — nothing missed, no restored
+`current`.
+
+`Tracker` is live state only (`current_context()` starts `None`, never
+backfilled). The durable path is `enqueue` with queue-tail dedup (so
+`A → B → A` across failures keeps `B`) into a bounded FIFO (128) with
+ORIGINAL timestamps, flushed in order on idle/backoff — never via a
+compositor query (no desktop polling). Overflow is an explicit gap with
+finite memory: the new observation is DROPPED with an
+`observation gap` line on stderr (no reserved slot, no lossless claim);
+the pre-existing backlog is retained and the session ends
+(`BacklogFull`). While the backlog stays full the outer loop enters an
+explicit storage-blocked state: ONLY persistence retries + backoff, NO
+discovery/snapshot queries until capacity recovers. While no subscription
+is held live `current` reads unavailable via local-only marking
+(`mark_current_unavailable_local`), never stale available. Honest gap:
+the backlog is in-memory, so crash-before-flush loses rows and
+overflow/storage-blocked events are dropped with explicit gaps — on
+stderr, never claimed as saved.
+
+Shutdown performs a bounded final drain with a fixed deadline
+(`SHUTDOWN_DRAIN_DEADLINE = 2 s`), checked between individual appends so
+slow-but-successful rows cannot push the whole drain past it; at most one
+in-flight SQLite busy-wait (≤100 ms) may overrun. Any remainder is
+reported as `shutdown incomplete` with its pending count and exits
+nonzero (1, no durable spool — in-memory backlog is lost).
+
+Kinds: `focus`, `title`, `workspace`, `availability`, `snapshot`. A
+focused-window `Some ↔ None` change is `focus` (focus loss/gain proves
+no lifecycle); `window_open`/`window_close` are reserved and never
+emitted in Phase 1. Key names: `Tracker::{new, current_context,
+enqueue, pending_front, pop_pending_front, mark_persisted,
+mark_current_unavailable_local, backlog_is_full}`,
+`flush_pending`, `final_drain`, `ActivityStore::{open, open_read_only,
+open_in_memory, append, recent_activity, activity_in_range,
+schema_version}`, `fetch_snapshot[_at]`, `connect_bounded`,
+`run_collector_once`/`run_collector_forever`, `acquire_lock`,
+`default_db_path`, `lock_path_for`, `ensure_parent_dir`
+(`BACKOFF_INITIAL`/`BACKOFF_MAX`, `SHUTDOWN_DRAIN_DEADLINE`,
+`MAX_PENDING_OBSERVATIONS = 128`, `SNAPSHOT_MAX_ATTEMPTS = 3`).
+
+### Manual checks and tests
+
+With a scratch `--db` (private dir first, as above) inside a Hyprland
+session: start collection (expect `collecting to …`); run
+`history --limit 20` twice idle — ids/count unchanged (dedup); switch
+window/title/workspace and see one new `focus`/`title`/`workspace` row
+each; `kill -TERM <pid>` drains pending within ~2 s (deadline checked per
+row, ≤100 ms overrun for one in-flight append) and exits 0, or exits
+1 with `shutdown incomplete: N pending` when storage stays blocked (no
+durable spool); socket loss logs `reconnecting` with backoff, and a
+second collector on the same `--db` exits 1 with `already locked`.
+
+```sh
+cargo test --locked --manifest-path services/agent-orchestrator/Cargo.toml
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+Covers FIFO order/overflow, semantic reread stability (irrelevant
+metadata ignored), discovery safety, read-only non-mutation, schema
+rejection, fake-socket event→snapshot→disconnect→unavailable,
+storage-blocked persistence-only backoff with no extra snapshots plus
+ordered recovery, and shutdown drain (recovered vs persistent failure).
+
+### Privacy and limitations
+
+Titles/app names stored verbatim (title ≤1024, app ≤256 chars); no
+redaction or retention controls — skip the collector or use a throwaway
+`--db` if sensitive. Hyprland-only; event-triggered only (no polling
+fallback); one writer per DB; `history` prints pretty JSON rows only;
+crash-before-flush loses queued rows, overflow drops the new observation
+with an explicit `observation gap`, and shutdown keeps only what the ~2 s
+per-row-bounded drain persists (no lossless-recovery claim, no durable spool).
