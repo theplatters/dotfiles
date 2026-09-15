@@ -132,17 +132,34 @@ class WidgetAdoptionTests(unittest.TestCase):
         self.assertIn("icons/panel-right-open.svg", tasks)
 
     def test_planner_and_journal_session_buttons_share_widget_button(self):
-        for source, guard in ((PLANNER, "root.sessionControlsEnabled()"),
-                              (JOURNAL, "root.sessionControlBlockedReason()")):
-            self.assertIn("WidgetButton", source)
-            for label in ('text: "New session"', 'text: "Rename"',
-                          'text: "Restore session"'):
-                self.assertIn(label, source)
-            self.assertIn("onClicked: root.newSession()", source)
-            self.assertIn("onClicked: root.openRename()", source)
-            self.assertIn("onClicked: root.restoreSession()", source)
-            self.assertIn("enabled:", source)
-            self.assertIn(guard, source)
+        # Journal keeps three WidgetButtons with direct session actions.
+        self.assertIn("WidgetButton", JOURNAL)
+        for label in ('text: "New session"', 'text: "Rename"',
+                      'text: "Restore session"'):
+            self.assertIn(label, JOURNAL)
+        self.assertIn("onClicked: root.newSession()", JOURNAL)
+        self.assertIn("onClicked: root.openRename()", JOURNAL)
+        self.assertIn("onClicked: root.restoreSession()", JOURNAL)
+        self.assertIn("enabled:", JOURNAL)
+        self.assertIn("root.sessionControlBlockedReason()", JOURNAL)
+        # Planner compacts the same three actions into a Session menu
+        # opened from a WidgetButton, preserving gating and routing.
+        self.assertIn("WidgetButton", PLANNER)
+        self.assertIn("id: sessionMenuButton", PLANNER)
+        self.assertIn("id: sessionMenu", PLANNER)
+        self.assertIn("MenuItem {", PLANNER)
+        for label in ('text: "New session"', 'text: "Rename"',
+                      'text: "Restore session"'):
+            self.assertIn(label, PLANNER)
+        session_block = PLANNER[PLANNER.index("id: sessionMenu"):PLANNER.index("id: modelMenu")]
+        self.assertIn("root.sessionControlsEnabled()", session_block)
+        self.assertIn("root.newSession()", session_block)
+        self.assertIn("root.openRename()", session_block)
+        self.assertIn("root.restoreSession()", session_block)
+        self.assertIn("root.sessionMenuValidFor(owner, path, session)", session_block)
+        self.assertIn("onClicked: sessionMenu.open()", PLANNER)
+        self.assertIn("enabled:", PLANNER)
+        self.assertIn("root.sessionControlsEnabled()", PLANNER)
 
     def test_palette_history_toggle_uses_shared_icon_control(self):
         self.assertIn("WidgetIconButton", PALETTE)

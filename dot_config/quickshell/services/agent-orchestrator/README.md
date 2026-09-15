@@ -279,14 +279,18 @@ are unaffected by this bridge:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-## Phase 1 desktop-activity collector (`qs-desktop-context`)
+## Desktop-activity collector (`qs-desktop-context`): Phase 1 base + Phase 2 enrichment
 
 Standalone same-crate binary recording Hyprland focus/title/workspace
-activity to a private local SQLite DB. Phase 1 is collect + local query
-only: no QML wiring, no `ScopedAgent`/Pi bridge changes, no Pi protocol
-changes. Per-scope Pi bridges keep their idle/`stopIdle` behavior;
-nothing auto-starts this collector, and no worker consumes the DB yet
-(library API in `src/lib.rs`, or read-only `history` below).
+activity to a private local SQLite DB, plus implemented Phase 2
+application-aware enrichment (optional typed `resource` per snapshot;
+new `context` kind). Still collect + local query only: no QML wiring,
+no `ScopedAgent`/Pi bridge changes, no Pi protocol changes. Per-scope
+Pi bridges keep their idle/`stopIdle` behavior; nothing auto-starts or
+auto-installs this collector, and no worker/search/session consumer
+reads the DB yet (library API in `src/lib.rs`, or read-only `history`
+below). Phase 3 (future search/session use) must handle the freshness
+notes under Phase 2 below; nothing here promises it.
 
 ### Build
 
@@ -373,10 +377,14 @@ install -d -m 0700 /tmp/qs-test
 
 ### Schema and truly read-only history
 
-Schema (`SCHEMA_VERSION = 1`): singleton
+Current store is schema v2 (`SCHEMA_VERSION = 2`): singleton
 `schema_version(version INTEGER PRIMARY KEY)` + `activity(id
-AUTOINCREMENT, observed_at_ms, kind, source, snapshot_json)` +
-`idx_activity_time(observed_at_ms, id)`. Opens validate authoritatively
+AUTOINCREMENT, observed_at_ms, kind, source, snapshot_json,
+project_id TEXT NULL)` + `idx_activity_time(observed_at_ms, id)` +
+`idx_activity_project(project_id, observed_at_ms, id)`.
+Phase 1 base was schema v1 (same table without `project_id` and only
+the time index); v1 files migrate transactionally on writable open and
+stay readable read-only (see project attribution below). Opens validate authoritatively
 before any mutation (transactional setup): foreign tables, newer
 versions, and multi-row `schema_version` are rejected
 (`IncompatibleSchema`) without modification.
@@ -428,19 +436,224 @@ in-flight SQLite busy-wait (≤100 ms) may overrun. Any remainder is
 reported as `shutdown incomplete` with its pending count and exits
 nonzero (1, no durable spool — in-memory backlog is lost).
 
-Kinds: `focus`, `title`, `workspace`, `availability`, `snapshot`. A
-focused-window `Some ↔ None` change is `focus` (focus loss/gain proves
-no lifecycle); `window_open`/`window_close` are reserved and never
-emitted in Phase 1. Key names: `Tracker::{new, current_context,
+Kinds: `focus`, `title`, `workspace`, `context` (Phase 2: same focused
+window/workspace, only the application `resource` changed),
+`availability`, `snapshot`. A focused-window `Some ↔ None` change is
+`focus` (focus loss/gain proves no lifecycle); `window_open`/
+`window_close` are reserved and never emitted. Legacy compatibility:
+`SCHEMA_VERSION` stays `1` with the same `activity` table — the
+snapshot JSON just gains an additive optional `resource` object, so
+Phase 1 rows without `resource` (and without the focused-window
+`process_id`) still deserialize to `None` and round-trip; the stored
+`kind` string `"resource"` reads back as `context`. `process_id`
+(Hyprland `pid`, lenient `None` when absent) is correlation metadata
+only and never affects semantic equality/classification on its own.
+Key names: `Tracker::{new, current_context,
 enqueue, pending_front, pop_pending_front, mark_persisted,
 mark_current_unavailable_local, backlog_is_full}`,
 `flush_pending`, `final_drain`, `ActivityStore::{open, open_read_only,
 open_in_memory, append, recent_activity, activity_in_range,
 schema_version}`, `fetch_snapshot[_at]`, `connect_bounded`,
-`run_collector_once`/`run_collector_forever`, `acquire_lock`,
+`run_collector_once`/`run_collector_forever`
+(`run_collector_once_with_enrich`/`run_collector_forever_with_enrich`
+with `AppRefreshConfig`), `acquire_lock`,
 `default_db_path`, `lock_path_for`, `ensure_parent_dir`
 (`BACKOFF_INITIAL`/`BACKOFF_MAX`, `SHUTDOWN_DRAIN_DEADLINE`,
 `MAX_PENDING_OBSERVATIONS = 128`, `SNAPSHOT_MAX_ATTEMPTS = 3`).
+Enrichment API: `ResourceContext`, `enrich_desktop_context`,
+`enrich_with_env`, `EnrichmentEnv`, `ResourceProvider`,
+`APP_REFRESH_INTERVAL`, `RECORD_FRESHNESS_MS`, `LAST_GOOD_TTL_MS`.
+
+### Phase 2 application enrichment (implemented, opt-in per app)
+
+Additive optional `resource` object on `DesktopContext`
+(`adapter`, `file`, `cwd`, `git_root`, `git_branch`, `url`, `page`,
+`title`; adapter-only shells normalize to `None`; bounds: adapter 64,
+paths 4096, branch 256, url 2048, page 1024 chars). Same table, same
+schema version — old rows keep working, new `context` rows appear only
+when the resource changes under an unchanged focus/workspace. The
+shipped `qs-desktop-context` binary already runs this path
+(`run_collector_forever` → default `AppRefreshConfig` →
+environment-driven `enrich_desktop_context`); each provider stays
+disabled until its own opt-in variables/files exist, and a disabled or
+failing provider never fails the base snapshot.
+
+How it runs (async, best-effort, no desktop polling): every compositor
+snapshot persists its BASE immediately on the event thread — merged with
+the live overlay for the same exact window (opaque id + application +
+client PID), because a raw fetch carries `resource: None`, which is not
+confirmed absence; without the merge every compositor event would
+oscillate clear/restore rows. A bounded background worker (one thread
+per session, one in flight, latest request wins, panics caught to base)
+then enriches a resource-free copy (the merged overlay is for immediate
+persistence only, so confirmed absence clears on the event path while
+transient gaps stay masked by bounded last-good); a process-wide hard cap
+of 16 concurrent workers
+bounds threads no matter how fast sessions reconnect — a denied session
+(or a spawn failure, which releases its slot) runs base-only instead of
+stacking threads. Pending compositor bytes always win over harvest:
+after every idle flush the fd is re-probed, and worker results are
+accepted only when it reads idle; a relevant event invalidates the
+generation immediately (before coalescing), so the expected shape is
+base-first then a `context` row. Terminal paths
+(EOF/read errors) never drain enrichment: the subscription is dead, so
+in-flight results are discarded and the session marks unavailable
+immediately. Enriched rows carry completion time (`now_ms` at persist),
+so idle resource changes advance history time. Enriched overflow
+propagates `BacklogFull` with local-unavailable marking exactly like
+snapshot overflow. Worker threads always stop with their session (held
+slot count observable via `enrich_workers_live`); sessions are sequential
+so at most one worker is live in production. Separately, a low-frequency application-only
+refresh (`APP_REFRESH_INTERVAL = 5 s`) re-submits the live base with a
+fresh timestamp for re-enrichment during idle reads — no
+`fetch_snapshot`, no `discover`, no storage-blocked bypass. Corrected
+polling claim: no *desktop* polling (base stays event-triggered);
+application refresh only. The storage-blocked loop stays
+persistence-only (no discovery, no snapshot, and no application
+refresh) until capacity recovers.
+
+Oscillation guard: bounded thread-local last-good cache
+(`LAST_GOOD_TTL_MS = 60 s`, max 64 focus keys of lowercased app +
+opaque window id + client PID, so a reused address never inherits the
+previous occupant). Thread-locality means each session worker starts
+fresh (reconnects invalidate automatically). Provider `None`
+(transiently unavailable) serves the cached resource for the same focus
+within TTL instead of flapping; a confirmed mismatch (kitty peer,
+explicit binding) evicts instead of serving, never returning foreign
+data. Kitty-path serves additionally require the exact verified
+pane + editor PID recorded alongside the cached neovim value
+(nonsemantic metadata, never persisted): a missing record on a
+different pane or for a new editor PID clears, evicts, and falls back
+to the verified pane cwd instead of serving old; unresolvable or
+ambiguous pane focus is likewise a confirmed mismatch. A fresh result with a transiently-missing `git_branch` is
+backfilled from the cache when the file/cwd/url/page anchor is
+unchanged — but carried git keeps its ORIGINAL timestamps, so repeated
+partial resolutions cannot renew the window past TTL, and a confirmed
+non-repo (git's own "not a git repository" text under `LC_ALL=C`)
+clears metadata immediately instead of back-filling. Cache health and
+timestamps never enter the persisted resource, so last-good alone never
+creates activity.
+
+Per-app (all bounded, no shell, no file-content reads; details in
+`integrations/*/README.md`):
+
+- Neovim (opt-in Lua `qs-context.lua`): publishes the actual `file` +
+  `cwd` per PID (`<pid>.json`, `0600`, atomic rename, `0700`
+  euid-owned dir, default
+  `$XDG_RUNTIME_DIR/quickshell/nvim-context`). Epoch
+  `updated_at_ms` via `gettimeofday` (wall clock, not monotonic);
+  collector ignores records older than 30 s. Standalone `nvim`/`neovim`
+  class binds record PID == focused client PID; inside kitty it wins
+  only as the unique foreground `nvim` with a fresh correlated record
+  (matching kitty window id when both present). Relative `file` is
+  resolved against `cwd`. The collector (not Lua) attaches
+  `git_root`/`git_branch`.
+- Kitty (opt-in remote control): `allow_remote_control socket-only`
+  only (never `yes`; `socket-only` is a transport restriction — only
+  local-socket peers may issue remote commands at all — not a
+  read-only flag, so keep the socket private regardless), socket at an
+  absolute path under a private runtime parent with a per-instance PID
+  suffix, addressed as the exact `unix:` address `kitty @ --to`
+  requires (bare paths and `unix:` addresses both normalize; see kitty
+  README; no `/tmp` public-parent example). Identity is `SO_PEERCRED`
+  peer PID == focused Hyprland client PID over the same bounded
+  connector (a present but unequal peer is a confirmed mismatch:
+  evicted, never last-good-served), then unique-`is_focused` OS
+  window/tab/pane (any ambiguity yields no resource; numeric id==pid
+  conflation rejected). Pane cwd is the unanimous foreground-process
+  cwd else the focused pane `cwd`. Query bounded (1.5 s, 256 KiB).
+- Zen (honest fallback + opt-in explicit): default `zen-title` carries
+  only the focused window title, `url` stays `null`. An explicit URL
+  comes only from an externally supplied private JSON file
+  (`QS_ZEN_CONTEXT_FILE`, `0600`, ≤16 KiB) holding `window_id` + `pid`
+  + `url`/`title` + epoch `updated_at_ms` (≤30 s); both the opaque
+  compositor window id AND the client PID must match, else title
+  fallback (confirmed mismatch) or bounded last-good (transient
+  unreadable). No bundled publisher — your helper must sample the
+  focused id+pid from the compositor in the same tick as the URL,
+  write atomically, and refresh roughly every ~10 s.
+- Logseq (title-only, no HTTP): the local `getCurrentPage` API was
+  removed — it reports a process-global page with no verifiable
+  per-window binding (a configured window id cannot prove the global
+  value belongs to the focused window without polling), so any
+  attributed page would be deceptive. `logseq-title` always carries the
+  full window title plus `page` only via the explicit rule `<page> -
+  Logseq` suffix-strip (anything else: `page` stays `null`, never a
+  guess, never a URL).
+- Git (collector-side, neovim/kitty paths only): bounded
+  `git -C <dir> rev-parse` (1 s each, 8 KiB stdout, 2 KiB stderr,
+  `LC_ALL=C`) from the file parent else `cwd`. Explicit non-repos
+  (git's own "not a git repository") clear metadata immediately;
+  timeouts/missing binaries stay transient for last-good fill.
+  Detached HEAD yields `detached:<short-sha>`; worktrees resolve to
+  their own root/branch; relative/malicious paths rejected. A transient
+  branch miss leaves `git_branch` unset for last-good fill (which never
+  renews its own TTL) rather than persisting a removal.
+
+Security: full URLs, absolute paths, and window titles are stored
+verbatim in the private DB (no redaction, no retention controls);
+file *contents* are never read (only published records plus `git
+rev-parse` metadata). Skip the collector or use a throwaway `--db` if
+sensitive. Private-file rules from Phase 1 extend to enrichment inputs
+(euid-owned, no group/other bits, no symlinks, `O_NOFOLLOW`, size
+bounds; over-permissive/foreign/malformed inputs ignored).
+
+Setup prerequisites (manual; nothing auto-installs or auto-starts):
+Rust/Cargo locked release build, a Hyprland session with
+`XDG_RUNTIME_DIR`/`HYPRLAND_INSTANCE_SIGNATURE`, one opt-in at a time
+(`QS_KITTY_SOCKET` or `KITTY_LISTEN_ON`; Lua `qs-context.lua` with
+`vim.g.qs_nvim_context_enable = true`; `QS_ZEN_CONTEXT_FILE`;
+Logseq needs no config — title-only), and
+an optional manual `exec-once` for the collector. Phase 3 note: future
+search/session consumers must treat `resource` as best-effort and
+stale-tolerant (5 s refresh cadence, 30 s record freshness, 60 s
+last-good window, focus-bound invalidation) and must re-validate before
+acting; no QML/search/session wiring exists yet.
+
+### Desktop project attribution (deterministic, existing mapping only)
+
+Deterministic overlay of the existing snapshot onto the existing
+`scripts/projects.py` UUID registry (`QUICKSHELL_PROJECTS_FILE`
+precedence; never parses `projects.toml` directly). No new model, no
+inference, no writes. Full contract, CLI/Python usage, and limits:
+`docs/desktop-project-context.md`.
+
+- `DesktopContext.project` is `{id, name, matched_by}` only
+  (`file`/`cwd`/`git_root`/`git_remote`); missing in old JSON reads as
+  `None`. Unknown/ambiguous stays unassociated — no UI-selected
+  fallback.
+- Precedence `file > cwd > git_root > git_remote`, longest
+  component-boundary folder wins per level; ties across projects at one
+  level mean no association. Remotes are canonical GitHub
+  HTTPS/SSH/scp (`https://github.com/owner/repo`, credentials stripped,
+  never persisted); exactly one distinct registered claim wins while
+  unmapped upstreams are ignored; conflicting mapped remotes mean
+  unknown. Discovery is local `git config` only (linked worktrees via
+  `commondir` supported), no network.
+- Caches: registry subprocess only on metadata change (no repeat Python
+  when unchanged); folder projection TTL 5 s; remotes 30 s TTL plus
+  git-config invalidation.
+- Store is schema v2 with indexed `project_id` (append-time,
+  backfilled transactionally from v1 on writable open, read-only v1
+  supported, no retroactive reassignment).
+- CLI: `current`, `current-project`, `history --project UUID`,
+  `last-activity --project UUID`, `resources --project UUID [--limit]`.
+  `current` is a fresh on-demand snapshot plus focus recheck — not
+  collector IPC/history. Python `scripts/desktop_projects.py` serves
+  `current-project` / `todos` / `logseq-context` / `recent-activity` /
+  `last-activity` / `resources` (overrides `--projects-file` `--graph`
+  `--db` `--desktop-bin`; reuses the `read_page` task parser;
+  name-only projects have history but no Logseq). Five additive Pi
+  tools only; existing scopes unaffected. Same locked release build as
+  above; nothing auto-installs or auto-starts. No
+  LLM/embeddings/screenshots/sessions/Resume.
+- Limits: async initial base is bare, then a `context` row; fresh-query
+  helper caches are process-local; latest-resource streaming is bounded
+  but can scan long duplicate runs; historical ids persist across
+  remove/rename; graph context follows the current mapping; hung mounts
+  are not hard-bounded; the binary's helper path is compile-time (move
+  the checkout → rebuild). Next-phase consumers must keep resource-id
+  identity/ordering and retention with no new semantic layer.
 
 ### Manual checks and tests
 
@@ -448,7 +661,10 @@ With a scratch `--db` (private dir first, as above) inside a Hyprland
 session: start collection (expect `collecting to …`); run
 `history --limit 20` twice idle — ids/count unchanged (dedup); switch
 window/title/workspace and see one new `focus`/`title`/`workspace` row
-each; `kill -TERM <pid>` drains pending within ~2 s (deadline checked per
+each; with an opt-in provider set, change only the app resource (e.g.
+nvim buffer, kitty cwd, bound Zen URL, Logseq title page) and see one
+new `context` row, then repeat unchanged and see dedup (last-good masks
+transient blips without new rows); `kill -TERM <pid>` drains pending within ~2 s (deadline checked per
 row, ≤100 ms overrun for one in-flight append) and exits 0, or exits
 1 with `shutdown incomplete: N pending` when storage stays blocked (no
 durable spool); socket loss logs `reconnecting` with backoff, and a
@@ -467,10 +683,19 @@ ordered recovery, and shutdown drain (recovered vs persistent failure).
 
 ### Privacy and limitations
 
-Titles/app names stored verbatim (title ≤1024, app ≤256 chars); no
+Titles/app names/URLs/paths stored verbatim (title ≤1024, app ≤256 chars; resource paths ≤4096, branch ≤256, url ≤2048, page ≤1024); no
 redaction or retention controls — skip the collector or use a throwaway
-`--db` if sensitive. Hyprland-only; event-triggered only (no polling
-fallback); one writer per DB; `history` prints pretty JSON rows only;
+`--db` if sensitive. File contents are never read. Hyprland-only; event-triggered base with no desktop polling
+fallback plus low-frequency application-only refresh (5 s, no compositor
+query); one writer per DB; `history` prints pretty JSON rows only;
 crash-before-flush loses queued rows, overflow drops the new observation
 with an explicit `observation gap`, and shutdown keeps only what the ~2 s
 per-row-bounded drain persists (no lossless-recovery claim, no durable spool).
+Enrichment is best-effort and focus-bound: the initial base row is bare
+by design (enrichment arrives as a later `context` row); a focus change
+discards in-flight enrichment for the old focus and EOF never waits for
+it, so a slow provider can delay a `context` row but never base rows,
+events, shutdown, or disconnect marking. Reused compositor addresses
+are safe (PID-keyed cache + overlay merge); Logseq has no page API
+(title rule only); Zen has no bundled URL publisher; a `context` row in
+flight at SIGTERM is lost while its base is safe.

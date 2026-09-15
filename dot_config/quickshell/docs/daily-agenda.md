@@ -57,7 +57,7 @@ python3 scripts/daily_agenda.py --graph PATH complete < complete.json
 python3 scripts/daily_agenda.py --graph PATH toggle < toggle.json
 ```
 
-### `list` — stdin `{"date": "YYYY-MM-DD"}`
+### `list` — stdin `{"date": "YYYY-MM-DD"}` (`date` optional, defaults to local today)
 
 ```json
 {"date": "2026-09-13"}
@@ -87,7 +87,8 @@ Returns:
 
 - Covers all safe project pages: every open task plus done tasks scheduled
   on the requested date. Done tasks scheduled elsewhere (or unscheduled)
-  are excluded; the UI filters the rest.
+  are excluded; the UI filters the rest. Omit `date` (or pass `null`) to
+  inspect local today.
 - `scheduledDate` is `""` when unscheduled.
 - Output is capped at 1000 tasks with `truncated: true` when capped.
   Tasks scheduled on the requested date are prioritized first so a cap never
@@ -161,15 +162,50 @@ Reuses the planner toggle and returns `{"page": <full read_page response>}`.
   (`focusMinutes`/`breakMinutes`, `pomoPhase`/`pomoRunning`/`pomoDeadline`).
 - `widgets/DailyPlanner.qml` — reusable UI bound to that state: Monday-start
   month grid (prev/next/Today/sync), scheduled list (toggle, remove,
-  `Finish…`), picker with search (`Add to day`), completion editor with a
-  required note and `Complete & save`, Pomodoro controls, reload, and
-  busy/error display.
+  `Finish…`), picker with search (`Add to day` schedules the picked open task
+  on the currently selected date via `select` with `selected: true`),
+  completion editor with a required note and `Complete & save`, Pomodoro
+  controls, reload, and busy/error display.
 - `widgets/CalendarPopout.qml` — clock-anchored `PopupWindow` hosting the
   planner UI; the bar clock (`widgets/Bar.qml` `clockAnchor`) toggles it.
 - `widgets/ProjectPlanner.qml` — genuine `Daily` tab (`icons/history.svg`)
   embedding the same `DailyPlanner`; agenda writes arrive via `pageWritten`
   and refresh the page cache through `applyAgendaPage` without touching
-  agents or drafts.
+  agents or drafts. Its `Add to day` action also targets the selected date.
+
+## Palette AI (constrained, palette-only)
+
+Palette mode registers two constrained tools over the same
+`scripts/daily_agenda.py` `list`/`select` backend and direct
+`quickshell-agenda` property; no alternative storage is created. They are
+unavailable in scoped project/journal modes.
+
+- `logseq_agenda_list` — `{"date"?: "YYYY-MM-DD"}` (defaults to local today).
+  Returns the same `date`/`graphName`/`tasks`/`truncated` shape as `list`,
+  with `path`, `page`, `line`, `task`, `marker`, `done`, `revision`, and
+  `scheduledDate` per entry. Read-only discovery for natural-language
+  matching; when several tasks match, the model must ask the user to clarify
+  instead of guessing.
+- `logseq_agenda_add` — `{"path", "line", "revision", "date"?}` (defaults to
+  local today). Schedules one existing open task with `selected: true`. The
+  tool fresh-reads the listing, validates the exact open task and revision,
+  shows `task`/`project`/`date` plus the old schedule when moving for
+  mandatory UI confirmation, then writes with the unchanged approved
+  `revision`/`path`/`line`/`date`. Denial, missing UI, abort, timeout, a
+  stale revision, an already-done line, or a scoped session performs no
+  write; the backend rechecks the SHA-256 revision atomically.
+
+Example palette prompt:
+
+```text
+ai: Add the TODO about rereading chapter 4 of the ... project to my daily todos
+```
+
+The model calls `logseq_agenda_list`, picks (or clarifies) the exact TODO,
+then calls `logseq_agenda_add`. The confirmation shows the task, the project
+(`page` + `path:line`), the target date (local today when omitted), and the
+previous schedule (`unscheduled` or the old `YYYY-MM-DD` when moving). Only
+an explicit approval schedules it.
 
 ## Safety
 

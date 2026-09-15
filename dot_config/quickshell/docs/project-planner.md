@@ -5,6 +5,134 @@ IPC target/global shortcut. It is manual only: opening it lists existing
 markdown pages below `pages/` and selecting a page reads that page, including
 open and completed TODOs.
 
+## Project registry (`projects.toml`)
+
+The **Projects** tab lists the TOML registry via `scripts/projects.py`, not
+the graph scan. The old all-page scan (`scripts/project_planner.py list`)
+still exists and remains the source for the daily agenda
+(`scripts/daily_agenda.py`); the planner UI no longer lists it.
+
+Registry location (first non-empty wins):
+
+1. explicit `--projects-file` CLI flag,
+2. `QUICKSHELL_PROJECTS_FILE` environment variable,
+3. `<repo-root>/projects.toml` (repo root is the parent of `scripts/`).
+
+`list`/`create`/`update`/`remove` need no graph, so project management works
+with no graph configured. Only `import-logseq` needs `--graph` (or
+`LOGSEQ_GRAPH`/`settings.json`).
+
+Schema (`version = 1`; unknown fields are rejected, never silently
+preserved):
+
+```toml
+version = 1
+
+[[projects]]
+id = "<uuid>"                 # required, stable, unique (canonical lowercase)
+name = "..."                  # required, non-blank (max 512 chars)
+logseq_path = "pages/X.md"    # optional, omitted when empty
+local_folder = "/abs/path"    # optional, absolute or ~/ only, omitted when empty
+github_url = "https://github.com/owner/repo"  # optional HTTPS repo URL, omitted when empty
+```
+
+A name-only project (all optionals empty) is valid. Empty values are stored
+as omitted keys and read back as `""`. Duplicate `id` values and duplicate
+non-empty `logseq_path` values are rejected. Parsing uses stdlib `tomllib`,
+so Python 3.11+ is required.
+
+CRUD (`scripts/projects.py`):
+
+```sh
+python3 scripts/projects.py list
+echo '{"name":"Demo"}' | python3 scripts/projects.py create
+echo '{"id":"<uuid>","revision":"<rev>","name":"Demo","logseq_path":"","local_folder":"","github_url":""}' | python3 scripts/projects.py update
+echo '{"id":"<uuid>","revision":"<rev>"}' | python3 scripts/projects.py remove
+python3 scripts/projects.py --graph PATH import-logseq
+```
+
+- `create` stdin: `name` plus optional `logseq_path`/`local_folder`/
+  `github_url` (unknown keys rejected); the `id` is server-assigned.
+- `update` stdin: full replacement — `id`, `revision`, `name`, plus
+  optionals; missing optionals clear to `""`. A stale `revision` is
+  rejected (reload and retry).
+- `remove` stdin: `id` plus `revision`. A stale `revision` is rejected.
+- Every list/mutation response carries `projects` (sorted by
+  lowercased name), `revision` (SHA-256 of the registry file bytes, or of
+  empty input when the file is missing), and `file` (absolute registry
+  path). The planner sends the listed `revision` back on update/remove.
+
+Planner **New project** / **Edit details** / **Delete** touch only registry
+entries: they never create or delete notes, folders, or repositories (the
+Delete dialog states this explicitly). Name is required; note, folder, and
+GitHub are optional and independent. Failures preserve every typed field;
+only the authoritative backend response mutates the list. A write is never
+cancelled on timeout or planner close — closing is blocked while a write is
+busy.
+
+Projects without a linked note are fully selectable with metadata visible,
+but note-based chat and tasks are disabled (`No linked note for this
+project…`); selecting one never launches an agent or reads the graph. Chat,
+tasks, the per-note Pi session, and the folder/GitHub tools require a linked
+`logseq_path`.
+
+`import-logseq` is the only explicit graph import. It is idempotent: it
+scans graph pages via the existing `project_planner` safe readers, adds only
+notes not already registered, never updates existing entries, and never
+writes to the graph. A note counts as a project when its leading
+page-property block declares `status:: project` **or** `type:: project`
+(plain or `[[project]]`, case-insensitive); only the leading block counts,
+so body/nested `- file::` lines and fenced samples never match. The real
+graph marks projects with `type:: project`, so the seed import yields 28
+pages including non-active ones. `file::`/`github::`/`url::` values are
+unwrapped with the same conservative helper; a malformed folder such as
+`file://~Arbeit/...` is skipped (folder left empty) with a `warnings` entry
+instead of inventing a location, as are duplicate/relative/non-local
+targets. The command reports `imported` plus `warnings`.
+
+Linked-note file tools (`files-list`/`files-read`/`files-git` in
+`scripts/project_planner.py`): when the selected note is registered with a
+non-empty `local_folder`, that registry folder is resolved strictly with the
+full `project_files` safety checks and wins. A corrupt registry or an
+unusable registered folder fails closed instead of silently falling back to
+a possibly stale `file::` folder. Unregistered notes (or registered entries
+without a folder) keep the legacy fallback to the page-level `file::`
+property. The helper-side registry override is the
+`QUICKSHELL_PROJECTS_FILE` environment variable.
+
+## Desktop project context (deterministic attribution)
+
+Full contract: `docs/desktop-project-context.md`.
+
+The live desktop snapshot is attributed to the existing registry only —
+no new model, no inference, no writes, no UI-selected fallback. The
+overlay is `DesktopContext.project {id, name, matched_by}` with
+precedence `file > cwd > git_root > git_remote` (longest
+component-boundary folder wins; same-strength ties and conflicting
+mapped remotes stay unknown). GitHub remotes accept canonical
+HTTPS/SSH/scp (credentials stripped, never persisted); unmapped
+upstreams are ignored; discovery is local `git config` only (linked
+worktrees supported). The registry subprocess runs only on metadata
+change (folder projection TTL 5 s, remotes 30 s + config
+invalidation). History store is schema v2 with indexed append-time
+`project_id` (transactional v1 migration, read-only v1 support, no
+retroactive reassignment).
+
+- CLI: `current`, `current-project`, `history --project UUID`,
+  `last-activity --project UUID`, `resources --project UUID [--limit]`
+  (`current` is a fresh snapshot + focus recheck, not collector IPC).
+- Python: `scripts/desktop_projects.py current-project | todos |
+  logseq-context | recent-activity | last-activity | resources`
+  (overrides `--projects-file --graph --db --desktop-bin`; reuses the
+  `read_page` task parser; a name-only project is valid, has history,
+  but returns explicit no-Logseq-linkage).
+- Five additive Pi tools only; existing scopes unaffected. Build with
+  `cargo build --locked --release --manifest-path
+  services/agent-orchestrator/Cargo.toml`; nothing auto-installs or
+  auto-starts. No LLM/embeddings/screenshots/sessions/Resume. Next
+  phase keeps resource-id identity/ordering and retention with no new
+  semantic layer.
+
 ## Journal tab
 
 The header has a separate **Journal** tab. It is usable even when the graph has
@@ -46,19 +174,49 @@ its own New, Rename, and Restore controls and persistent graph-level scope.
 
 Each project has its own lazily-created Pi session. Selecting a project starts
 that session without sending a prompt. A prompt is sent only after the user
-presses **Send**; the planner fetches a fresh page first and JSON-delimits the
-untrusted page context from the explicit request. Typed drafts and agent
-history remain separate for each project while the shell runs.
+presses **Send**; the planner fetches a fresh page first. That fresh page
+context is included only with the first user message of the conversation or
+session and is JSON-delimited from the explicit request as untrusted data.
+Follow-up sends submit only the typed request. The decision derives from the
+authoritative current `worker.messages` user history (any `user` role counts,
+including older wrapped prompts) once a correlated successful history load
+for the current `(sessionFile, messagesGeneration)` is known
+(`ScopedAgent.historyLoadedValid`, per worker so startup and background
+workers gate independently) plus a transient accepted-turn boundary for the
+prompt-to-history race — never a global ever-sent flag — so a new empty
+session includes context, a resumed nonempty session does not, and a
+rejected first send can retry with context. A Pi-level prompt failure
+(bridge ack positive on write, Pi `success:false` later) clears the transient
+boundary when history is still authoritatively empty so the retry wraps
+again; unrelated failures never drop valid loaded history. While session
+history is unknown, loading, or failed the send is blocked with a
+history-loading notice instead of guessing empty. A restored empty cache
+after `stateUpdated` is therefore not treated as fresh until its queued
+`get_messages` succeeds; a delayed or failed history fetch keeps the send
+blocked with a retryable history error. Typed drafts and agent history
+remain separate for each project while the shell runs. The transcript keeps
+the full raw submitted prompt in its model but user rows show only the
+original request (malformed or lookalike text is left untouched; the decoder
+requires the canonical exact wrapper shape — exact keys only, recomposed
+equality — so extra or duplicate keys never decode); wrapped user rows offer
+an inline **Inspect prompt** expansion showing the full submitted prompt as
+selectable plain text. History stores text only with no provenance, so a
+fully canonical user-pasted wrapper is indistinguishable from a generated
+one and decodes the same way; this heuristic display limitation is accepted
+rather than solved with extra storage. Assistant rendering is unchanged.
 
 ## Session controls
 
-The session strip belongs to the selected project and offers **New session**,
-**Rename**, and **Restore session**. It calls only that project's `ScopedAgent`
-worker: session controls do not compose a prompt, append page content, or
-make a model call. They are disabled (and guarded in the handlers) while the
-page is loading or writing, a request/approval is active, or the worker is
-busy, compacting, stopping, switching sessions, processing another control,
-or is not ready.
+A single ~48px session/model toolbar belongs to the selected project. The
+elided session name keeps storage status as tooltip/accessibility rather than
+a second text line, and a **Session…** button opens a menu with **New
+session**, **Rename**, and **Restore session**. It calls only that project's
+`ScopedAgent` worker: session controls do not compose a prompt, append page
+content, or make a model call. They are disabled (and guarded in the handlers)
+while the page is loading or writing, a request/approval is active, or the
+worker is busy, compacting, stopping, switching sessions, processing another
+control, or is not ready. The menu snapshots owner/path/session at open and
+revalidates fail-closed, and closes on project/agent/planner close.
 
 The active name is shown when available; an unnamed active session is shown as
 **Unnamed session**, and a project with no active worker is shown as **New
@@ -68,6 +226,19 @@ New sessions likewise do not clear the per-project draft. Restore uses Pi's
 existing scoped session picker and preserves its select/keyboard/cancel flow.
 The picker title comes from the request, and its restore view does not expose
 the page context as approval content.
+
+A clickable **model** button in the same toolbar shows the selected project's
+authoritative model as `provider/id` (both `id` and `modelId` shapes count;
+**Loading models…**, **No model selected**, **Models unavailable**, and **No
+model** cover loading/empty/missing states, with the full label as tooltip).
+The dropdown lists only valid
+available models with the current one marked, scrolls long lists, and stays
+keyboard accessible. It reuses the session readiness gates, forwards only the
+selected worker's listed entry via `chooseModel`, and revalidates the
+project/session owner at activation so a stale popup cannot retarget. It
+never sends a prompt, clears drafts/context/history, or optimistically
+rewrites the current model; immediate and async rejections surface through
+the existing notice/failed path.
 
 Session storage is persistent and isolated by the resolved graph and project
 page. The launch wrapper stores projects below
@@ -79,7 +250,7 @@ latest saved session for that key by validating that exact saved file and
 passing it explicitly rather than relying on an implicit continuation. Sessions
 from the old shared pool are not automatically assigned to projects.
 
-The session strip shows **Loading session history…** while identity or history
+The session label tooltip shows **Loading session history…** while identity or history
 is unresolved. A settled conversation with no messages is marked **not saved
 to Restore yet**; this does not disable New session or Rename. Pi does not
 persist an empty session name as a durable saved-session record. The pending

@@ -51,6 +51,19 @@ with `widgets/icons/*.svg` assets.
 The planner tasks panel collapses to an overlay below 600px width and
 the transcript uses `conversationStore` + `syncConversation` for stable scroll.
 
+Projects tab lists the TOML registry (`scripts/projects.py`, default
+`<repo>/projects.toml`, override via `QUICKSHELL_PROJECTS_FILE` or
+`--projects-file`): `version = 1` plus `[[projects]]` entries with stable
+`id`, required `name`, and optional `logseq_path`/`local_folder`/
+`github_url` (Python 3.11+ for stdlib `tomllib`). The planner's **New /
+Edit / Delete** manage registry entries only — notes, folders, and repos
+are never created or deleted. Note-less projects are selectable but
+note-based chat/tasks need a linked note. `import-logseq` is the explicit
+idempotent graph import (`status:: project` or `type:: project`); the
+registered `local_folder` is authoritative for the linked-note file tools,
+with legacy `file::` fallback for unregistered notes. Details in
+`docs/project-planner.md`.
+
 Rust/Cargo is a build prerequisite. The release binary is git-ignored
 and never committed — rebuild it manually after every pull before
 launching Quickshell. QML launches only the built binary with no
@@ -64,7 +77,7 @@ Docs:
 
 - `services/agent-orchestrator/README.md` — build, CLI, stdin/update
   protocol, bounds, tests.
-- `docs/project-planner.md` — planner/journal behavior.
+- `docs/project-planner.md` — planner/journal behavior, project registry.
 - `.pi/README.md` — palette, skills, and scoped-tool policy.
 
 ## Tests

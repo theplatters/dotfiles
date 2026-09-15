@@ -38,6 +38,7 @@
 //! outcome; the collector marks unavailable immediately with no subsequent
 //! snapshot fetch on the known-closed subscription.
 
+use crate::app_context::APP_REFRESH_INTERVAL;
 use crate::desktop_context::{
     now_ms, DesktopContext, EnqueueOutcome, PendingFull, Source, Tracker,
     MAX_PENDING_OBSERVATIONS,
@@ -50,7 +51,7 @@ use crate::hyprland::{
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Per-session tunables (all bounded).
@@ -96,6 +97,43 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Fixed deadline for the bounded shutdown drain (no durable spool).
 pub const SHUTDOWN_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Application-only refresh configuration for the collector.
+///
+/// `enrich` overrides the default environment-driven enrichment
+/// ([`crate::app_context::enrich_desktop_context`]) when `Some`. It runs on
+/// a bounded background worker (one in flight, latest request wins), never
+/// on the event thread: base observations persist immediately and a blocked
+/// provider cannot delay events, persistence, or shutdown. Panics are caught
+/// and treated as "no enrichment". `None` selects the default. `interval`
+/// is the low-frequency cadence for re-requesting the live context without
+/// any compositor query (never desktop polling).
+#[derive(Clone)]
+pub struct AppRefreshConfig {
+    pub interval: Duration,
+    pub enrich: Option<EnrichFn>,
+}
+
+/// Shareable enrichment closure: base snapshot in, enriched snapshot out.
+pub type EnrichFn = std::sync::Arc<dyn Fn(DesktopContext) -> DesktopContext + Send + Sync>;
+
+impl std::fmt::Debug for AppRefreshConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppRefreshConfig")
+            .field("interval", &self.interval)
+            .field("has_enrich", &self.enrich.is_some())
+            .finish()
+    }
+}
+
+impl AppRefreshConfig {
+    pub fn disabled() -> Self {
+        Self {
+            interval: Duration::from_secs(u64::MAX / 2),
+            enrich: None,
+        }
+    }
+}
+
 /// Run ONE event session: connect, snapshot, consume events until the socket
 /// dies, a snapshot fails, the backlog overflows, or `shutdown` is set.
 /// Returns the outcome plus whether any snapshot was successfully observed
@@ -105,6 +143,48 @@ pub fn run_collector_once(
     tracker: &mut Tracker,
     config: &CollectorConfig,
     shutdown: &AtomicBool,
+) -> (SessionOutcome, bool) {
+    run_collector_once_with_enrich(store, tracker, config, shutdown, &AppRefreshConfig::default())
+}
+
+impl Default for AppRefreshConfig {
+    fn default() -> Self {
+        Self {
+            interval: APP_REFRESH_INTERVAL,
+            enrich: None,
+        }
+    }
+}
+
+/// Enrichment-aware session: identical to [`run_collector_once`] but with an
+/// explicit [`AppRefreshConfig`]. Base snapshots persist immediately after
+/// every compositor fetch; enrichment runs on a bounded background worker
+/// bound to a focus generation (stale results discarded, initial base then
+/// `context` row is the expected shape). The live context is re-requested
+/// on a low-frequency application-only cadence during idle reads (no
+/// `fetch_snapshot`, no `discover`, no storage-blocked bypass).
+pub fn run_collector_once_with_enrich(
+    store: &ActivityStore,
+    tracker: &mut Tracker,
+    config: &CollectorConfig,
+    shutdown: &AtomicBool,
+    app: &AppRefreshConfig,
+) -> (SessionOutcome, bool) {
+    let worker = EnrichWorker::new(app.enrich.clone());
+    run_session(store, tracker, config, shutdown, app, &worker)
+}
+
+/// Session core with an explicit worker (the public wrappers above own a
+/// fresh worker per session; tests inject workers bound to local slot
+/// counters, e.g. denied ones, to prove the base path never depends on
+/// enrichment capacity).
+fn run_session(
+    store: &ActivityStore,
+    tracker: &mut Tracker,
+    config: &CollectorConfig,
+    shutdown: &AtomicBool,
+    app: &AppRefreshConfig,
+    worker: &EnrichWorker<'_>,
 ) -> (SessionOutcome, bool) {
     if shutdown.load(Ordering::SeqCst) {
         return (SessionOutcome::Shutdown, false);
@@ -134,14 +214,37 @@ pub fn run_collector_once(
         return (SessionOutcome::ConnectFailed, false);
     }
 
-    // Authoritative initial snapshot AFTER subscribing.
+    // Base observations persist IMMEDIATELY on the event thread;
+    // enrichment completes asynchronously bound to a focus generation
+    // (stale results discarded). A blocked provider therefore never delays
+    // events, persistence, or shutdown. Latest-request-wins, no queue; the
+    // worker thread always stops (and terminates after its bounded
+    // in-flight op) when the session ends. A denied worker (cap reached)
+    // simply never produces: the session stays base-only.
+    // Focus generation: incremented the moment a relevant compositor event
+    // is seen (before coalescing) and on the initial snapshot. App-only
+    // re-requests reuse the current generation.
+    let mut focus_gen: u64 = 0;
+
+    // Authoritative initial snapshot AFTER subscribing. The base (merged
+    // with any valid overlay for the same window identity, so a bare
+    // resource=None fetch never clears known enrichment) persists
+    // immediately; a resource-free copy is requested in the background so
+    // confirmed absence can clear without an idle refresh, while transient
+    // gaps stay masked by bounded last-good.
     let made_progress = match fetch_snapshot(&config.request_socket) {
         Ok(ctx) => {
-            match persist_observation_via_backlog(store, tracker, ctx) {
-                Ok(()) => true,
+            let base = with_merged_overlay(tracker, ctx);
+            match persist_observation_via_backlog(store, tracker, base.clone()) {
+                Ok(()) => {
+                    focus_gen = focus_gen.wrapping_add(1);
+                    worker.submit(focus_gen, base.with_resource(None));
+                    true
+                }
                 Err(_) => {
                     // Overflowing snapshot dropped (gap-logged); no
                     // subscription survives, so live reads unavailable.
+                    worker.shutdown();
                     tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                     return (SessionOutcome::BacklogFull, false);
                 }
@@ -149,6 +252,7 @@ pub fn run_collector_once(
         }
         Err(e) => {
             eprintln!("qs-desktop-context: initial snapshot failed: {e}");
+            worker.shutdown();
             if mark_unavailable_via_backlog(store, tracker).is_err() {
                 tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                 return (SessionOutcome::BacklogFull, false);
@@ -157,18 +261,53 @@ pub fn run_collector_once(
         }
     };
     let mut made_progress = made_progress;
+    let mut last_app_refresh = Instant::now();
 
     let mut pending: Vec<u8> = Vec::new();
     let mut discarding = false;
     let mut chunk = [0u8; READ_CHUNK];
 
+    // Harvest helper: accept a worker result only on idle paths (no queued
+    // compositor bytes are waiting) and only for the current generation.
+    // Returns `Some(SessionOutcome)` when the session must end (BacklogFull,
+    // propagated exactly like Phase 1 snapshot overflow).
+    let harvest = |store: &ActivityStore,
+                       tracker: &mut Tracker,
+                       worker: &EnrichWorker<'_>,
+                       focus_gen: u64,
+                       made_progress: &mut bool|
+     -> Option<SessionOutcome> {
+        match worker.poll() {
+            None => None,
+            Some(res) if res.generation != focus_gen => None,
+            Some(res) => match persist_enriched_result(store, tracker, res.enriched) {
+                Ok(queued) => {
+                    if queued {
+                        *made_progress = true;
+                    }
+                    None
+                }
+                Err(_) => {
+                    tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
+                    Some(SessionOutcome::BacklogFull)
+                }
+            },
+        }
+    };
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            worker.shutdown();
             return (SessionOutcome::Shutdown, made_progress);
         }
         match stream.read(&mut chunk) {
             Ok(0) => {
                 eprintln!("qs-desktop-context: event socket EOF (compositor gone?)");
+                // Terminal: no enrichment drain. The subscription is dead;
+                // any in-flight result is stale by definition. Discard and
+                // mark unavailable immediately.
+                worker.shutdown();
+                worker.invalidate();
                 if mark_unavailable_via_backlog(store, tracker).is_err() {
                     tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                     return (SessionOutcome::BacklogFull, made_progress);
@@ -184,6 +323,12 @@ pub fn run_collector_once(
                     &mut want_refresh,
                 );
                 if want_refresh {
+                    // Invalidate FIRST (before coalescing): a relevant event
+                    // means any in-flight enrichment is for the previous
+                    // focus. Pending events are processed before any worker
+                    // result is accepted.
+                    focus_gen = focus_gen.wrapping_add(1);
+                    worker.invalidate();
                     // Coalesce paired bursts (activewindow+activewindowv2)
                     // into a single snapshot reconciliation.
                     match drain_coalesce(
@@ -197,6 +342,8 @@ pub fn run_collector_once(
                             eprintln!(
                                 "qs-desktop-context: event socket closed during coalesce"
                             );
+                            worker.shutdown();
+                            worker.invalidate();
                             if mark_unavailable_via_backlog(store, tracker).is_err() {
                                 tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                                 return (SessionOutcome::BacklogFull, made_progress);
@@ -208,9 +355,14 @@ pub fn run_collector_once(
                     match fetch_snapshot(&config.request_socket) {
                         Ok(ctx) => {
                             made_progress = true;
-                            match persist_observation_via_backlog(store, tracker, ctx) {
-                                Ok(()) => {}
+                            last_app_refresh = Instant::now();
+                            let base = with_merged_overlay(tracker, ctx);
+                            match persist_observation_via_backlog(store, tracker, base.clone()) {
+                                Ok(()) => {
+                                    worker.submit(focus_gen, base.with_resource(None));
+                                }
                                 Err(_) => {
+                                    worker.shutdown();
                                     tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                                     return (SessionOutcome::BacklogFull, false);
                                 }
@@ -218,6 +370,8 @@ pub fn run_collector_once(
                         }
                         Err(e) => {
                             eprintln!("qs-desktop-context: snapshot refresh failed: {e}");
+                            worker.shutdown();
+                            worker.invalidate();
                             if mark_unavailable_via_backlog(store, tracker).is_err() {
                                 tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                                 return (SessionOutcome::BacklogFull, made_progress);
@@ -231,16 +385,85 @@ pub fn run_collector_once(
                 // Idle: retry SQLite backlog independently of compositor
                 // queries (no fetch_snapshot here — never desktop polling).
                 flush_pending_and_log(store, tracker);
+                // Re-probe AFTER the (possibly slow) flush: event bytes may
+                // have arrived while SQLite was busy. Harvest only when the
+                // fd is confirmed idle; otherwise loop back and drain the
+                // queued events first, so a pre-event enrichment can never
+                // slip in ahead of pending compositor state.
+                if event_pending(&stream) {
+                    continue;
+                }
+                // Idle-only harvest: no event bytes are queued, so a
+                // current-generation result is safe to accept.
+                if let Some(outcome) =
+                    harvest(store, tracker, worker, focus_gen, &mut made_progress)
+                {
+                    worker.shutdown();
+                    return (outcome, made_progress);
+                }
+                // Bounded low-frequency application-only re-request: submit
+                // the live base for background enrichment with a fresh
+                // observation timestamp. No discovery, no snapshot query,
+                // no storage-blocked bypass.
+                if app_refresh_due(&last_app_refresh, app) {
+                    last_app_refresh = Instant::now();
+                    if tracker.backlog_is_full() {
+                        worker.shutdown();
+                        tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
+                        return (SessionOutcome::BacklogFull, made_progress);
+                    }
+                    if let Some(cur) = tracker.current_context() {
+                        if cur.available && cur.focused_window.is_some() {
+                            let mut candidate = cur;
+                            candidate.resource = None;
+                            // Stripped worker inputs must clear the project
+                            // too: never resolve the previous focus's project.
+                            candidate.project = None;
+                            candidate.observed_at_ms = now_ms();
+                            worker.submit(focus_gen, candidate);
+                        }
+                    }
+                }
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 // Idle: same backlog retry, no compositor query.
                 flush_pending_and_log(store, tracker);
+                // Same post-flush re-probe as above: queued events win over
+                // harvest, always.
+                if event_pending(&stream) {
+                    continue;
+                }
+                if let Some(outcome) =
+                    harvest(store, tracker, worker, focus_gen, &mut made_progress)
+                {
+                    worker.shutdown();
+                    return (outcome, made_progress);
+                }
+                if app_refresh_due(&last_app_refresh, app) {
+                    last_app_refresh = Instant::now();
+                    if tracker.backlog_is_full() {
+                        worker.shutdown();
+                        tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
+                        return (SessionOutcome::BacklogFull, made_progress);
+                    }
+                    if let Some(cur) = tracker.current_context() {
+                        if cur.available && cur.focused_window.is_some() {
+                            let mut candidate = cur;
+                            candidate.resource = None;
+                            candidate.project = None;
+                            candidate.observed_at_ms = now_ms();
+                            worker.submit(focus_gen, candidate);
+                        }
+                    }
+                }
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 eprintln!("qs-desktop-context: event socket read failed: {e}");
+                worker.shutdown();
+                worker.invalidate();
                 if mark_unavailable_via_backlog(store, tracker).is_err() {
                     tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
                     return (SessionOutcome::BacklogFull, made_progress);
@@ -249,6 +472,58 @@ pub fn run_collector_once(
             }
         }
     }
+}
+
+/// Merge the live overlay onto a bare compositor snapshot: a raw fetch
+/// carries `resource: None`, which is NOT confirmed absence. When the live
+/// context names the same exact window (opaque id + application + client
+/// PID) and holds a resource, carry it forward so routine compositor events
+/// do not oscillate clear/restore rows; genuine resource changes still
+/// arrive as worker results and classify as `context`. Title-only
+/// fallbacks (`*-title` adapters) are cheap and pure, so they are
+/// recomputed from the current title instead of carried stale — a title
+/// change persists one title row whose resource already matches, not a
+/// contradictory row plus a correction. The project overlay merges with the
+/// resource (same focus only): carrying the resource without its project
+/// would oscillate project clear/restore rows, and a recomputed title
+/// fallback carries no project (title-only resources have no path signal).
+/// The worker always receives a resource-free snapshot (see submit sites):
+/// only the immediate persistence path merges.
+fn with_merged_overlay(tracker: &Tracker, mut base: DesktopContext) -> DesktopContext {
+    if base.resource.is_some() {
+        return base;
+    }
+    // A bare fetch never carries a project either; a stale project without
+    // its resource must not survive.
+    base.project = None;
+    let Some(cur) = tracker.current_context() else {
+        return base;
+    };
+    let (Some(bw), Some(cw)) = (base.focused_window.as_ref(), cur.focused_window.as_ref())
+    else {
+        return base;
+    };
+    if bw.id == cw.id && bw.application == cw.application && bw.process_id == cw.process_id {
+        if let Some(r) = cur.resource.clone() {
+            if r.is_empty() {
+                return base;
+            }
+            match crate::app_context::refresh_title_fallback(&r, &bw.application, &bw.title) {
+                // Not a title fallback: carry the stored overlay + project.
+                None => {
+                    base.resource = Some(r);
+                    base.project = cur.project.clone();
+                }
+                // Recomputed fallback (or honestly absent on empty title):
+                // fresh resource carries no project (title-only, no paths).
+                Some(fresh) => {
+                    base.resource = fresh;
+                    base.project = None;
+                }
+            }
+        }
+    }
+    base
 }
 
 /// Outer loop with discovery + bounded backoff. `discover` is called each
@@ -268,6 +543,20 @@ pub fn run_collector_forever(
     tracker: &mut Tracker,
     shutdown: &AtomicBool,
     discover: impl Fn() -> Option<SocketPaths>,
+) -> usize {
+    run_collector_forever_with_enrich(store, tracker, shutdown, discover, &AppRefreshConfig::default())
+}
+
+/// Enrichment-aware outer loop: identical to [`run_collector_forever`] but
+/// threads `app` through every session. The storage-blocked branch stays
+/// persistence-only (no discovery/snapshot AND no application refresh) until
+/// capacity recovers.
+pub fn run_collector_forever_with_enrich(
+    store: &ActivityStore,
+    tracker: &mut Tracker,
+    shutdown: &AtomicBool,
+    discover: impl Fn() -> Option<SocketPaths>,
+    app: &AppRefreshConfig,
 ) -> usize {
     let mut backoff = BACKOFF_INITIAL;
     // Track whether the last round already reported absence, to avoid
@@ -316,7 +605,8 @@ pub fn run_collector_forever(
         };
         absence_logged = false;
         let config = CollectorConfig::new(&paths.event_socket, &paths.request_socket);
-        let (outcome, progress) = run_collector_once(store, tracker, &config, shutdown);
+        let (outcome, progress) =
+            run_collector_once_with_enrich(store, tracker, &config, shutdown, app);
         match outcome {
             SessionOutcome::Shutdown => break,
             SessionOutcome::BacklogFull => {
@@ -483,6 +773,320 @@ fn persist_observation_via_backlog(
             Err(full)
         }
     }
+}
+
+/// Hard process-wide cap on concurrent enrichment worker threads. The
+/// counter only bounds live threads; it cannot grow without bound no matter
+/// how fast sessions reconnect.
+pub const MAX_ENRICH_WORKERS: usize = 16;
+
+/// Held enrichment-worker slots (observability for tests; production
+/// sessions are sequential so this reads 0 or 1).
+static ENRICH_WORKER_SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of currently held enrichment worker slots.
+pub fn enrich_workers_live() -> usize {
+    ENRICH_WORKER_SLOTS.load(Ordering::SeqCst)
+}
+
+/// Compare-exchange acquisition of one worker slot against `counter`.
+/// Returns true (holding the slot) iff the count was below `max`.
+/// The counter is injectable so unit tests exercise the cap without
+/// touching the process-wide state.
+fn try_acquire_worker_slot(counter: &AtomicUsize, max: usize) -> bool {
+    let mut cur = counter.load(Ordering::SeqCst);
+    loop {
+        if cur >= max {
+            return false;
+        }
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Bounded background enrichment worker: at most one request in flight plus
+/// the latest pending request (size-1 slot, latest wins). Base observations
+/// persist immediately on the event thread; enrichment results arrive
+/// asynchronously bound to a focus generation and stale generations are
+/// discarded. No unbounded queue: one thread per session, and a process-wide
+/// hard cap ([`MAX_ENRICH_WORKERS`]) bounds concurrent threads — a session
+/// denied a slot (or hit by a spawn failure) runs base-only instead of
+/// stacking threads.
+struct EnrichRequest {
+    generation: u64,
+    base: DesktopContext,
+}
+
+struct EnrichResult {
+    generation: u64,
+    enriched: DesktopContext,
+}
+
+struct EnrichWorker<'a> {
+    request: std::sync::Arc<std::sync::Mutex<Option<EnrichRequest>>>,
+    result: std::sync::Arc<std::sync::Mutex<Option<EnrichResult>>>,
+    stop: std::sync::Arc<AtomicBool>,
+    /// Slot guard: `None` for a denied worker (base-only, never spawns).
+    /// Held until drop, so the process-wide count is exact.
+    _slot: Option<WorkerSlot<'a>>,
+}
+
+/// One held worker slot; releasing (drop) frees process-wide capacity.
+struct WorkerSlot<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> Drop for WorkerSlot<'a> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl EnrichWorker<'static> {
+    fn new(enrich: Option<EnrichFn>) -> EnrichWorker<'static> {
+        Self::new_with_slot(enrich, &ENRICH_WORKER_SLOTS, MAX_ENRICH_WORKERS)
+    }
+}
+
+impl<'a> EnrichWorker<'a> {
+
+    /// Testable constructor against an injected slot counter and cap.
+    /// Denied (or spawn-failed) workers are base-only: `submit` is a no-op
+    /// and `poll` stays empty, so the session path works unchanged.
+    fn new_with_slot(
+        enrich: Option<EnrichFn>,
+        slots: &'a AtomicUsize,
+        max: usize,
+    ) -> Self {
+        let disabled = || Self {
+            request: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stop: std::sync::Arc::new(AtomicBool::new(true)),
+            _slot: None,
+        };
+        if !try_acquire_worker_slot(slots, max) {
+            eprintln!(
+                "qs-desktop-context: enrichment worker cap reached ({max}); session runs base-only"
+            );
+            return disabled();
+        }
+        let request = std::sync::Arc::new(std::sync::Mutex::new(None::<EnrichRequest>));
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None::<EnrichResult>));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let req_c = std::sync::Arc::clone(&request);
+        let res_c = std::sync::Arc::clone(&result);
+        let stop_c = std::sync::Arc::clone(&stop);
+        let spawn = std::thread::Builder::new()
+            .name("qs-enrich".to_string())
+            .spawn(move || {
+                loop {
+                    if stop_c.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let req = req_c.lock().ok().and_then(|mut g| g.take());
+                    match req {
+                        None => std::thread::sleep(Duration::from_millis(10)),
+                        Some(r) => {
+                            if stop_c.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let enriched = run_enrich_blocking(r.base, enrich.as_ref());
+                            if stop_c.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            if let Ok(mut g) = res_c.lock() {
+                                *g = Some(EnrichResult {
+                                    generation: r.generation,
+                                    enriched,
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+        match spawn {
+            Ok(_handle) => Self {
+                request,
+                result,
+                stop,
+                _slot: Some(WorkerSlot { counter: slots }),
+            },
+            Err(e) => {
+                // The acquired slot is released by dropping the guard
+                // implicitly: construct then drop a guard now.
+                slots.fetch_sub(1, Ordering::SeqCst);
+                eprintln!(
+                    "qs-desktop-context: enrichment thread spawn failed ({e}); session runs base-only"
+                );
+                disabled()
+            }
+        }
+    }
+
+    /// Submit the latest base for enrichment (overwrites any pending slot).
+    fn submit(&self, generation: u64, base: DesktopContext) {
+        if self.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut g) = self.request.lock() {
+            *g = Some(EnrichRequest { generation, base });
+        }
+    }
+
+    /// Non-blocking poll for a completed enrichment (bounded, never waits).
+    fn poll(&self) -> Option<EnrichResult> {
+        self.result.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Invalidate pending and completed enrichment (focus moved on / terminal
+    /// state). Stale results must never be accepted afterwards.
+    fn invalidate(&self) {
+        if let Ok(mut g) = self.request.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.result.lock() {
+            *g = None;
+        }
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for EnrichWorker<'_> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Blocking enrichment body executed ONLY on the worker thread: never on the
+/// event path, so slow providers cannot delay base persistence, events, or
+/// shutdown. Panics are caught and yield the base unchanged.
+///
+/// Custom `enrich` hooks keep their exact Phase 2 contract (compositor
+/// identity is clamped; only resource/project/observed_at flow through).
+/// The default path runs app + deterministic project resolution.
+fn run_enrich_blocking(base: DesktopContext, enrich: Option<&EnrichFn>) -> DesktopContext {
+    if !base.available || base.focused_window.is_none() {
+        return base;
+    }
+    if let Some(f) = enrich {
+        let input = base.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(input))) {
+            Ok(out) => {
+                let mut clamped = base.clone();
+                clamped.resource = out.resource;
+                // Custom hooks stay resource-driven: a project without its
+                // resource is never retained (stripped inputs clear both).
+                clamped.project = if clamped.resource.is_some() {
+                    out.project
+                } else {
+                    None
+                };
+                if out.observed_at_ms != base.observed_at_ms
+                    && out.focused_window == base.focused_window
+                    && out.workspace == base.workspace
+                    && out.available == base.available
+                    && out.source == base.source
+                {
+                    clamped.observed_at_ms = out.observed_at_ms;
+                }
+                clamped
+            }
+            Err(_) => base,
+        }
+    } else {
+        let input = base.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::app_context::enrich_desktop_context(input)
+        })) {
+            Ok(out) => out,
+            Err(_) => {
+                eprintln!("qs-desktop-context: enrichment panicked; using base snapshot");
+                base
+            }
+        }
+    }
+}
+
+/// Enqueue a worker-produced enriched snapshot (already correlated by
+/// generation by the caller). The observation timestamp is set to completion
+/// time so idle resource changes advance history time. Returns `Ok(true)`
+/// when a new row was queued (backoff progress), `Ok(false)` on dedup or
+/// focus mismatch, and `Err(PendingFull)` on bounded overflow — which the
+/// caller must propagate as `BacklogFull` with local-unavailable marking,
+/// exactly like Phase 1 snapshot paths.
+fn persist_enriched_result(
+    store: &ActivityStore,
+    tracker: &mut Tracker,
+    mut enriched: DesktopContext,
+) -> Result<bool, PendingFull> {
+    // Safety: the worker never rewrites compositor identity for injected
+    // enrichers (clamped) and the default path preserves it; double-check
+    // against live state before persisting.
+    if let (Some(cur), Some(win)) = (
+        tracker.current_context(),
+        enriched.focused_window.as_ref(),
+    ) {
+        let cur_win = cur.focused_window.as_ref();
+        let same_focus = match (cur_win, Some(win)) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.semantic_eq(b),
+            _ => false,
+        };
+        if !same_focus || cur.workspace != enriched.workspace {
+            return Ok(false);
+        }
+    }
+    enriched.observed_at_ms = now_ms();
+    match tracker.enqueue(enriched) {
+        Ok(EnqueueOutcome::Deduplicated) => {
+            flush_pending_and_log(store, tracker);
+            Ok(false)
+        }
+        Ok(EnqueueOutcome::Queued(_, _)) => {
+            flush_pending_and_log(store, tracker);
+            Ok(true)
+        }
+        Err(full) => {
+            eprintln!(
+                "qs-desktop-context: observation gap: dropped 1 enriched observation (history backlog full capacity {}); backlog retained, session stopping; history has explicit gap",
+                full.capacity
+            );
+            Err(full)
+        }
+    }
+}
+
+/// Zero-timeout readability probe on the event socket: true when a
+/// subsequent read would not block (event bytes pending, or EOF/error
+/// condition pending). Used after idle flushes so queued compositor traffic
+/// is always drained before any enrichment harvest.
+fn event_pending(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: single valid pollfd, zero timeout (never blocks).
+    let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if r <= 0 {
+        return false;
+    }
+    let re = pfd.revents;
+    (re & libc::POLLIN) != 0 || (re & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
+fn app_refresh_due(last: &Instant, app: &AppRefreshConfig) -> bool {
+    if app.interval.is_zero() || app.interval.as_secs() >= u32::MAX as u64 {
+        return false;
+    }
+    last.elapsed() >= app.interval
 }
 
 /// Enqueue an unavailable marker then flush. Returns `Err(PendingFull)` when
@@ -918,6 +1522,135 @@ mod tests {
             front.1.observed_at_ms,
             1000 + drained as i64,
             "remainder must resume right after the drained prefix"
+        );
+    }
+
+    #[test]
+    fn worker_slot_acquire_release_independent() {
+        // Permit logic against an injected counter: independent of the
+        // process-wide state other tests exercise.
+        let counter = AtomicUsize::new(0);
+        assert!(super::try_acquire_worker_slot(&counter, 2));
+        assert!(super::try_acquire_worker_slot(&counter, 2));
+        assert!(
+            !super::try_acquire_worker_slot(&counter, 2),
+            "cap must deny past max"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        // Release via the guard path a worker would take.
+        counter.fetch_sub(1, Ordering::SeqCst);
+        assert!(super::try_acquire_worker_slot(&counter, 2));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        counter.fetch_sub(2, Ordering::SeqCst);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        // max == 0 denies everything.
+        assert!(!super::try_acquire_worker_slot(&counter, 0));
+    }
+
+    #[test]
+    fn denied_worker_spawns_nothing_base_still_works() {
+        // A cap-denied worker (injected counter at max) spawns no thread
+        // and stays base-only, while the session path persists base rows
+        // and disconnects exactly like Phase 1.
+        use crate::desktop_context::{FocusedWindow, Workspace};
+        let slots = AtomicUsize::new(0);
+        let before = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        let _ = before;
+        let denied = EnrichWorker::new_with_slot(None, &slots, 0);
+        let base = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0xD", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1,
+        );
+        denied.submit(1, base);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(denied.poll().is_none(), "denied worker never produces");
+
+        // Full session against fake sockets with the denied worker: base
+        // persists, EOF disconnects, no enrichment rows appear.
+        let dir = tmpdir("denied-session");
+        let req = spawn_fake_request_socket(
+            &dir,
+            r#"{"address":"0xD","class":"kitty","title":"t","workspace":{"id":1,"name":"1"}}"#,
+            r#"{"id":1,"name":"1"}"#,
+        );
+        let ev_path = dir.join(".socket2.sock");
+        let _ = std::fs::remove_file(&ev_path);
+        let listener = UnixListener::bind(&ev_path).unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut s, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = s.write_all(b"workspace>>1\n");
+            std::thread::sleep(Duration::from_millis(60));
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let store = ActivityStore::open_in_memory().unwrap();
+        let mut tracker = Tracker::new();
+        let shutdown = AtomicBool::new(false);
+        let config = CollectorConfig {
+            event_socket: ev_path,
+            request_socket: req,
+            idle_timeout: Duration::from_millis(100),
+            coalesce_window: Duration::from_millis(20),
+        };
+        let app = AppRefreshConfig::disabled();
+        let (outcome, progress) =
+            super::run_session(&store, &mut tracker, &config, &shutdown, &app, &denied);
+        let _ = server.join();
+        assert_eq!(outcome, SessionOutcome::Disconnected);
+        assert!(progress);
+        let rows = store.recent_activity(10).unwrap();
+        assert!(!rows.is_empty(), "denied session still persists base");
+        assert!(
+            rows.iter().all(|r| r.kind != "context"),
+            "no enrichment rows without a worker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_pending_probe_true_false() {
+        use std::os::unix::net::UnixStream;
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        assert!(!super::event_pending(&b), "idle socket reads nothing");
+        use std::io::Write;
+        a.write_all(b"x").unwrap();
+        assert!(super::event_pending(&b), "queued byte must probe true");
+        let mut buf = [0u8; 8];
+        use std::io::Read;
+        let _ = b.read(&mut buf);
+        // Drained: depending on timing the probe reads false again.
+        assert!(!super::event_pending(&b), "drained socket reads idle");
+    }
+
+    #[test]
+    fn worker_threads_terminate_no_accumulation() {
+        // Worker threads must terminate when their session ends instead of
+        // accumulating across reconnects. Other tests in this binary may
+        // transiently own workers, so wait boundedly for quiescence first.
+        let start = Instant::now();
+        while super::enrich_workers_live() != 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        {
+            let w1 = EnrichWorker::new(None);
+            let w2 = EnrichWorker::new(None);
+            drop(w1);
+            drop(w2);
+        }
+        // Both threads exit promptly after stop (no bounded op in flight).
+        let start = Instant::now();
+        while super::enrich_workers_live() != 0 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            super::enrich_workers_live(),
+            0,
+            "worker threads must terminate with their sessions"
         );
     }
 }

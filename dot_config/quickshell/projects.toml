@@ -1,0 +1,153 @@
+version = 1
+
+[[projects]]
+id = "f2c9c688-a041-4741-afc7-f348495e5418"
+name = "Acadia"
+logseq_path = "pages/Acadia.md"
+github_url = "https://github.com/theplatters/acadia"
+
+[[projects]]
+id = "b445a81a-eb7b-4a6a-a6eb-aea0822ddd54"
+name = "Advent of Code"
+logseq_path = "pages/Advent of Code.md"
+
+[[projects]]
+id = "f82ffe50-435d-4479-bc46-935606867be3"
+name = "Agent Based Modeling with ECS"
+logseq_path = "pages/Agent Based Modeling with ECS.md"
+
+[[projects]]
+id = "57cc6994-5c3a-4e11-ae72-82a64665baca"
+name = "Aktivitätsbericht"
+logseq_path = "pages/Aktivitätsbericht.md"
+
+[[projects]]
+id = "e63d7416-388a-4de2-aefa-9576630d180a"
+name = "Asset-Prices"
+logseq_path = "pages/Asset-Prices.md"
+local_folder = "/home/franzs/Schreibtisch/Arbeit/PKAssetPrices"
+github_url = "https://github.com/theplatters/PKAssetPrices"
+
+[[projects]]
+id = "c1fd3151-de27-4d54-8ab7-5d518bf3b1ce"
+name = "Bachelorarbeit"
+logseq_path = "pages/Bachelorarbeit.md"
+
+[[projects]]
+id = "9e5528a6-762d-4395-b3e0-17effb622979"
+name = "BeforeIT ECS-Rewrite"
+logseq_path = "pages/BeforeIT ECS-Rewrite.md"
+
+[[projects]]
+id = "6c3f62b0-54cc-4b88-817b-2bc0352f7fa6"
+name = "Berlintrip"
+logseq_path = "pages/Berlintrip.md"
+
+[[projects]]
+id = "96146d43-40be-42b3-80d0-9b79dddedbb5"
+name = "Beyond Hulten"
+logseq_path = "pages/Beyond Hulten.md"
+local_folder = "/home/franzs/Schreibtisch/Arbeit/BeyondHulten"
+github_url = "https://github.com/theplatters/CGEandLeontief"
+
+[[projects]]
+id = "f1064813-ba69-40ce-9a9a-9095b36e14a2"
+name = "Budget"
+logseq_path = "pages/Budget.md"
+
+[[projects]]
+id = "11753b85-764f-406a-a46f-a69aa289b92f"
+name = "CGE-Reading-List"
+logseq_path = "pages/CGE-Reading-List.md"
+
+[[projects]]
+id = "49ec90c2-b218-475c-9dd2-7be24b344ba2"
+name = "DnD-Kampagne"
+logseq_path = "pages/DnD-Kampagne.md"
+
+[[projects]]
+id = "71e8e9fa-65c1-47f7-bf73-a0f43e7dd884"
+name = "Ecologically unequal exchange"
+logseq_path = "pages/Ecologically unequal exchange.md"
+github_url = "https://github.com/ecoclassical/ECO-ECO-NETWORK"
+
+[[projects]]
+id = "420d8fab-964d-42a2-a03b-b8fab96b3bde"
+name = "Entwicklung der Sanktionierung in der Arbeitslosenversicherung in Österreich"
+logseq_path = "pages/Entwicklung der Sanktionierung in der Arbeitslosenversicherung in Österreich.md"
+
+[[projects]]
+id = "a0de2304-917d-465f-9637-40d2ad47ebd6"
+name = "Global North - Global South"
+logseq_path = "pages/Global North - Global South.md"
+
+[[projects]]
+id = "e8f84c6b-eb03-4e26-82e3-189655c0568d"
+name = "Graph Reorganization"
+logseq_path = "pages/Graph Reorganization.md"
+
+[[projects]]
+id = "13013c27-90b2-4800-96ae-d1b58e59ceea"
+name = "Helm"
+logseq_path = "pages/Helm.md"
+github_url = "https://github.com/theplatters/Helm.jl"
+
+[[projects]]
+id = "a2fa52e2-c4c6-43e3-848f-0b3de7b74bf5"
+name = "Heuristics"
+logseq_path = "pages/Heuristics.md"
+
+[[projects]]
+id = "574a2940-a564-4d18-86f6-88fe5e9a2fa3"
+name = "Integration competiveness"
+logseq_path = "pages/Integration competiveness.md"
+
+[[projects]]
+id = "8f598710-d1fd-452a-83c9-2cfe6798956d"
+name = "Juliora"
+logseq_path = "pages/Juliora.md"
+github_url = "https://github.com/theplatters/Juliora"
+
+[[projects]]
+id = "2d68521e-ff9b-41cd-acd0-6da94d2be30f"
+name = "Masterarbeit"
+logseq_path = "pages/Masterarbeit.md"
+local_folder = "/home/franzs/Nextcloud/Documents/Studium/Masterarbeit"
+github_url = "https://github.com/theplatters/Masterarbeit"
+
+[[projects]]
+id = "010108fa-f2cd-430e-85f0-8c6ac960ba12"
+name = "Minecraft-Mod"
+logseq_path = "pages/Minecraft-Mod.md"
+
+[[projects]]
+id = "a72cd070-4071-460b-88f7-5f93d756bb1d"
+name = "Morast"
+logseq_path = "pages/Morast.md"
+
+[[projects]]
+id = "2c4464ef-8ad4-43a3-977b-893a70649e8a"
+name = "Portugaltrip"
+logseq_path = "pages/Portugaltrip.md"
+
+[[projects]]
+id = "fa63f78e-f6b3-4901-a327-5488759746fd"
+name = "Research Seminar"
+logseq_path = "pages/Research Seminar.md"
+
+[[projects]]
+id = "30a930d5-075d-4ecd-bc22-2462228f3d8d"
+name = "Science Model"
+logseq_path = "pages/Science Model.md"
+local_folder = "/home/franzs/Schreibtisch/Arbeit/science-model"
+github_url = "https://github.com/paulbanse/sciencemodels"
+
+[[projects]]
+id = "1ff47aa0-315c-45eb-b575-54415027c86f"
+name = "Synthetic control"
+logseq_path = "pages/Synthetic control.md"
+
+[[projects]]
+id = "56c581f0-67c5-4a31-bc48-2cbed2953d78"
+name = "WiPol Linz"
+logseq_path = "pages/WiPol Linz.md"

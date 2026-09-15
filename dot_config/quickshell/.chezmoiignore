@@ -12,3 +12,9 @@
 .config/quickshell/**/__pycache__
 .config/quickshell/**/__pycache__/**
 .config/quickshell/**/*.pyc
+# Desktop-context collector databases: private activity data (never deploy).
+.config/quickshell/**/*.db
+.config/quickshell/**/*.db-wal
+.config/quickshell/**/*.db-shm
+.config/quickshell/**/*.db-journal
+.config/quickshell/**/*.db.lock

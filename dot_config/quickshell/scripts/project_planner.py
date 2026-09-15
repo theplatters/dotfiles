@@ -502,11 +502,47 @@ def update_page(graph, path, revision=None, content=None):
     return _response(graph, relative, replacement)
 
 
+def _registry_folder_root(graph, logseq_path):
+    """Return the validated registry folder for *logseq_path*, or None.
+
+    None means the note is unregistered (or registered without a folder),
+    and the caller falls back to the legacy page-level ``file::`` property.
+    A registered non-empty folder is resolved strictly and screened with the
+    ``project_files`` safety checks; failures raise instead of silently
+    falling back to a possibly stale ``file::`` folder.  A corrupt registry
+    likewise raises fail-closed.  The registry override for these helpers is
+    the ``QUICKSHELL_PROJECTS_FILE`` environment variable (no caller root).
+    """
+    try:
+        import projects as _projects
+    except ImportError:
+        return None
+    try:
+        folder = _projects.lookup_local_folder(logseq_path)
+    except Exception as exc:
+        raise GraphError(f"project registry is unusable: {exc}") from exc
+    if not folder:
+        return None
+    import project_files as _project_files
+    expanded = os.path.expanduser(folder)
+    candidate = Path(expanded)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise GraphError("registered project folder is not accessible") from exc
+    return _project_files._validate_root(resolved)
+
+
 def files_list(graph, request=None):
     """List the folder declared by the selected page's ``file::`` property.
 
     The page is reread fresh on every call; only the pinned page path is
     accepted.  Any ``root`` supplied by the caller is ignored.
+
+    When the page's note is registered with a non-empty ``local_folder`` in
+    the project registry (``scripts/projects.py``, default
+    ``<repo>/projects.toml`` or ``QUICKSHELL_PROJECTS_FILE``), that folder
+    wins; otherwise the legacy page-level ``file::`` property is used.
     """
     import project_files
     if isinstance(request, dict):
@@ -514,8 +550,10 @@ def files_list(graph, request=None):
     else:
         path = request
     current = read_page(graph, path)
-    root = project_files.resolve_root_from_content(graph_path(graph),
-                                                   current["content"])
+    root = _registry_folder_root(graph_path(graph), current["path"])
+    if root is None:
+        root = project_files.resolve_root_from_content(graph_path(graph),
+                                                       current["content"])
     listing = project_files.list_files(root)
     return {"path": current["path"], "page": current["page"],
             "graphName": current["graphName"], "root": listing["root"],
@@ -531,8 +569,10 @@ def files_read(graph, request=None, file=None):
     else:
         path = request
     current = read_page(graph, path)
-    root = project_files.resolve_root_from_content(graph_path(graph),
-                                                   current["content"])
+    root = _registry_folder_root(graph_path(graph), current["path"])
+    if root is None:
+        root = project_files.resolve_root_from_content(graph_path(graph),
+                                                       current["content"])
     value = project_files.read_file(root, file)
     return {"path": current["path"], "page": current["page"],
             "graphName": current["graphName"], "root": value["root"],
@@ -548,8 +588,10 @@ def files_git(graph, request=None):
     else:
         path = request
     current = read_page(graph, path)
-    root = project_files.resolve_root_from_content(graph_path(graph),
-                                                   current["content"])
+    root = _registry_folder_root(graph_path(graph), current["path"])
+    if root is None:
+        root = project_files.resolve_root_from_content(graph_path(graph),
+                                                       current["content"])
     info = project_files.git_info(root)
     return {"path": current["path"], "page": current["page"],
             "graphName": current["graphName"], **info}

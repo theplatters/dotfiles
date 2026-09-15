@@ -71,6 +71,10 @@ def _error(message: str) -> NoReturn:
     raise GraphError(message)
 
 
+def _today_iso() -> str:
+    return datetime.date.today().isoformat()
+
+
 def _validate_iso_date(value: object) -> str:
     if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
         _error("date must be YYYY-MM-DD")
@@ -324,10 +328,24 @@ def _response_for(graph, relative, raw):
     return project_planner._response(graph, relative, raw)
 
 
-def list_agenda(graph, date=None):
-    """List open tasks plus done tasks scheduled on *date*."""
-    if isinstance(date, dict):
-        date = date.get("date")
+_UNSET = object()
+
+
+def list_agenda(graph, date=_UNSET):
+    """List open tasks plus done tasks scheduled on *date*.
+
+    *date* defaults to local today when omitted (or when a request object
+    omits ``date``) so palette discovery can inspect the current day
+    without guessing a date. An explicit null/non-string date still fails
+    validation.
+    """
+    if date is _UNSET:
+        date = _today_iso()
+    elif isinstance(date, dict):
+        if "date" not in date:
+            date = _today_iso()
+        else:
+            date = date.get("date")
     date = _validate_iso_date(date)
     graph = graph_path(graph)
     try:
@@ -606,7 +624,7 @@ def main(argv=None):
         graph = resolve_graph(args.graph)
         if args.command == "list":
             request = _read_input()
-            value = list_agenda(graph, request.get("date"))
+            value = list_agenda(graph, request)
         else:
             request = _read_input()
             if args.command == "select":

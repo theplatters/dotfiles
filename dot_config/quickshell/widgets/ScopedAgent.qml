@@ -92,6 +92,17 @@ Item {
     property string status: "Press Retry to start the agent…"
     property var pendingApproval: null
     property var pendingRequests: ({})
+    // Authoritative history signal: get_state clears
+    // messagesAwaitingSessionState/sessionRefreshPending BEFORE the queued
+    // get_messages responds, so an empty messages cache after stateUpdated
+    // must never be treated as a fresh session. historyLoadedValid is true
+    // only after a correlated successful get_messages for the CURRENT
+    // (sessionFile, messagesGeneration); any historyFailed clears it.
+    // Per-worker (not planner-global) so background/cached workers and
+    // startup each gate independently.
+    property string historyLoadedSessionFile: ""
+    property int historyLoadedGeneration: -1
+    property bool historyLoadedValid: false
     property int serial: 0
     property int generation: 0
     property string lastRequestId: ""
@@ -343,6 +354,16 @@ Item {
         return id;
     }
 
+    function noteHistoryLoaded(sessionFile, generation) {
+        historyLoadedSessionFile = String(sessionFile || "");
+        historyLoadedGeneration = Number(generation || 0);
+        historyLoadedValid = true;
+    }
+
+    function noteHistoryFailed() {
+        historyLoadedValid = false;
+    }
+
     function request(type, fields) {
         // Allowlisted palette compatibility: only get_session_stats maps to
         // the bridge requestStats op. No raw Pi RPC is constructed here.
@@ -466,6 +487,11 @@ Item {
             messagesSessionFile = "";
             messagesAwaitingSessionState = false;
         }
+        // Authoritative history is per-identity: a dead bridge with an
+        // unresolved refresh must not retain a stale loaded signal.
+        historyLoadedSessionFile = "";
+        historyLoadedGeneration = -1;
+        historyLoadedValid = false;
         status = "Agent bridge stopped — Retry to restart";
         for (let pid of Object.keys(pendingCopy)) {
             opFinished(pid, pendingCopy[pid], false, "Agent bridge stopped — no prompt was replayed.");
@@ -505,6 +531,9 @@ Item {
         desiredRunning = false;
         _retryableBase = true;
         processStartFailed = true;
+        historyLoadedSessionFile = "";
+        historyLoadedGeneration = -1;
+        historyLoadedValid = false;
         status = buildErrorMessage();
         for (let pid of Object.keys(pendingCopy)) {
             opFinished(pid, pendingCopy[pid], false, buildErrorMessage());
@@ -537,6 +566,7 @@ Item {
                 // the retry UI clears its pending flag.
                 let hasFailed = (value.events || []).some(e => e && e.name === "failed");
                 if (op === "requestMessages") {
+                    noteHistoryFailed();
                     historyFailed(message, sessionFile, messagesGeneration);
                     if (!hasFailed) failed(message);
                 } else if (!hasFailed) {
@@ -553,8 +583,14 @@ Item {
             else if (event.name === "uiRequest") uiRequest(args[0] === undefined ? null : args[0]);
             else if (event.name === "stateUpdated") stateUpdated();
             else if (event.name === "statsChanged") statsChanged(args[0] === undefined ? ({}) : args[0]);
-            else if (event.name === "historyFailed") historyFailed(String(args[0] || ""), String(args[1] || ""), Number(args[2] || 0));
-            else if (event.name === "historyLoaded") historyLoaded(String(args[0] || ""), Number(args[1] || 0));
+            else if (event.name === "historyFailed") {
+                noteHistoryFailed();
+                historyFailed(String(args[0] || ""), String(args[1] || ""), Number(args[2] || 0));
+            }
+            else if (event.name === "historyLoaded") {
+                noteHistoryLoaded(String(args[0] || ""), Number(args[1] || 0));
+                historyLoaded(String(args[0] || ""), Number(args[1] || 0));
+            }
         }
     }
 

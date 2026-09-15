@@ -250,7 +250,7 @@ const update = () => tools.logseq_project_update.execute("id", {
 
 const gate = await hooks.tool_call({ toolName: "bash", input: { command: "cat escape" } }, ctx);
 assert(gate?.block === true, "scoped shell was not blocked");
-assert(Object.keys(tools).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git",
+assert(Object.keys(tools).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,desktop_current_project,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_project_resources",
        "scoped registration exposed unrelated tools");
 const read = await tools.logseq_project_read.execute("id", {}, undefined, undefined, ctx);
 assert(read.content[0].text.includes("before € after"), "split UTF-8 stdout was corrupted");

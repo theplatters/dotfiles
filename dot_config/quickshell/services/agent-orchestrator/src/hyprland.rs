@@ -666,7 +666,14 @@ pub fn fetch_snapshot_at(
         let focused_b = parse_activewindow(&win_b)?;
         let workspace_a = parse_activeworkspace(&ws_a)?;
         let workspace_b = parse_activeworkspace(&ws_b)?;
-        if focused_a != focused_b || workspace_a != workspace_b {
+        // PID-only differences are correlation metadata, never instability:
+        // compare focused windows on id/application/title only.
+        let windows_stable = match (&focused_a, &focused_b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.semantic_eq(b),
+            _ => false,
+        };
+        if !windows_stable || workspace_a != workspace_b {
             last_err = Some(HyprError::Timeout(
                 "snapshot unstable across rereads (switch in flight)".to_string(),
             ));
@@ -846,6 +853,16 @@ pub fn parse_activewindow(raw: &str) -> Result<Option<FocusedWindow>, HyprError>
             }
         }
     }
+    // Optional correlation PID: Hyprland reports the client PID as a JSON
+    // number under `pid`. Lenient by design (missing/null/wrong-typed reads
+    // as None) so older compositors and fake sockets without `pid` keep
+    // working; PID-only differences never affect semantic stability.
+    let process_id: Option<u32> = match obj.get("pid") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+        Some(serde_json::Value::String(s)) => s.parse::<u32>().ok(),
+        Some(_) => None,
+    };
     // Valid empty: no address (or null address) and no class/title content.
     if addr.is_empty() || addr == "0x0" {
         if class.is_empty() && title.is_empty() {
@@ -857,7 +874,12 @@ pub fn parse_activewindow(raw: &str) -> Result<Option<FocusedWindow>, HyprError>
     if addr.is_empty() && class.is_empty() && title.is_empty() {
         return Ok(None);
     }
-    Ok(Some(FocusedWindow::new(addr, class, title)))
+    Ok(Some(FocusedWindow::new_with_pid(
+        addr,
+        class,
+        title,
+        process_id,
+    )))
 }
 
 /// Strict activeworkspace parse. `None` = valid empty workspace.

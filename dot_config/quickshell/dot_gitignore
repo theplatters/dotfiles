@@ -4,3 +4,12 @@ __pycache__/
 # Per-machine settings (see settings.example.json). Never commit the real
 # logseqGraph path; every machine keeps its own copy.
 settings.json
+# Runtime lock for the persistent project registry (keep projects.toml).
+projects.toml.lock
+# Desktop-context collector databases: private activity data, never committed.
+# Covers activity.db, SQLite WAL/SHM/journal sidecars, and the per-DB lock.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.lock

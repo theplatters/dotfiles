@@ -53,6 +53,7 @@ SCOPED_FNS = [
     "refreshSpawnIdentity", "sendOp", "start", "stopIdle", "prompt",
     "abort", "newSession", "switchSession", "rename", "compact",
     "chooseModel", "respond", "requestMessages", "request",
+    "noteHistoryLoaded", "noteHistoryFailed",
     "applyState", "handleBridgeDead", "handleFailedToStart", "handleUpdate",
 ]
 

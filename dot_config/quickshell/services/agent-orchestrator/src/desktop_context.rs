@@ -12,13 +12,25 @@ pub const MAX_ID_CHARS: usize = 256;
 pub const MAX_APP_CHARS: usize = 256;
 pub const MAX_TITLE_CHARS: usize = 1024;
 pub const MAX_WORKSPACE_CHARS: usize = 256;
+/// Bounds for optional application resource fields.
+pub const MAX_RESOURCE_ADAPTER_CHARS: usize = 64;
+pub const MAX_RESOURCE_PATH_CHARS: usize = 4096;
+pub const MAX_RESOURCE_BRANCH_CHARS: usize = 256;
+pub const MAX_RESOURCE_URL_CHARS: usize = 2048;
+pub const MAX_RESOURCE_PAGE_CHARS: usize = 1024;
 
 /// Focused window: `id` is opaque (compositor-assigned), never interpreted.
+/// `process_id` is the optional OS PID of the focused client (Hyprland `pid`
+/// field). It is correlation metadata for application enrichment only and is
+/// deliberately ignored by semantic equality / classification so PID-only
+/// differences never produce history rows on their own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusedWindow {
     pub id: String,
     pub application: String,
     pub title: String,
+    #[serde(default)]
+    pub process_id: Option<u32>,
 }
 
 impl FocusedWindow {
@@ -27,7 +39,109 @@ impl FocusedWindow {
             id: bound_chars(id, MAX_ID_CHARS),
             application: bound_chars(application, MAX_APP_CHARS),
             title: bound_chars(title, MAX_TITLE_CHARS),
+            process_id: None,
         }
+    }
+
+    pub fn new_with_pid(id: &str, application: &str, title: &str, process_id: Option<u32>) -> Self {
+        Self {
+            id: bound_chars(id, MAX_ID_CHARS),
+            application: bound_chars(application, MAX_APP_CHARS),
+            title: bound_chars(title, MAX_TITLE_CHARS),
+            process_id,
+        }
+    }
+
+    /// Semantic equality for history/dedup: opaque id + human strings only.
+    /// `process_id` is correlation metadata and never meaningful alone.
+    pub fn semantic_eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.application == other.application && self.title == other.title
+    }
+}
+
+/// Optional typed application resource attached to a desktop snapshot.
+///
+/// Generic and additive: Phase 1 JSON without `resource` deserializes to
+/// `None`. `adapter` records provenance (e.g. `neovim`, `kitty`,
+/// `zen-title`, `logseq`, `logseq-title`) so fallbacks stay honest and
+/// labeled. Only meaningful location fields participate in semantic
+/// equality; provider timestamps/diagnostics must never live here (they
+/// would defeat dedup).
+///
+/// `git_remote` is an additive project-resolution field: a normalized safe
+/// GitHub repository URL (`https://github.com/owner/repo`, no credentials)
+/// when already known by a provider. Phase 2 JSON without `git_remote`
+/// reads as `None`. The project resolver may also discover the remote from
+/// the local git config when this is absent; it never stores credentials.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ResourceContext {
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_root: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_remote: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub page: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+impl ResourceContext {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        adapter: &str,
+        file: Option<&str>,
+        cwd: Option<&str>,
+        git_root: Option<&str>,
+        git_branch: Option<&str>,
+        url: Option<&str>,
+        page: Option<&str>,
+        title: Option<&str>,
+    ) -> Self {
+        Self {
+            adapter: bound_chars(adapter, MAX_RESOURCE_ADAPTER_CHARS),
+            file: opt_bound(file, MAX_RESOURCE_PATH_CHARS),
+            cwd: opt_bound(cwd, MAX_RESOURCE_PATH_CHARS),
+            git_root: opt_bound(git_root, MAX_RESOURCE_PATH_CHARS),
+            git_branch: opt_bound(git_branch, MAX_RESOURCE_BRANCH_CHARS),
+            git_remote: None,
+            url: opt_bound(url, MAX_RESOURCE_URL_CHARS),
+            page: opt_bound(page, MAX_RESOURCE_PAGE_CHARS),
+            title: opt_bound(title, MAX_TITLE_CHARS),
+        }
+    }
+
+    /// Attach a normalized safe GitHub remote URL (no credentials).
+    /// Malformed/untrusted values clear to `None`; overlong values truncate
+    /// at a char boundary via the same bound as `url`.
+    pub fn with_git_remote(mut self, remote: Option<&str>) -> Self {
+        self.git_remote = remote
+            .filter(|s| !s.is_empty())
+            .and_then(|s| crate::project_context::normalize_github_remote(s))
+            .and_then(|n| opt_bound(Some(n.as_str()), MAX_RESOURCE_URL_CHARS));
+        self
+    }
+
+    /// True when every meaningful location field is empty. Adapter-only
+    /// resources carry no signal and are treated as absent by callers.
+    pub fn is_empty(&self) -> bool {
+        self.file.is_none()
+            && self.cwd.is_none()
+            && self.git_root.is_none()
+            && self.git_branch.is_none()
+            && self.git_remote.is_none()
+            && self.url.is_none()
+            && self.page.is_none()
+            && self.title.is_none()
     }
 }
 
@@ -80,7 +194,42 @@ pub enum Availability {
     Unavailable,
 }
 
+/// Deterministic project association for a desktop snapshot.
+///
+/// Additive and explainable: only the stable project identity (`id`, `name`)
+/// plus the match strength (`matched_by`: `file`/`cwd`/`git_root`/`git_remote`
+/// ONLY) participate in semantic equality. The registry `revision` is
+/// deliberately excluded so identical mappings at different revisions do not
+/// flap history. Old JSON without `project` reads as `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectContext {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub matched_by: String,
+}
+
+impl ProjectContext {
+    pub fn new(id: &str, name: &str, matched_by: &str) -> Self {
+        Self {
+            id: bound_chars(id, MAX_ID_CHARS),
+            name: bound_chars(name, MAX_APP_CHARS),
+            matched_by: bound_chars(matched_by, MAX_RESOURCE_ADAPTER_CHARS),
+        }
+    }
+}
+
 /// Live desktop context snapshot (serializable).
+///
+/// `resource` is an additive Phase 2 field: missing in Phase 1 JSON reads as
+/// `None`, and `Some` values round-trip through the same `activity` table
+/// without any schema change. `source` stays compositor-only (Hyprland);
+/// per-application provenance lives in `resource.adapter`.
+///
+/// `project` is the deterministic project resolution overlay: missing in
+/// older JSON reads as `None` and participates in semantic equality
+/// (id/name/matched_by only, never the registry revision).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopContext {
     pub focused_window: Option<FocusedWindow>,
@@ -89,6 +238,10 @@ pub struct DesktopContext {
     pub source: Source,
     /// UTC epoch milliseconds of observation.
     pub observed_at_ms: i64,
+    #[serde(default)]
+    pub resource: Option<ResourceContext>,
+    #[serde(default)]
+    pub project: Option<ProjectContext>,
 }
 
 impl DesktopContext {
@@ -104,6 +257,27 @@ impl DesktopContext {
             available: true,
             source,
             observed_at_ms,
+            resource: None,
+            project: None,
+        }
+    }
+
+    pub fn available_with_resource(
+        source: Source,
+        focused_window: Option<FocusedWindow>,
+        workspace: Option<Workspace>,
+        observed_at_ms: i64,
+        resource: Option<ResourceContext>,
+    ) -> Self {
+        let resource = resource.filter(|r| !r.is_empty());
+        Self {
+            focused_window,
+            workspace,
+            available: true,
+            source,
+            observed_at_ms,
+            resource,
+            project: None,
         }
     }
 
@@ -114,16 +288,49 @@ impl DesktopContext {
             available: false,
             source,
             observed_at_ms,
+            resource: None,
+            project: None,
         }
     }
 
-    /// Semantic equality: everything except the observation timestamp.
+    /// Semantic equality: everything except the observation timestamp and
+    /// the focused-window PID. Focused windows compare on opaque
+    /// id/application/title only; resource compares on meaningful location
+    /// fields; project compares on stable identity (id/name/matched_by
+    /// only, never the registry revision) so identical mappings do not flap.
+    /// Provider timestamps/diagnostics must never be stored here.
     /// Used for dedup so paired/duplicate events do not append history.
     pub fn semantic_eq(&self, other: &Self) -> bool {
-        self.focused_window == other.focused_window
+        windows_opt_semantic_eq(self.focused_window.as_ref(), other.focused_window.as_ref())
             && self.workspace == other.workspace
             && self.available == other.available
             && self.source == other.source
+            && self.resource == other.resource
+            && self.project == other.project
+    }
+
+    /// Attach (or clear) enrichment, normalizing adapter-only shells to None.
+    /// Any resource change clears a possibly-stale project: the project
+    /// resolver re-derives it from the new resource, and stripped worker
+    /// inputs (`None`) must never carry a previous focus's project.
+    pub fn with_resource(mut self, resource: Option<ResourceContext>) -> Self {
+        self.resource = resource.filter(|r| !r.is_empty());
+        self.project = None;
+        self
+    }
+
+    /// Attach (or clear) the deterministic project overlay.
+    pub fn with_project(mut self, project: Option<ProjectContext>) -> Self {
+        self.project = project;
+        self
+    }
+}
+
+fn windows_opt_semantic_eq(a: Option<&FocusedWindow>, b: Option<&FocusedWindow>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.semantic_eq(y),
+        _ => false,
     }
 }
 
@@ -140,6 +347,9 @@ pub enum ActivityKind {
     Focus,
     Title,
     Workspace,
+    /// Phase 2: same focused window/workspace, but the application resource
+    /// (file/cwd/git root/branch/url/page/title) changed.
+    Context,
     /// Reserved: never produced by [`classify_transition`] in Phase 1.
     WindowOpen,
     /// Reserved: never produced by [`classify_transition`] in Phase 1.
@@ -154,6 +364,7 @@ impl ActivityKind {
             ActivityKind::Focus => "focus",
             ActivityKind::Title => "title",
             ActivityKind::Workspace => "workspace",
+            ActivityKind::Context => "context",
             ActivityKind::WindowOpen => "window_open",
             ActivityKind::WindowClose => "window_close",
             ActivityKind::Availability => "availability",
@@ -166,6 +377,8 @@ impl ActivityKind {
             "focus" => ActivityKind::Focus,
             "title" => ActivityKind::Title,
             "workspace" => ActivityKind::Workspace,
+            "context" => ActivityKind::Context,
+            "resource" => ActivityKind::Context,
             "window_open" => ActivityKind::WindowOpen,
             "window_close" => ActivityKind::WindowClose,
             "availability" => ActivityKind::Availability,
@@ -217,13 +430,19 @@ pub fn classify_transition(prev: Option<&DesktopContext>, next: &DesktopContext)
             if p.title != n.title || p.application != n.application {
                 return ActivityKind::Title;
             }
+            // Deliberately ignore process_id-only differences here and in
+            // semantic_eq: PID is correlation metadata, not user meaning.
         }
     }
     if prev.workspace != next.workspace {
         return ActivityKind::Workspace;
     }
-    // Same window id/title and same workspace but something else changed
-    // (should be rare given semantic_eq gate): generic snapshot.
+    if prev.resource != next.resource || prev.project != next.project {
+        return ActivityKind::Context;
+    }
+    // Same window id/title, same workspace, same resource/project but
+    // something else changed (should be rare given semantic_eq gate):
+    // generic snapshot.
     ActivityKind::Snapshot
 }
 
@@ -449,6 +668,14 @@ fn bound_chars(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max_chars).collect()
+}
+
+fn opt_bound(v: Option<&str>, max_chars: usize) -> Option<String> {
+    match v {
+        None => None,
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(bound_chars(s, max_chars)),
+    }
 }
 
 #[cfg(test)]

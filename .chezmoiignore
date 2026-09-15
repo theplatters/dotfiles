@@ -38,3 +38,10 @@
 **/*.swo
 **/*~
 **/*.bak
+
+# --- Local databases (desktop-context collector activity DB + SQLite sidecars/locks) ---
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
+**/*.db.lock

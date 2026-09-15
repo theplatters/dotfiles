@@ -79,7 +79,7 @@ const ctx = {cwd: "/work", hasUI: true, ui: {confirm: async (_title, message) =>
 }}};
 const noUi = {cwd: "/work", hasUI: false, ui: ctx.ui};
 const assert = (value, message) => { if (!value) throw new Error(message); };
-assert(Object.keys(tools).join(",") === "logseq_journal_context,logseq_journal_append", "journal mode exposed extra tools");
+assert(Object.keys(tools).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_project,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_project_resources", "journal mode exposed extra tools");
 const blocked = await hooks.tool_call({toolName: "bash", input: {command: "touch note"}}, ctx);
 assert(blocked?.block === true, "generic tool escaped journal allowlist");
 assert(await hooks.session_before_switch({reason: "new"}) === undefined, "new session hook was rejected");
