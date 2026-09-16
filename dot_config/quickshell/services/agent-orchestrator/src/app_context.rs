@@ -14,9 +14,21 @@
 //! PID — a present but unequal peer is a confirmed mismatch that evicts
 //! rather than serving last-good; the selected OS window/tab/pane must each
 //! be the unique `is_focused` entry (no positional or first-element guesses,
-//! no numeric window-id==pid conflation). Neovim wins only as the unique
+//! no numeric window-id==pid conflation). Kitty socket discovery honors the
+//! configured env socket (`QS_KITTY_SOCKET` / `KITTY_LISTEN_ON`) as a
+//! preference; when it is absent or belongs to a foreign instance, the
+//! focused instance's default socket (`/tmp/kitty-<focused_pid>`, plus
+//! `$TMPDIR/kitty-<pid>` when different) is probed and still validated by
+//! peer PID — no other opt-in is required for cwd-based project resolution
+//! (the nvim Lua publisher remains optional for per-file context). Neovim wins only as the unique
 //! foreground `nvim` with a fresh correlated record. Zen explicit records
-//! require the opaque compositor `window_id` PLUS `pid`. Logseq is
+//! require the opaque compositor `window_id` PLUS `pid`. Zotero explicit
+//! active-reader records require the same verified `window_id` PLUS `pid`
+//! binding supplied by the external bridge (the in-process plugin cannot
+//! observe native window handles: the local library API exposes no
+//! focus/reader state and `Zotero.Reader` exposes no OS handle, so a global
+//! last-active reader is never attributed and there is no title fallback;
+//! closed/stale/mismatched readers evict). Logseq is
 //! title-only (no HTTP API: the global page cannot be window-bound without
 //! polling): the full title plus an explicit ` - Logseq` suffix-strip page
 //! extraction. Multi-target ambiguity resolves to `None`, never a guess.
@@ -82,6 +94,7 @@ pub struct EnrichmentEnv {
     pub kitty_socket: Option<PathBuf>,
     pub nvim_dir: Option<PathBuf>,
     pub zen_file: Option<PathBuf>,
+    pub zotero_file: Option<PathBuf>,
 }
 
 impl EnrichmentEnv {
@@ -100,10 +113,12 @@ impl EnrichmentEnv {
             });
         let nvim_dir = std::env::var_os("QS_NVIM_CONTEXT_DIR").map(PathBuf::from);
         let zen_file = std::env::var_os("QS_ZEN_CONTEXT_FILE").map(PathBuf::from);
+        let zotero_file = std::env::var_os("QS_ZOTERO_CONTEXT_FILE").map(PathBuf::from);
         Self {
             kitty_socket,
             nvim_dir,
             zen_file,
+            zotero_file,
         }
     }
 }
@@ -193,6 +208,21 @@ pub fn enrich_with_env(base: DesktopContext, env: &EnrichmentEnv, now: i64) -> D
             Some(r) => ProviderFresh::Value(r),
             // Empty title: nothing honest to attach (not worth caching).
             None => return base,
+        }
+    } else if app.contains("zotero") {
+        // No title-based attribution for Zotero: without the opt-in explicit
+        // file there is nothing honest to attach (a window title cannot prove
+        // which reader tab is active, and the local library API exposes no
+        // focus/reader state). Unconfigured Zotero windows carry no resource.
+        if env.zotero_file.is_none() {
+            return base;
+        }
+        match zotero_fresh(win, env, now) {
+            ProviderFresh::Value(r) => ProviderFresh::Value(r),
+            // Closed readers and binding mismatches evict (never serve stale
+            // documents); missing/unreadable files stay transient.
+            ProviderFresh::Unavailable => ProviderFresh::Unavailable,
+            ProviderFresh::Mismatch => ProviderFresh::Mismatch,
         }
     } else {
         return base;
@@ -696,6 +726,75 @@ pub fn kitty_peer_pid(_socket: &Path) -> Option<u32> {
     None
 }
 
+/// Candidate kitty remote-control sockets for the focused client PID, in
+/// probe priority order: the configured env socket first (when it is a
+/// usable absolute path: non-empty, no NUL, `<=4096` bytes, bare or
+/// `unix:`-prefixed form normalized via [`kitty_fs_path`]), then the
+/// focused instance's default socket `/tmp/kitty-<focused_pid>` (kitty's
+/// default when no explicit listen address is configured), then
+/// `$TMPDIR/kitty-<focused_pid>` when it differs from the `/tmp` form
+/// (hermetic temp dirs in tests, custom `TMPDIR` in production).
+/// Duplicates are removed preserving order. All candidates are absolute
+/// paths only; no shell is ever involved and each candidate is still
+/// validated by [`kitty_peer_pid`] before use.
+pub fn kitty_candidate_sockets(configured: Option<&Path>, focused_pid: u32) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !p.is_absolute() {
+            return;
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Some(cfg) = configured {
+        if let Some(fs) = kitty_fs_path(cfg) {
+            push(fs);
+        }
+    }
+    push(PathBuf::from(format!("/tmp/kitty-{focused_pid}")));
+    let tmp = std::env::temp_dir().join(format!("kitty-{focused_pid}"));
+    if tmp.is_absolute() {
+        push(tmp);
+    }
+    out
+}
+
+/// Outcome of [`select_kitty_socket`]: the validated socket plus its peer
+/// PID, a confirmed foreign instance, or nothing reachable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KittySocketChoice {
+    Matched(PathBuf, u32),
+    Mismatch,
+    Unavailable,
+}
+
+/// Probe each candidate with the bounded [`kitty_peer_pid`] (500 ms) and
+/// return the FIRST candidate whose peer equals `focused_pid`, scanning all
+/// candidates (a foreign first candidate never stops a later match). When
+/// no candidate matches but at least one probe returned a (foreign) peer,
+/// the focused instance is confirmed absent on every reachable socket:
+/// `Mismatch`. When nothing was reachable at all: `Unavailable`.
+pub fn select_kitty_socket(candidates: &[PathBuf], focused_pid: u32) -> KittySocketChoice {
+    let mut saw_foreign = false;
+    for cand in candidates {
+        match kitty_peer_pid(cand) {
+            Some(peer) if peer == focused_pid => {
+                return KittySocketChoice::Matched(cand.clone(), peer);
+            }
+            Some(_) => {
+                saw_foreign = true;
+            }
+            None => {}
+        }
+    }
+    if saw_foreign {
+        KittySocketChoice::Mismatch
+    } else {
+        KittySocketChoice::Unavailable
+    }
+}
+
 /// Focused kitty pane info extracted from `kitty @ ls` JSON.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KittyPaneInfo {
@@ -888,11 +987,19 @@ fn resolve_pane_cwd(win: &serde_json::Value) -> Option<String> {
 
 /// Kitty (+ Neovim-inside-kitty precedence) resource for a focused kitty
 /// window, plus the verified pane/editor scope for cache service.
+/// Socket discovery honors the configured env socket as a preference and
+/// falls back to the focused instance's default socket
+/// (`/tmp/kitty-<focused_pid>`, plus `$TMPDIR/kitty-<pid>`); every
+/// candidate is still validated by peer PID before use, so no extra opt-in
+/// beyond the running kitty instance is required for cwd resolution.
 /// Scoping rules (never an unrelated global):
-/// - unconfigured socket / unreachable peer / failed query: `Unavailable`
-///   with no scope (transient; generic focus-keyed serve may apply).
-/// - present but unequal peer, missing focused PID, or unresolvable /
-///   ambiguous pane focus: `Mismatch` (confirmed foreign; evicts, no serve).
+/// - no focused PID: `Mismatch` (identity cannot be established).
+/// - no reachable candidate: `Unavailable` with no scope (transient;
+///   generic focus-keyed serve may apply).
+/// - reachable foreign peer(s) but no candidate matching the focused PID:
+///   `Mismatch` (confirmed foreign; evicts, no serve).
+/// - failed query after a match: `Unavailable` with no scope (transient).
+/// - unresolvable / ambiguous pane focus: `Mismatch` (confirmed foreign;
 /// - unique foreground nvim with a fresh record: neovim `Value` scoped to
 ///   that pane + editor PID.
 /// - same unique foreground nvim but the record is missing/stale: the
@@ -911,30 +1018,31 @@ fn kitty_fresh(
         kitty_window_id: pane.window_id.clone(),
         nvim_pid,
     };
-    let Some(socket) = env.kitty_socket.as_ref() else {
-        return (ProviderFresh::Unavailable, None);
-    };
-    // Peer check BEFORE spawning `kitty`: a present but unequal peer proves
-    // the socket belongs to another instance (confirmed mismatch, no query,
-    // no last-good). An unreachable socket is merely unavailable.
-    let peer = kitty_peer_pid(socket);
-    if let (Some(focused), Some(peer)) = (win.process_id, peer) {
-        if focused != peer {
-            return (ProviderFresh::Mismatch, None);
-        }
-    } else if win.process_id.is_some() && peer.is_none() {
-        // Focused PID known but peer unreachable: transient.
-        return (ProviderFresh::Unavailable, None);
-    } else if win.process_id.is_none() {
+    let Some(focused_pid) = win.process_id else {
         // No focused PID: instance identity cannot be established.
         return (ProviderFresh::Mismatch, None);
-    }
-    let Some(raw) = kitty_ls_via_socket(socket) else {
+    };
+    // Socket discovery BEFORE spawning `kitty`: the configured env socket
+    // is the preference, but when it is absent or belongs to a foreign
+    // instance the focused instance's own default socket is tried. Every
+    // candidate is probed with the bounded peer check; the first whose
+    // `SO_PEERCRED` peer equals the focused client PID wins (all
+    // candidates are scanned — a foreign first candidate never stops a
+    // later match). A reachable foreign socket with no matching candidate
+    // is a confirmed mismatch (never last-good); nothing reachable is
+    // merely unavailable.
+    let candidates = kitty_candidate_sockets(env.kitty_socket.as_deref(), focused_pid);
+    let (socket, peer) = match select_kitty_socket(&candidates, focused_pid) {
+        KittySocketChoice::Matched(socket, peer) => (socket, peer),
+        KittySocketChoice::Mismatch => return (ProviderFresh::Mismatch, None),
+        KittySocketChoice::Unavailable => return (ProviderFresh::Unavailable, None),
+    };
+    let Some(raw) = kitty_ls_via_socket(&socket) else {
         return (ProviderFresh::Unavailable, None);
     };
     // Unresolvable or ambiguous pane focus: confirmed mismatch, never an
     // unrelated previous pane's value.
-    let Some(pane) = select_kitty_pane(&raw, win.process_id, peer) else {
+    let Some(pane) = select_kitty_pane(&raw, win.process_id, Some(peer)) else {
         return (ProviderFresh::Mismatch, None);
     };
     // Resolve pane entries once for both presence detection and record
@@ -1487,6 +1595,250 @@ fn read_zen_explicit(path: &Path, win: &FocusedWindow, now: i64) -> ZenRead {
 }
 
 // ---------------------------------------------------------------------------
+// Zotero (opt-in explicit active-reader only, no title attribution)
+// ---------------------------------------------------------------------------
+//
+// The Zotero local library API (`http://localhost:23119/api/`, Zotero docs
+// "Local API": read-only library data, `Zotero-Server-ID` header on Zotero
+// 10+, no focus/reader state) cannot tell which reader tab is active, and
+// the in-process JS API (`Zotero.Reader` tab/window manager,
+// `Zotero.getActiveZoteroPane().getSelectedItems()`, `Zotero.Items`,
+// `Zotero.Collections` per the JS-API docs and `zotero/reader` source)
+// exposes no native OS window handle that maps to a Hyprland window
+// address/PID. A plugin therefore cannot fabricate `window_id`/`pid`, and
+// a process-global "last active reader" must never be attributed to the
+// focused window (multi-window/tab switches and detached readers would
+// misattribute).
+//
+// Fail-closed contract (documented in `integrations/zotero/README.md`):
+// the plugin exposes a local endpoint with the *Zotero-internal* active
+// reader (server/library/item/attachment/title/memberships+ancestors,
+// version, stable URI), and a tiny external bridge samples the compositor
+// (`hyprctl activewindow -j`) in the SAME tick, then writes the verified
+// private JSON (`QS_ZOTERO_CONTEXT_FILE`, `0600`, atomic rename, bounded)
+// carrying the opaque `window_id` PLUS `pid` binding. The collector binds
+// ONLY on an exact `window_id`+`pid` match with freshness (30 s, mtime
+// fallback); anything else evicts. Closed readers are explicit tombstones
+// (`state:"closed"` or missing item identity) and evict rather than serving
+// last-good. There is no title fallback: unconfigured Zotero windows carry
+// no resource, and no SQLite, cloud, title, or content reads ever happen.
+
+/// True for an 8-char Zotero key (`[A-Z0-9]{8}`: item/attachment/collection).
+pub fn is_zotero_key(s: &str) -> bool {
+    s.len() == 8 && s.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// True for a Zotero library id (digit string, `user/"0"` alias allowed).
+pub fn is_zotero_library_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Bounded server-id check (non-blank, no NUL/controls/whitespace, ≤128).
+pub fn is_zotero_server_id(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 128
+        && !t.contains('\0')
+        && !t.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// Stable `zotero://select/...` URI check (display/search only, never identity).
+fn is_zotero_uri(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 2048
+        && !t.contains('\0')
+        && (t.starts_with("zotero://select/") || t.starts_with("zotero://open-pdf/"))
+}
+
+/// Tri-state Zotero read: `Matched` (bound active reader), `ConfirmedMismatch`
+/// (readable but for another window/stale/closed — evict), `Unavailable`
+/// (missing/unreadable — transient, serve last-good).
+enum ZoteroRead {
+    Matched(ResourceContext),
+    ConfirmedMismatch,
+    Unavailable,
+}
+
+fn zotero_fresh(win: &FocusedWindow, env: &EnrichmentEnv, now: i64) -> ProviderFresh {
+    let Some(path) = env.zotero_file.as_ref() else {
+        return ProviderFresh::Unavailable;
+    };
+    match read_zotero_explicit(path, win, now) {
+        ZoteroRead::Matched(r) => ProviderFresh::Value(r),
+        ZoteroRead::ConfirmedMismatch => ProviderFresh::Mismatch,
+        ZoteroRead::Unavailable => ProviderFresh::Unavailable,
+    }
+}
+
+fn read_zotero_explicit(path: &Path, win: &FocusedWindow, now: i64) -> ZoteroRead {
+    let Some((raw, mtime)) = read_private_file(path) else {
+        return ZoteroRead::Unavailable;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return ZoteroRead::Unavailable;
+    };
+    let Some(obj) = v.as_object() else {
+        return ZoteroRead::Unavailable;
+    };
+    // Exact binding first: opaque compositor window id AND pid must both match.
+    // A readable record for another window (or without binding) is a confirmed
+    // mismatch, never a transient. This is the verified bridge binding — the
+    // plugin itself never invents it (see module docs).
+    let rec_window = obj.get("window_id").and_then(|x| x.as_str()).unwrap_or("");
+    if rec_window.is_empty() || rec_window != win.id {
+        return ZoteroRead::ConfirmedMismatch;
+    }
+    let Some(focused_pid) = win.process_id else {
+        return ZoteroRead::ConfirmedMismatch;
+    };
+    let rec_pid = match obj.get("pid") {
+        Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|x| u32::try_from(x).ok()),
+        Some(serde_json::Value::String(s)) => s.parse::<u32>().ok(),
+        _ => None,
+    };
+    if rec_pid != Some(focused_pid) {
+        return ZoteroRead::ConfirmedMismatch;
+    }
+    let updated = obj.get("updated_at_ms").and_then(|x| x.as_i64());
+    if !record_is_fresh(updated, mtime, now) {
+        return ZoteroRead::ConfirmedMismatch;
+    }
+    // Closed reader tombstone: explicit closed state or missing item identity
+    // evicts (never serves the previous document as last-good).
+    if obj.get("state").and_then(|x| x.as_str()) == Some("closed") {
+        return ZoteroRead::ConfirmedMismatch;
+    }
+    let Some(zc) = parse_zotero_context(obj) else {
+        return ZoteroRead::ConfirmedMismatch;
+    };
+    let title = obj
+        .get("title")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let t = s.trim();
+            if t.chars().count() <= 1024 {
+                t.to_string()
+            } else {
+                t.chars().take(1024).collect()
+            }
+        });
+    let uri = zc.uri.clone();
+    let r = ResourceContext::new(
+        "zotero",
+        None,
+        None,
+        None,
+        None,
+        uri.as_deref(),
+        None,
+        title.as_deref(),
+    )
+    .with_zotero(Some(zc));
+    if r.is_empty() {
+        return ZoteroRead::ConfirmedMismatch;
+    }
+    ZoteroRead::Matched(r)
+}
+
+/// Parse + bound the typed Zotero identity from a verified record object.
+/// Returns `None` on any missing/invalid stable field (fail closed). Only
+/// metadata is read: server/library/item/attachment keys, current direct
+/// memberships + ancestor collection keys, version, stable URI. Page numbers,
+/// annotations, and content are never read.
+pub fn parse_zotero_context(obj: &serde_json::Map<String, serde_json::Value>) -> Option<crate::desktop_context::ZoteroContext> {
+    let server_id = obj.get("server_id")?.as_str()?;
+    if !is_zotero_server_id(server_id) {
+        return None;
+    }
+    let library_type = obj.get("library_type")?.as_str()?;
+    if library_type != "user" && library_type != "group" {
+        return None;
+    }
+    let library_id = obj.get("library_id")?.as_str()?;
+    if !is_zotero_library_id(library_id) {
+        return None;
+    }
+    if library_type == "group" && library_id == "0" {
+        return None;
+    }
+    let item_key = obj.get("item_key")?.as_str()?;
+    if !is_zotero_key(item_key) {
+        return None;
+    }
+    let attachment_key = match obj.get("attachment_key") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) if is_zotero_key(s) => Some(s.clone()),
+        _ => return None,
+    };
+    let str_list = |key: &str| -> Option<Vec<String>> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Some(Vec::new()),
+            Some(serde_json::Value::Array(arr)) => {
+                if arr.len() > 256 {
+                    return None;
+                }
+                let mut out = Vec::new();
+                for x in arr {
+                    let s = x.as_str()?;
+                    if !is_zotero_key(s) {
+                        return None;
+                    }
+                    if !out.contains(&s.to_string()) {
+                        out.push(s.to_string());
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    };
+    let collections = str_list("collections")?;
+    let ancestor_collections = str_list("ancestor_collections")?;
+    // Back-compat: older publishers wrote `ancestors`.
+    let ancestor_collections = if ancestor_collections.is_empty() {
+        str_list("ancestors").unwrap_or_default()
+    } else {
+        ancestor_collections
+    };
+    let version = match obj.get("version") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(n)) => {
+            let x = n.as_i64()?;
+            if x < 0 {
+                return None;
+            }
+            Some(x)
+        }
+        _ => return None,
+    };
+    let uri = match obj.get("zotero_uri").or_else(|| obj.get("uri")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
+        Some(serde_json::Value::String(s)) if is_zotero_uri(s) => {
+            Some(s.trim().to_string())
+        }
+        // A malformed URI never fails the whole record: identity still binds,
+        // display/search just omit the link.
+        Some(serde_json::Value::String(_)) => None,
+        _ => return None,
+    };
+    Some(crate::desktop_context::ZoteroContext {
+        server_id: server_id.trim().to_string(),
+        library_type: library_type.to_string(),
+        library_id: library_id.to_string(),
+        item_key: item_key.to_string(),
+        attachment_key,
+        collections,
+        ancestor_collections,
+        version,
+        uri,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Logseq (title-only)
 // ---------------------------------------------------------------------------
 //
@@ -1495,7 +1847,13 @@ fn read_zen_explicit(path: &Path, win: &FocusedWindow, now: i64) -> ZenRead {
 // cannot prove the global value belongs to the focused window without
 // compositor polling), so any attributed page would be deceptive. Logseq is
 // title-only: the full window title plus an explicit, documented page
-// extraction from the title suffix.
+// extraction from the window title. Two shapes are accepted: the
+// browser-tab form `<page> - Logseq` (exact suffix stripped, then trailing
+// `-`/whitespace trimmed) and the Electron-app bare page name (the trimmed
+// title used as-is). Validation here is structural only (non-empty,
+// <=1024 chars, no control chars, not the app name itself, no trailing
+// loading ellipsis); project association is exact registry matching in the
+// resolver, never a guess here.
 fn logseq_resource(focused_title: &str) -> Option<ResourceContext> {
     let title = focused_title.trim();
     if title.is_empty() {
@@ -1513,16 +1871,40 @@ fn logseq_resource(focused_title: &str) -> Option<ResourceContext> {
     ))
 }
 
-/// Explicit page extraction from a Logseq window title: Logseq renders
-/// `<page> - Logseq`. Returns the prefix only for that exact suffix;
-/// anything else yields `None` (never a guess).
+/// Explicit page extraction from a Logseq window title. Accepts both the
+/// browser-tab form `<page> - Logseq` (exact suffix stripped, then trailing
+/// `-`/whitespace trimmed exactly as before) and the Electron-app bare page
+/// name (the trimmed title used as-is). Validation is structural only:
+/// non-empty, `chars().count() <= 1024`, no `'\0'` or other control chars
+/// (`char::is_control`), not the app window name (`"logseq"`,
+/// case-insensitive), and no trailing loading-ellipsis placeholder (`"..."` or
+/// `"…"`). Returns `None` for anything that fails validation (never a guess);
+/// project association is exact-match in the resolver.
 pub fn logseq_page_from_title(title: &str) -> Option<String> {
-    let page = title.trim().strip_suffix("- Logseq")?.trim_end();
-    let page = page.strip_suffix('-').unwrap_or(page).trim();
-    if page.is_empty() || page.chars().count() > 1024 {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    Some(page.to_string())
+    let candidate = if let Some(stripped) = trimmed.strip_suffix("- Logseq") {
+        let page = stripped.trim_end();
+        let page = page.strip_suffix('-').unwrap_or(page).trim();
+        page
+    } else {
+        trimmed
+    };
+    if candidate.is_empty() || candidate.chars().count() > 1024 {
+        return None;
+    }
+    if candidate.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if candidate.eq_ignore_ascii_case("logseq") {
+        return None;
+    }
+    if candidate.ends_with("...") || candidate.ends_with('…') {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1889,6 +2271,29 @@ impl ResourceProvider for LogseqProvider {
     }
 }
 
+/// Zotero provider: explicit verified active-reader only, never title-based.
+/// Unconfigured or unbound Zotero windows yield `None` (fail closed).
+pub struct ZoteroProvider {
+    pub env: EnrichmentEnv,
+    pub now: i64,
+}
+
+impl ResourceProvider for ZoteroProvider {
+    fn name(&self) -> &'static str {
+        "zotero"
+    }
+    fn enrich(&self, ctx: &DesktopContext) -> Option<ResourceContext> {
+        let win = ctx.focused_window.as_ref()?;
+        if !ctx.available || !win.application.to_lowercase().contains("zotero") {
+            return None;
+        }
+        match zotero_fresh(win, &self.env, self.now) {
+            ProviderFresh::Value(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,7 +2362,56 @@ mod tests {
         );
         assert!(logseq_page_from_title("Logseq").is_none());
         assert!(logseq_page_from_title("").is_none());
-        assert!(logseq_page_from_title("a - Logseq - extra").is_none());
+        assert_eq!(
+            logseq_page_from_title("a - Logseq - extra").as_deref(),
+            Some("a - Logseq - extra")
+        );
+        // Bare Electron-app titles are page names.
+        assert_eq!(
+            logseq_page_from_title("Asset-Prices").as_deref(),
+            Some("Asset-Prices")
+        );
+        assert_eq!(
+            logseq_page_from_title("Person/Grace").as_deref(),
+            Some("Person/Grace")
+        );
+        // Loading-placeholder transients are rejected.
+        assert!(logseq_page_from_title("Lädt...").is_none());
+        assert!(logseq_page_from_title("Loading…").is_none());
+        // Whitespace is trimmed.
+        assert_eq!(
+            logseq_page_from_title("  Asset-Prices  ").as_deref(),
+            Some("Asset-Prices")
+        );
+        // Embedded control chars are rejected.
+        assert!(logseq_page_from_title("a\tb").is_none());
+        assert!(logseq_page_from_title("a\0b").is_none());
+        // Overlong candidates are rejected.
+        assert!(logseq_page_from_title(&"a".repeat(1025)).is_none());
+        assert_eq!(
+            logseq_page_from_title(&"a".repeat(1024)).as_deref(),
+            Some("a".repeat(1024).as_str())
+        );
+    }
+
+    #[test]
+    fn logseq_bare_title_enriches_page() {
+        clear_last_good_cache();
+        let ctx = DesktopContext::available(
+            crate::desktop_context::Source::Hyprland,
+            Some(crate::desktop_context::FocusedWindow::new(
+                "0x1",
+                "Logseq",
+                "Asset-Prices",
+            )),
+            None,
+            1,
+        );
+        let out = enrich_with_env(ctx, &env_empty(), 1_000_000);
+        let r = out.resource.expect("logseq bare-title fallback");
+        assert_eq!(r.adapter, "logseq-title");
+        assert_eq!(r.title.as_deref(), Some("Asset-Prices"));
+        assert_eq!(r.page.as_deref(), Some("Asset-Prices"));
     }
 
     #[test]
@@ -2261,6 +2715,109 @@ mod tests {
         assert_eq!(
             resolve_nvim_file("/tmp/note.md", Some("/other")).as_deref(),
             Some("/tmp/note.md")
+        );
+    }
+
+    #[test]
+    fn kitty_candidate_sockets_order_dedup_and_filtering() {
+        let pid = 424242u32;
+        let default_tmp = PathBuf::from(format!("/tmp/kitty-{pid}"));
+        // Configured socket is the preference, then the focused default.
+        let cfg = PathBuf::from("/run/user/1000/kitty.sock");
+        let c = kitty_candidate_sockets(Some(cfg.as_path()), pid);
+        assert!(!c.is_empty(), "even empty env yields a derived default");
+        assert_eq!(c[0], cfg, "configured socket stays first");
+        assert!(c.contains(&default_tmp), "must contain /tmp/kitty-<pid>");
+        assert!(c.iter().all(|p| p.is_absolute()), "absolute only");
+        let mut seen = std::collections::HashSet::new();
+        for p in &c {
+            assert!(seen.insert(p.clone()), "no duplicates: {c:?}");
+        }
+        // No configured socket: derived default is still yielded.
+        let none = kitty_candidate_sockets(None, pid);
+        assert_eq!(none[0], default_tmp);
+        assert!(none.iter().all(|p| p.is_absolute()));
+        // Relative / empty / NUL configured values are filtered out.
+        let rel = kitty_candidate_sockets(Some(Path::new("relative.sock")), pid);
+        assert_eq!(rel[0], default_tmp, "relative configured must be skipped");
+        let empty = kitty_candidate_sockets(Some(Path::new("")), pid);
+        assert_eq!(empty[0], default_tmp, "empty configured must be skipped");
+        // Configured socket equal to the default dedupes (no repeat).
+        let dup = kitty_candidate_sockets(Some(default_tmp.as_path()), pid);
+        assert_eq!(dup.iter().filter(|p| *p == &default_tmp).count(), 1);
+    }
+
+    #[test]
+    fn select_kitty_socket_matched_skips_unreachable_first() {
+        // Hermetic temp dir only: never bind literal /tmp/kitty-<pid>.
+        let dir = std::env::temp_dir().join(format!(
+            "qs-kitty-sel-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("second.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let accept = std::thread::spawn(move || {
+            // Accept the single probe connection; the peer credential is
+            // the connecting process (this test binary) either way.
+            if let Ok((s, _)) = listener.accept() {
+                std::mem::forget(s);
+            }
+        });
+        let missing = dir.join("first-missing.sock");
+        let candidates = vec![missing.clone(), sock.clone()];
+        let me = std::process::id();
+        match select_kitty_socket(&candidates, me) {
+            KittySocketChoice::Matched(path, peer) => {
+                assert_eq!(path, sock, "first matching candidate wins");
+                assert_eq!(peer, me);
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn select_kitty_socket_mismatch_and_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "qs-kitty-mis-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("only.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let accept = std::thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                std::mem::forget(s);
+            }
+        });
+        // Reachable socket whose peer (this process) differs from the
+        // requested pid: confirmed foreign, never last-good.
+        let foreign = std::process::id().wrapping_add(1);
+        assert_ne!(foreign, std::process::id());
+        assert_eq!(
+            select_kitty_socket(std::slice::from_ref(&sock), foreign),
+            KittySocketChoice::Mismatch
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = accept.join();
+        // Nothing reachable at all: transient unavailability.
+        let gone = vec![
+            std::env::temp_dir().join(format!("qs-kitty-gone-a-{}-{}", std::process::id(), now_ms())),
+            std::env::temp_dir().join(format!("qs-kitty-gone-b-{}-{}", std::process::id(), now_ms())),
+        ];
+        assert_eq!(
+            select_kitty_socket(&gone, std::process::id()),
+            KittySocketChoice::Unavailable
+        );
+        assert_eq!(
+            select_kitty_socket(&[], std::process::id()),
+            KittySocketChoice::Unavailable
         );
     }
 

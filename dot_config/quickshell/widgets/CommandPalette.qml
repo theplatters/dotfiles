@@ -52,6 +52,15 @@ PanelWindow {
     property bool requestedOpen: false
     property bool closing: false
     property bool pendingProjectPlanner: false
+    property string pendingPlannerProjectId: ""
+    property string pendingPlannerAction: ""
+    property string pendingPlannerMessage: ""
+    property bool resumeExecuteBusy: false
+    property string resumeExecuteError: ""
+    property string resumeExecuteProjectId: ""
+    property string resumeExecuteProcessProjectId: ""
+    property int resumeExecuteGeneration: 0
+    property int resumeExecuteProcessGeneration: 0
     property bool showStats: false
     property int screenshotGeneration: 0
     property string pendingScreenshotMode: ""
@@ -64,7 +73,7 @@ PanelWindow {
     property string historyQuery: ""
     property var historyRows: []
 
-    signal projectPlanningRequested()
+    signal projectPlanningRequested(string projectId, string action, string message)
 
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
@@ -112,6 +121,14 @@ PanelWindow {
                     root.rebuildModel();
             } else if (source === "file") {
                 if (dataSources.fileError) root.notice = dataSources.fileError;
+                root.rebuildModel();
+            } else if (source === "resume") {
+                if (dataSources.resumeError) root.notice = dataSources.resumeError;
+                root.rebuildModel();
+                root.requestResumePlanForSelection();
+            } else if (source === "resumePlan") {
+                if (dataSources.resumePlanError) root.notice = dataSources.resumePlanError;
+                else if (root.mode === "resume") root.notice = "";
                 root.rebuildModel();
             }
         }
@@ -189,6 +206,19 @@ PanelWindow {
     }
 
     Process { id: actionProcess }
+    Process {
+        id: resumeExecuteProcess
+        stdout: StdioCollector { id: resumeExecuteOutput }
+        onExited: (code) => root.finishResumeExecute(code, resumeExecuteOutput.text,
+                                                     root.resumeExecuteProcessGeneration,
+                                                     root.resumeExecuteProcessProjectId)
+    }
+    Timer {
+        id: resumeExecuteTimeout
+        interval: 12000
+        repeat: false
+        onTriggered: root.cancelResumeExecute()
+    }
     Process {
         id: clipboardCopyProcess
         onExited: (code) => {
@@ -273,6 +303,12 @@ PanelWindow {
         if (root.mode === "file")
             return dataSources.fileBusy ? "Searching files…"
                 : (root.modeQuery ? (dataSources.fileTruncated ? "Results truncated" : "No files found") : "Type a filename");
+        if (root.mode === "resume") {
+            if (root.resumeExecuteBusy) return "Resuming project…";
+            if (dataSources.resumeBusy) return "Searching projects…";
+            if (dataSources.resumePlanBusy) return "Loading project plan…";
+            return root.modeQuery ? "No projects found" : "Type a project name";
+        }
         if (root.mode === "clip" || root.mode === "#")
             return dataSources.clipboardPending ? "Loading clipboard…" : "No clipboard matches";
         if (root.mode === "!") return dataSources.todoPending ? "Loading TODOs…" : "No TODOs found";
@@ -362,6 +398,17 @@ PanelWindow {
             // displayed file rows instead of resurrecting stale ones.
             let cachedFiles = dataSources.fileRows || [];
             root.rows = cachedFiles.slice();
+            for (let i = 0; i < root.rows.length; ++i)
+                resultModel.append({ prefix: root.rows[i].prefix, title: root.rows[i].title,
+                                     subtitle: root.rows[i].subtitle, rowIndex: i });
+            root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, resultModel.count - 1));
+            return;
+        }
+        if (root.mode === "resume") {
+            // Resume rows are an asynchronous cache owned by
+            // PaletteDataSources and authoritative here, mirroring file mode.
+            let cachedResume = dataSources.resumeRows || [];
+            root.rows = cachedResume.slice();
             for (let i = 0; i < root.rows.length; ++i)
                 resultModel.append({ prefix: root.rows[i].prefix, title: root.rows[i].title,
                                      subtitle: root.rows[i].subtitle, rowIndex: i });
@@ -537,6 +584,12 @@ PanelWindow {
             dataSources.pendingFileQuery = root.modeQuery;
             rebuildModel();
             if (changed && root.modeQuery) dataSources.scheduleFileSearch();
+        } else if (root.mode === "resume") {
+            dataSources.pendingFileQuery = "";
+            dataSources.pendingResumeQuery = root.modeQuery;
+            rebuildModel();
+            if (changed) dataSources.scheduleResumeSearch();
+            else root.requestResumePlanForSelection();
         } else {
             if (root.mode === "" && !!root.modeQuery &&
                     !(root.calculatorResult && root.calculatorResult.matched &&
@@ -581,6 +634,10 @@ PanelWindow {
 
     function loadModeData() {
         if (!root.requestedOpen) return;
+        if (root.mode === "resume") {
+            dataSources.scheduleResumeSearch();
+            return;
+        }
         if ((root.mode === "clip" || root.mode === "#") || isUnifiedSearch()) {
             // Unified search deliberately starts these helpers once per open,
             // rather than once per keystroke.  A failed load is also terminal
@@ -611,6 +668,16 @@ PanelWindow {
             root.screen = Quickshell.screens.find(s => s.name === monitor.name) || root.screen;
         query = "";
         pendingProjectPlanner = false;
+        pendingPlannerProjectId = "";
+        pendingPlannerAction = "";
+        pendingPlannerMessage = "";
+        // Invalidate any in-flight execute: bump before clearing so a
+        // delayed exit is stale even after reopen. The immutable process
+        // id is kept until its exit for equality checks.
+        root.resumeExecuteGeneration++;
+        resumeExecuteBusy = false;
+        resumeExecuteError = "";
+        resumeExecuteProjectId = "";
         input.text = "";
         confirming = false;
         confirmationAction = "";
@@ -645,6 +712,13 @@ PanelWindow {
         historyRows = [];
         if (clipboardCopyProcess.running) clipboardCopyProcess.running = false;
         if (answerCopyProcess.running) answerCopyProcess.running = false;
+        // Invalidate in-flight Resume execute callbacks: increment the
+        // generation before stopping so a delayed completion is stale.
+        // The immutable process project id is kept until its exit.
+        root.resumeExecuteGeneration++;
+        if (resumeExecuteProcess.running) resumeExecuteProcess.running = false;
+        resumeExecuteTimeout.stop();
+        resumeExecuteBusy = false;
         dataSources.resetForClose();
         // Do not stop Pi: pending approvals are shown again safely on reopen.
     }
@@ -652,13 +726,231 @@ PanelWindow {
     // The planner is a separate layer surface. Wait for the palette exit
     // animation before asking the shell to map it, so two keyboard-focused
     // overlay windows never compete during the handoff.
-    function handoffToProjectPlanner() {
+    function handoffToProjectPlanner(projectId, action, message) {
         pendingProjectPlanner = true;
+        pendingPlannerProjectId = String(projectId === undefined || projectId === null ? "" : projectId);
+        pendingPlannerAction = String(action === undefined || action === null ? "" : action);
+        pendingPlannerMessage = String(message === undefined || message === null ? "" : message).substring(0, 300);
         if (root.requestedOpen) root.close();
         else {
             pendingProjectPlanner = false;
-            projectPlanningRequested();
+            let pid = pendingPlannerProjectId, act = pendingPlannerAction, msg = pendingPlannerMessage;
+            pendingPlannerProjectId = "";
+            pendingPlannerAction = "";
+            pendingPlannerMessage = "";
+            projectPlanningRequested(pid, act, msg);
         }
+    }
+
+    // Resume mode helpers: rows are registry entries; the compact preview
+    // comes from the validated ResumePlan v1 for the selected project only.
+    // Never embeds full page content.
+    function selectedResumeEntry() {
+        if (root.mode !== "resume") return null;
+        if (root.selectedIndex < 0 || root.selectedIndex >= root.rows.length) return null;
+        let row = root.rows[root.selectedIndex];
+        if (!row || row.kind !== "resume" || !row.payload) return null;
+        return row.payload;
+    }
+
+    function resumePlanForSelection() {
+        let entry = root.selectedResumeEntry();
+        if (!entry) return null;
+        let plan = dataSources.resumePlan;
+        if (!plan || !plan.project) return null;
+        if (String(plan.project.id || "") !== String(entry.id || "")) return null;
+        if (dataSources.resumePlanProjectId !== String(entry.id || "")) return null;
+        return plan;
+    }
+
+    function requestResumePlanForSelection() {
+        if (root.mode !== "resume" || !root.requestedOpen) return false;
+        let entry = root.selectedResumeEntry();
+        if (!entry || !entry.id) return false;
+        return dataSources.ensureResumePlan(entry.id);
+    }
+
+    function resumePreviewText() {
+        let entry = root.selectedResumeEntry();
+        if (!entry) return "";
+        let plan = root.resumePlanForSelection();
+        if (dataSources.resumePlanBusy && !plan) return "Loading project plan…";
+        if (!plan) return dataSources.resumePlanError || "Plan not loaded yet — press Enter to load.";
+        let parts = [];
+        parts.push(String(plan.project.name || entry.name || entry.id));
+        if (plan.session) {
+            let endMs = Number(plan.session.end_ms || 0);
+            if (endMs > 0) {
+                let date = new Date(endMs);
+                parts.push("Last session: " + date.toLocaleString());
+            } else {
+                parts.push("Last session recorded");
+            }
+        } else {
+            parts.push(String(plan.session_reason || "No prior session"));
+        }
+        let files = Array.isArray(plan.files) ? plan.files.map((f) => String(f.relative || "")).filter((s) => !!s) : [];
+        parts.push(files.length ? ("Files: " + files.slice(0, 4).join(", ")) : "Files: none");
+        if (plan.repository && plan.repository.available) {
+            let repo = plan.repository.branch || plan.repository.remote || plan.repository.root_observed || "";
+            if (repo) parts.push("Repo: " + String(repo).substring(0, 120));
+        }
+        if (plan.logseq && plan.logseq.available) {
+            parts.push("Logseq: " + String(plan.logseq.page || plan.logseq.path || ""));
+            parts.push("TODOs: " + String(plan.logseq.open_count || 0) + " open");
+        } else {
+            parts.push("Logseq: " + String((plan.logseq && plan.logseq.reason) || "unavailable"));
+        }
+        if (plan.pi_session && plan.pi_session.available) parts.push("Pi session: saved");
+        else parts.push("Pi session: new");
+        // Unavailable-operation and warning hints stay in the compact
+        // preview so partial restore risk is visible before Enter.
+        try {
+            let ops = Array.isArray(plan.operations) ? plan.operations : [];
+            let blocked = ops.filter((op) => op && op.available === false);
+            if (blocked.length) {
+                let hints = blocked.slice(0, 2).map((op) => {
+                    let label = String((op && (op.id || op.kind)) || "op");
+                    let reason = String((op && op.reason) || "unavailable");
+                    return label + ": " + reason.substring(0, 80);
+                });
+                parts.push("Unavailable: " + hints.join("; "));
+            }
+            let warnings = Array.isArray(plan.warnings) ? plan.warnings.filter((w) => !!w) : [];
+            if (warnings.length) parts.push("Note: " + String(warnings[0]).substring(0, 100));
+        } catch (error) {}
+        return parts.join("  ·  ");
+    }
+
+    function resumeSelectedProject() {
+        let entry = root.selectedResumeEntry();
+        if (!entry || !entry.id) { notice = "Select a project first"; return false; }
+        let plan = root.resumePlanForSelection();
+        if (root.resumeExecuteBusy) { notice = "Resuming project…"; return false; }
+        if (!plan) {
+            root.requestResumePlanForSelection();
+            notice = "Loading project plan…";
+            return false;
+        }
+        return root.startResumeExecute(String(entry.id));
+    }
+
+    function askResumeProject() {
+        let entry = root.selectedResumeEntry();
+        if (!entry || !entry.id) { notice = "Select a project first"; return false; }
+        root.handoffToProjectPlanner(String(entry.id), "ask");
+        return true;
+    }
+
+    function historyResumeProject() {
+        let entry = root.selectedResumeEntry();
+        if (!entry || !entry.id) { notice = "Select a project first"; return false; }
+        root.handoffToProjectPlanner(String(entry.id), "history");
+        return true;
+    }
+
+    function startResumeExecute(projectId) {
+        let wanted = String(projectId || "");
+        if (!wanted) { notice = "Select a project first"; return false; }
+        if (resumeExecuteProcess.running) { notice = "Resuming project…"; return false; }
+        root.resumeExecuteGeneration++;
+        root.resumeExecuteProcessGeneration = root.resumeExecuteGeneration;
+        root.resumeExecuteProjectId = wanted;
+        root.resumeExecuteProcessProjectId = wanted;
+        root.resumeExecuteBusy = true;
+        root.resumeExecuteError = "";
+        notice = "Resuming project…";
+        resumeExecuteProcess.command = ["python3", Quickshell.shellPath("scripts/desktop_resume.py"),
+            "execute", "--project", wanted];
+        resumeExecuteTimeout.restart();
+        resumeExecuteProcess.running = true;
+        return true;
+    }
+
+    function validResumeExecutePayload(payload) {
+        return payload && typeof payload === "object" && Array.isArray(payload.results) &&
+            payload.project && typeof payload.project === "object" &&
+            typeof payload.project.id === "string" && payload.project.id !== "";
+    }
+
+    function resumeExecuteSummary(payload) {
+        // Compact per-operation summary: counts by status plus the first
+        // failure/skip reason, bounded for the planner notice handoff.
+        try {
+            let results = payload && Array.isArray(payload.results) ? payload.results : [];
+            let counts = { ok: 0, launched: 0, partial: 0, failed: 0, skipped: 0, delegated: 0, other: 0 };
+            let firstAttention = "";
+            for (let i = 0; i < results.length; i++) {
+                let item = results[i] || {};
+                let status = String(item.status || "").toLowerCase();
+                if (status === "ok") counts.ok++;
+                else if (status === "launched") counts.launched++;
+                else if (status === "partial") counts.partial++;
+                else if (status === "failed") counts.failed++;
+                else if (status === "skipped") counts.skipped++;
+                else if (status === "delegated") counts.delegated++;
+                else counts.other++;
+                if (!firstAttention && (status === "failed" || status === "partial" || status === "skipped")) {
+                    let label = String(item.kind || item.id || "op");
+                    let reason = String(item.reason || status);
+                    firstAttention = label + ": " + reason;
+                }
+            }
+            let okTotal = counts.ok + counts.launched;
+            let summary = "Restored " + okTotal + " ok";
+            if (counts.delegated) summary += ", " + counts.delegated + " delegated";
+            if (counts.partial) summary += ", " + counts.partial + " partial";
+            if (counts.failed) summary += ", " + counts.failed + " failed";
+            if (counts.skipped) summary += ", " + counts.skipped + " skipped";
+            if (counts.other) summary += ", " + counts.other + " other";
+            if (firstAttention) summary += " — " + firstAttention.substring(0, 120);
+            return summary.substring(0, 300);
+        } catch (error) {
+            return "";
+        }
+    }
+
+    function finishResumeExecute(code, output, generation, requestProjectId) {
+        let rawRequest = (requestProjectId === undefined || requestProjectId === null)
+            ? (root.resumeExecuteProcessProjectId || "") : requestProjectId;
+        let executedId = String(rawRequest || root.resumeExecuteProjectId || "");
+        if (!executedId) executedId = String(root.resumeExecuteProjectId || "");
+        if (generation !== root.resumeExecuteGeneration) return;
+        let storedProcessId = String(root.resumeExecuteProcessProjectId || "");
+        if (executedId && storedProcessId && executedId !== storedProcessId) return;
+        resumeExecuteTimeout.stop();
+        if (!root.requestedOpen) { root.resumeExecuteBusy = false; return; }
+        if (code !== 0) {
+            root.resumeExecuteBusy = false;
+            root.resumeExecuteError = "Resume failed";
+            notice = "Resume failed";
+            return;
+        }
+        try {
+            let payload = JSON.parse(output || "{}");
+            if (!root.validResumeExecutePayload(payload)) throw new Error("invalid");
+            // Require the result project id to equal the executed id;
+            // never hand off a mismatched project.
+            let pid = String(payload.project.id || "");
+            if (!pid || pid !== executedId) throw new Error("invalid");
+            // Partial failures stay visible but never block the handoff.
+            let message = root.resumeExecuteSummary(payload);
+            root.resumeExecuteBusy = false;
+            root.resumeExecuteError = "";
+            root.handoffToProjectPlanner(pid, "resume", message);
+        } catch (error) {
+            root.resumeExecuteBusy = false;
+            root.resumeExecuteError = "Resume returned invalid data";
+            notice = "Resume returned invalid data";
+        }
+    }
+
+    function cancelResumeExecute() {
+        if (!root.resumeExecuteBusy) return;
+        root.resumeExecuteBusy = false;
+        root.resumeExecuteGeneration++;
+        if (resumeExecuteProcess.running) resumeExecuteProcess.running = false;
+        if (root.requestedOpen) notice = "Resume timed out; retry";
     }
 
     function cancelPendingScreenshot() {
@@ -716,9 +1008,17 @@ PanelWindow {
         confirmationAction = "";
         if (resultModel.count > 0)
             resultList.positionViewAtIndex(selectedIndex, ListView.Contain);
+        if (root.mode === "resume") root.requestResumePlanForSelection();
     }
 
     function activate(index) {
+        if (root.mode === "resume") {
+            // Default Enter resumes only once the selected plan preview is
+            // loaded; otherwise request it and show Loading.
+            if (index >= 0 && index < resultModel.count) selectedIndex = index;
+            root.resumeSelectedProject();
+            return;
+        }
         if (root.mode === "ai") {
             let prompt = root.modeQuery.trim();
             if (!prompt) { notice = "Type a prompt after ai:"; return; }
@@ -746,7 +1046,7 @@ PanelWindow {
             return;
         }
         if (source.kind === "projectPlanner") {
-            root.handoffToProjectPlanner();
+            root.handoffToProjectPlanner("", "");
             return;
         }
         if (source.kind === "ai") { aiAction(target); return; }
@@ -930,6 +1230,7 @@ PanelWindow {
             + (root.showStats && agent.statsText !== "" ? 90 : 0)
             + ((root.mode === "ai" || root.mode === ">") ? 42 : 0)
             + (root.mode === "ai" && root.showHistory ? 340 : 0)
+            + (root.mode === "resume" && resultModel.count > 0 ? 110 : 0)
         property int availableHeight: Math.max(120, parent.height - anchors.topMargin - 24)
         height: Math.min(availableHeight, 78 + detailHeight)
         color: Theme.base
@@ -949,7 +1250,7 @@ PanelWindow {
             TextField {
                 id: input
                 Layout.fillWidth: true
-                placeholderText: root.mode === "ai" ? "Ask Pi…" : (root.mode === "file" ? "file: filename" : (root.mode === "=" ? "= expression" : "Search desktop, files, clipboard…"))
+                placeholderText: root.mode === "ai" ? "Ask Pi…" : (root.mode === "file" ? "file: filename" : (root.mode === "resume" ? "resume: project name" : (root.mode === "=" ? "= expression" : "Search desktop, files, clipboard…")))
                 text: root.query
                 color: Theme.bg
                 enabled: root.requestedOpen && !root.closing
@@ -1191,6 +1492,52 @@ PanelWindow {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
             }
+            Text {
+                visible: root.mode === "resume" && resultModel.count > 0
+                text: root.resumePreviewText()
+                color: Theme.subtext1
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                elide: Text.ElideRight
+                maximumLineCount: 4
+            }
+            RowLayout {
+                visible: root.mode === "resume" && resultModel.count > 0
+                Layout.fillWidth: true
+                spacing: 12
+                Layout.topMargin: 4
+                WidgetIconButton {
+                    id: resumeActionButton
+                    text: root.resumeExecuteBusy ? "Resuming…" : "Resume"
+                    iconSource: "icons/play.svg"
+                    tooltipText: root.resumeExecuteBusy ? "Resuming project…" : "Resume the selected project"
+                    enabled: !root.resumeExecuteBusy
+                    Accessible.name: "Resume selected project"
+                    Accessible.description: "Restore the selected project workspace"
+                    onClicked: root.resumeSelectedProject()
+                }
+                WidgetIconButton {
+                    id: askResumeActionButton
+                    text: "Ask Pi"
+                    iconSource: "icons/message-circle.svg"
+                    tooltipText: "Ask Pi about the selected project"
+                    Accessible.name: "Ask Pi about the selected project"
+                    Accessible.description: "Open the selected project with a continuation request ready to send"
+                    onClicked: root.askResumeProject()
+                }
+                WidgetIconButton {
+                    id: resumeHistoryActionButton
+                    text: "History"
+                    iconSource: "icons/history.svg"
+                    tooltipText: "Show history for the selected project"
+                    Accessible.name: "Show history for the selected project"
+                    Accessible.description: "Open the selected project focused on its history"
+                    onClicked: root.historyResumeProject()
+                }
+                Item {
+                    Layout.fillWidth: true
+                }
+            }
             Text { visible: root.mode === "ai" || root.mode === ">" || root.mode === "/" || root.mode === "=" || root.notice !== "" || agent.pendingApproval; text: root.mode === "=" || root.notice !== "" ? root.notice : agent.status; color: root.mode === "=" && root.notice !== "" ? Theme.red : (agent.ready ? Theme.subtext1 : Theme.red); Layout.fillWidth: true; elide: Text.ElideRight }
             ScrollView {
                 visible: root.mode === "ai"
@@ -1291,7 +1638,11 @@ PanelWindow {
                 root.closing = false;
                 if (root.pendingProjectPlanner && !root.requestedOpen) {
                     root.pendingProjectPlanner = false;
-                    root.projectPlanningRequested();
+                    let pid = root.pendingPlannerProjectId, act = root.pendingPlannerAction, msg = root.pendingPlannerMessage;
+                    root.pendingPlannerProjectId = "";
+                    root.pendingPlannerAction = "";
+                    root.pendingPlannerMessage = "";
+                    root.projectPlanningRequested(pid, act, msg);
                 }
             }
         }

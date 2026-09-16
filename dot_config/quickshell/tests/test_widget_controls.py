@@ -18,6 +18,10 @@ ICONS = {
     "chevron-down.svg": "tray toggle",
     "x.svg": "close",
     "history.svg": "history",
+    "play.svg": "resume",
+    "message-circle.svg": "ask pi",
+    "send.svg": "composer send",
+    "stop.svg": "composer stop",
 }
 
 
@@ -48,6 +52,7 @@ class WidgetIconAssetsTests(unittest.TestCase):
         self.assertEqual(set(ICONS), {
             "folder.svg", "journal.svg", "panel-right-close.svg",
             "panel-right-open.svg", "chevron-down.svg", "x.svg", "history.svg",
+            "play.svg", "message-circle.svg", "send.svg", "stop.svg",
         })
 
 
@@ -160,6 +165,90 @@ class WidgetAdoptionTests(unittest.TestCase):
         self.assertIn("onClicked: sessionMenu.open()", PLANNER)
         self.assertIn("enabled:", PLANNER)
         self.assertIn("root.sessionControlsEnabled()", PLANNER)
+
+    def test_palette_resume_actions_use_shared_icon_controls(self):
+        for marker in ("id: resumeActionButton", "id: askResumeActionButton",
+                       "id: resumeHistoryActionButton"):
+            self.assertIn(marker, PALETTE)
+        resume_start = PALETTE.index("id: resumeActionButton")
+        ask_start = PALETTE.index("id: askResumeActionButton")
+        history_start = PALETTE.index("id: resumeHistoryActionButton")
+        for start in (resume_start, ask_start, history_start):
+            self.assertIn("WidgetIconButton", PALETTE[max(0, start - 120):start])
+        resume = PALETTE[resume_start:ask_start]
+        ask = PALETTE[ask_start:history_start]
+        resume_history = PALETTE[history_start:history_start + 1200]
+        self.assertIn('text: root.resumeExecuteBusy ? "Resuming…" : "Resume"', resume)
+        self.assertIn('iconSource: "icons/play.svg"', resume)
+        self.assertIn("tooltipText:", resume)
+        self.assertIn("Resuming", resume)
+        self.assertIn("enabled: !root.resumeExecuteBusy", resume)
+        self.assertIn("onClicked: root.resumeSelectedProject()", resume)
+        self.assertIn("Accessible.name", resume)
+        self.assertIn('text: "Ask Pi"', ask)
+        self.assertIn('iconSource: "icons/message-circle.svg"', ask)
+        self.assertIn("tooltipText:", ask)
+        self.assertIn("Accessible.name", ask)
+        self.assertIn("onClicked: root.askResumeProject()", ask)
+        self.assertIn('text: "History"', resume_history)
+        self.assertIn('iconSource: "icons/history.svg"', resume_history)
+        self.assertIn("tooltipText:", resume_history)
+        self.assertIn("Accessible.name", resume_history)
+        self.assertIn("onClicked: root.historyResumeProject()", resume_history)
+        row_start = PALETTE.rindex("RowLayout {", 0, resume_start)
+        row = PALETTE[row_start:history_start + 2000]
+        self.assertIn("spacing: 12", row)
+        self.assertIn("Layout.topMargin: 4", row)
+        self.assertIn("Layout.fillWidth: true", row)
+        self.assertIn("Item {", row)
+
+    def test_planner_composer_actions_use_shared_icon_controls(self):
+        for marker in ("id: projectSendButton", "id: projectStopButton"):
+            self.assertIn(marker, PLANNER)
+        send_start = PLANNER.index("id: projectSendButton")
+        stop_start = PLANNER.index("id: projectStopButton")
+        composer_start = PLANNER.index("id: composerBar")
+        self.assertLess(composer_start, send_start)
+        self.assertLess(send_start, stop_start)
+        for start in (send_start, stop_start):
+            self.assertIn("WidgetIconButton", PLANNER[max(0, start - 120):start])
+        send = PLANNER[send_start:stop_start]
+        stop = PLANNER[stop_start:stop_start + 1200]
+        composer = PLANNER[composer_start:stop_start + 1200]
+        # Shared icon controls with local assets, tooltips, and a11y.
+        self.assertIn('iconSource: "icons/send.svg"', send)
+        self.assertIn('iconSource: "icons/stop.svg"', stop)
+        self.assertIn("tooltipText:", send)
+        self.assertIn("Send message (Ctrl+Enter)", send)
+        self.assertIn("Loading", send)
+        self.assertIn('tooltipText: "Stop project agent"', stop)
+        self.assertIn("Accessible.name", send)
+        self.assertIn("Accessible.description", send)
+        self.assertIn("loading fresh context before sending", send.lower())
+        self.assertIn("Accessible.name", stop)
+        self.assertIn("Accessible.description", stop)
+        self.assertIn("abort", stop.lower())
+        self.assertIn("Layout.alignment: Qt.AlignVCenter", send)
+        self.assertIn("Layout.alignment: Qt.AlignVCenter", stop)
+        # Unchanged text gates and handlers.
+        self.assertIn('text: root.sendBusy ? "Loading…" : "Send"', send)
+        self.assertIn('text: "Stop"', stop)
+        self.assertIn("enabled: !!root.selectedAgent && root.selectedAgent.ready && !root.selectedAgent.busy && !root.pageBusy && !root.toggleBusy && !root.toggleRetiring && !root.sendBusy && !root.approvalRequest && !root.hasBusyAgent()", send)
+        self.assertIn("enabled: !!root.selectedAgent && (root.selectedAgent.busy || root.selectedAgent.pendingApproval)", stop)
+        self.assertIn("onClicked: root.send()", send)
+        self.assertIn("onClicked: root.stopAgent()", stop)
+        # Composer layout, input, and keyboard behavior are unchanged.
+        self.assertIn("id: composer", composer)
+        self.assertIn("spacing: 8", composer)
+        self.assertIn("Layout.fillWidth: true", composer)
+        self.assertIn("onTextChanged: root.setDraft(root.selectedPath, text)", composer)
+        self.assertIn("Qt.ControlModifier", composer)
+        self.assertIn("root.send()", composer)
+        self.assertIn("Qt.Key_Escape", composer)
+        # Shared WidgetIconButton control is untouched.
+        self.assertIn("property url iconSource", ICON_BUTTON)
+        self.assertIn("ToolTip.text", ICON_BUTTON)
+        self.assertIn("Accessible.name", ICON_BUTTON)
 
     def test_palette_history_toggle_uses_shared_icon_control(self):
         self.assertIn("WidgetIconButton", PALETTE)

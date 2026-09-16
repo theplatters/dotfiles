@@ -13,13 +13,18 @@ Item {
     visible: false
 
     // Factory configuration (frozen for the bridge command).
-    // paletteMode is an explicit unscoped general session. scopedMode stays
-    // !!projectPath||journalMode (actual scope); paletteMode must not be
-    // combined with projectPath/journalMode.
+    // Project workers are pinned by stable registry UUID (projectId) and
+    // work without a Logseq note, including Zotero-only projects.
+    // projectPath is the optional legacy page for explicit migration
+    // restores only; it is never scanned automatically. paletteMode is an
+    // explicit unscoped general session. scopedMode stays
+    // !!projectId||!!projectPath||journalMode (actual scope); paletteMode
+    // must not be combined with projectId/projectPath/journalMode.
+    property string projectId: ""
     property string projectPath: ""
     property bool journalMode: false
     property bool paletteMode: false
-    readonly property bool scopedMode: !!projectPath || journalMode
+    readonly property bool scopedMode: !!projectId || !!projectPath || journalMode
 
     // Frozen spawn identity for the bridge CLI. Refreshed from the latest
     // authoritative session on every deliberate start() spawn, then frozen
@@ -147,11 +152,18 @@ Item {
 
     function bridgeArgs() {
         // Palette takes precedence when conflicting flags are combined, so a
-        // misconfigured factory can never leak --project into palette mode.
+        // misconfigured factory can never leak --project-id/--project into
+        // palette mode. UUID pinning is primary; a legacy page is passed
+        // only as an explicit migration source alongside the id, or alone
+        // for legacy-only workers. UUID test is inline so isolated
+        // bridgeArgs extraction keeps working.
         let mode = root.paletteMode ? "palette" : (root.journalMode ? "journal" : "project");
         let args = [bridgePath(), "--root", Quickshell.shellPath("."),
             "--mode", mode];
-        if (mode === "project") args.push("--project", root.projectPath);
+        if (mode === "project") {
+            if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(root.projectId || "").trim())) args.push("--project-id", String(root.projectId).trim());
+            if (String(root.projectPath || "")) args.push("--project", root.projectPath);
+        }
         if (root._initSession) args.push("--session", root._initSession);
         if (root._initName) args.push("--pending-name", root._initName);
         if (root._initFresh) args.push("--new-session");
@@ -405,6 +417,8 @@ Item {
         _bSwitching = !!state.sessionSwitching;
         _bStopping = !!state.stopping;
         _bRefresh = !!state.sessionRefreshPending;
+        if (state.projectId !== undefined) root.projectId = state.projectId || root.projectId || "";
+        if (state.projectPath !== undefined) root.projectPath = state.projectPath || root.projectPath || "";
         sessionFile = state.sessionFile || "";
         sessionName = state.sessionName || "";
         freshSession = !!state.freshSession;

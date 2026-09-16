@@ -5,6 +5,11 @@ The public functions mirror the JSON commands and deliberately accept only
 existing pages below ``pages/``.  In particular, this module does not create
 pages or journals.  Writes use the graph's normal journal lock so they are
 serialized with :func:`logseq_graph.append_journal`.
+
+UUID mode (``{"project_id": "<uuid>"}``) resolves the current optional
+note/folder fresh from the registry per operation, so Zotero-only projects
+work without a note. Note tools fail clearly without a linked note; folder
+tools use the registry folder directly when present.
 """
 
 import argparse
@@ -299,8 +304,21 @@ def list_projects(graph):
 
 
 def read_page(graph, path):
-    """Read one existing page and return its exact-byte revision and tasks."""
-    if isinstance(path, dict):
+    """Read one existing page and return its exact-byte revision and tasks.
+
+    When *path* is a dict carrying ``project_id``, the note is resolved fresh
+    from the registry (per-operation, never frozen). A Zotero-only project
+    with no linked note fails clearly instead of reading an arbitrary page.
+    """
+    project_id = _project_id_from_request(path)
+    if project_id:
+        entry = _registry_entry_for_id(project_id)
+        note = entry.get("logseq_path", "") or entry.get("path", "")
+        if not note:
+            _error("project has no linked note; link a note or use folder/Zotero tools")
+        # Fresh registry wins: ignore a stale caller-supplied path.
+        path = note
+    elif isinstance(path, dict):
         path = path.get("path")
     graph = graph_path(graph)
     relative = _validate_relative_path(path)
@@ -439,12 +457,23 @@ def _replace_page(graph, relative, expected, replacement):
 
 def toggle_task(graph, path, revision=None, line=None, done=None):
     """Set one task's completion state, rejecting stale page revisions."""
-    if isinstance(path, dict) and revision is None:
+    if isinstance(path, dict):
         request = path
-        path = request.get("path")
-        revision = request.get("revision")
-        line = request.get("line")
-        done = request.get("done")
+        pid = _project_id_from_request(request)
+        if pid:
+            entry = _registry_entry_for_id(pid)
+            note = entry.get("logseq_path", "") or entry.get("path", "")
+            if not note:
+                _error("project has no linked note; link a note or use folder/Zotero tools")
+            path = note
+        else:
+            path = request.get("path")
+        if revision is None:
+            revision = request.get("revision")
+        if line is None:
+            line = request.get("line")
+        if done is None:
+            done = request.get("done")
     graph = graph_path(graph)
     relative = _validate_relative_path(path)
     revision = _validate_revision(revision)
@@ -476,11 +505,21 @@ def toggle_task(graph, path, revision=None, line=None, done=None):
 
 def update_page(graph, path, revision=None, content=None):
     """Replace an existing page, subject to its exact UTF-8 revision."""
-    if isinstance(path, dict) and revision is None:
+    if isinstance(path, dict):
         request = path
-        path = request.get("path")
-        revision = request.get("revision")
-        content = request.get("content")
+        pid = _project_id_from_request(request)
+        if pid:
+            entry = _registry_entry_for_id(pid)
+            note = entry.get("logseq_path", "") or entry.get("path", "")
+            if not note:
+                _error("project has no linked note; link a note or use folder/Zotero tools")
+            path = note
+        else:
+            path = request.get("path")
+        if revision is None:
+            revision = request.get("revision")
+        if content is None:
+            content = request.get("content")
     graph = graph_path(graph)
     relative = _validate_relative_path(path)
     _validate_revision(revision)
@@ -500,6 +539,57 @@ def update_page(graph, path, revision=None, content=None):
         if raw != replacement:
             _replace_page(graph, relative, raw, replacement)
     return _response(graph, relative, replacement)
+
+
+def _validate_project_id(value: object) -> str:
+    import uuid as _uuid
+    if not isinstance(value, str) or not value.strip():
+        _error("project_id must be a UUID string")
+    try:
+        return str(_uuid.UUID(value.strip()))
+    except ValueError as exc:
+        raise GraphError("project_id must be a UUID string") from exc
+
+
+def _registry_entry_for_id(project_id: str) -> dict:
+    """Return the fresh registry record for *project_id* (fail-closed)."""
+    pid = _validate_project_id(project_id)
+    try:
+        import projects as _projects
+    except ImportError as exc:
+        raise GraphError("project registry is unusable") from exc
+    try:
+        data = _projects.list_projects()
+    except Exception as exc:
+        raise GraphError(f"project registry is unusable: {exc}") from exc
+    entries = data.get("projects", []) if isinstance(data, dict) else []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == pid:
+            return entry
+    _error("project id is unknown")
+
+
+def _folder_root_for_entry(entry: dict):
+    """Validate the registry folder for an entry dict, or None when empty."""
+    folder = entry.get("local_folder", "") if isinstance(entry, dict) else ""
+    if not folder:
+        return None
+    import project_files as _project_files
+    expanded = os.path.expanduser(folder)
+    candidate = Path(expanded)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise GraphError("registered project folder is not accessible") from exc
+    return _project_files._validate_root(resolved)
+
+
+def _project_id_from_request(request) -> str:
+    if isinstance(request, dict):
+        raw = request.get("project_id", "")
+        if isinstance(raw, str) and raw.strip():
+            return _validate_project_id(raw)
+    return ""
 
 
 def _registry_folder_root(graph, logseq_path):
@@ -534,17 +624,36 @@ def _registry_folder_root(graph, logseq_path):
 
 
 def files_list(graph, request=None):
-    """List the folder declared by the selected page's ``file::`` property.
+    """List the folder for a project id or a selected page.
 
-    The page is reread fresh on every call; only the pinned page path is
-    accepted.  Any ``root`` supplied by the caller is ignored.
-
-    When the page's note is registered with a non-empty ``local_folder`` in
-    the project registry (``scripts/projects.py``, default
-    ``<repo>/projects.toml`` or ``QUICKSHELL_PROJECTS_FILE``), that folder
-    wins; otherwise the legacy page-level ``file::`` property is used.
+    UUID mode (``{"project_id": "<uuid>"}``) resolves the folder fresh from
+    the registry by id, so Zotero-only projects work without a note. When the
+    entry also has a note, the note's ``file::`` remains a fallback when no
+    registry folder is set. Legacy ``{"path": ...}`` keeps the previous
+    page-pinned behavior.
     """
     import project_files
+    project_id = _project_id_from_request(request)
+    if project_id:
+        entry = _registry_entry_for_id(project_id)
+        root = _folder_root_for_entry(entry)
+        note = entry.get("logseq_path", "") or entry.get("path", "")
+        if root is None:
+            if not note:
+                _error("project has no linked folder; link a folder or use Zotero tools")
+            current = read_page(graph, note)
+            root = _registry_folder_root(graph_path(graph), current["path"])
+            if root is None:
+                root = project_files.resolve_root_from_content(graph_path(graph),
+                                                               current["content"])
+            listing = project_files.list_files(root)
+            return {"project_id": project_id, "path": current["path"], "page": current["page"],
+                    "graphName": current["graphName"], "root": listing["root"],
+                    "entries": listing["entries"], "truncated": listing["truncated"]}
+        listing = project_files.list_files(root)
+        return {"project_id": project_id, "path": note, "page": entry.get("name", ""),
+                "graphName": graph_path(graph).name, "root": listing["root"],
+                "entries": listing["entries"], "truncated": listing["truncated"]}
     if isinstance(request, dict):
         path = request.get("path")
     else:
@@ -561,8 +670,33 @@ def files_list(graph, request=None):
 
 
 def files_read(graph, request=None, file=None):
-    """Read one folder-relative file declared by the selected page."""
+    """Read one folder-relative file for a project id or selected page."""
     import project_files
+    project_id = _project_id_from_request(request)
+    if project_id:
+        entry = _registry_entry_for_id(project_id)
+        if isinstance(request, dict) and file is None:
+            file = request.get("file")
+        root = _folder_root_for_entry(entry)
+        note = entry.get("logseq_path", "") or entry.get("path", "")
+        if root is None:
+            if not note:
+                _error("project has no linked folder; link a folder or use Zotero tools")
+            current = read_page(graph, note)
+            root = _registry_folder_root(graph_path(graph), current["path"])
+            if root is None:
+                root = project_files.resolve_root_from_content(graph_path(graph),
+                                                               current["content"])
+            value = project_files.read_file(root, file)
+            return {"project_id": project_id, "path": current["path"], "page": current["page"],
+                    "graphName": current["graphName"], "root": value["root"],
+                    "file": value["path"], "size": value["size"],
+                    "content": value["content"]}
+        value = project_files.read_file(root, file)
+        return {"project_id": project_id, "path": note, "page": entry.get("name", ""),
+                "graphName": graph_path(graph).name, "root": value["root"],
+                "file": value["path"], "size": value["size"],
+                "content": value["content"]}
     if isinstance(request, dict) and file is None:
         path = request.get("path")
         file = request.get("file")
@@ -581,8 +715,27 @@ def files_read(graph, request=None, file=None):
 
 
 def files_git(graph, request=None):
-    """Return scoped git status/diff for the selected page's folder."""
+    """Return scoped git status/diff for a project id or selected page."""
     import project_files
+    project_id = _project_id_from_request(request)
+    if project_id:
+        entry = _registry_entry_for_id(project_id)
+        root = _folder_root_for_entry(entry)
+        note = entry.get("logseq_path", "") or entry.get("path", "")
+        if root is None:
+            if not note:
+                _error("project has no linked folder; link a folder or use Zotero tools")
+            current = read_page(graph, note)
+            root = _registry_folder_root(graph_path(graph), current["path"])
+            if root is None:
+                root = project_files.resolve_root_from_content(graph_path(graph),
+                                                               current["content"])
+            info = project_files.git_info(root)
+            return {"project_id": project_id, "path": current["path"], "page": current["page"],
+                    "graphName": current["graphName"], **info}
+        info = project_files.git_info(root)
+        return {"project_id": project_id, "path": note, "page": entry.get("name", ""),
+                "graphName": graph_path(graph).name, **info}
     if isinstance(request, dict):
         path = request.get("path")
     else:
@@ -639,12 +792,14 @@ def main(argv=None):
         else:
             request = _read_input()
             if args.command == "page":
-                value = read_page(graph, request.get("path"))
+                # Pass the full request so UUID mode resolves fresh; legacy
+                # {"path": ...} keeps working via read_page fallback.
+                value = read_page(graph, request)
             elif args.command == "toggle":
-                value = toggle_task(graph, request.get("path"), request.get("revision"),
+                value = toggle_task(graph, request, request.get("revision"),
                                     request.get("line"), request.get("done"))
             elif args.command == "update":
-                value = update_page(graph, request.get("path"), request.get("revision"),
+                value = update_page(graph, request, request.get("revision"),
                                     request.get("content"))
             elif args.command == "files-list":
                 value = files_list(graph, request)

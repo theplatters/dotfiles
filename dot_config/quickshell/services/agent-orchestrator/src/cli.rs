@@ -5,6 +5,7 @@ pub struct Config {
     pub root: PathBuf,
     pub mode: String,
     pub project: Option<String>,
+    pub project_id: Option<String>,
     pub session: Option<String>,
     pub pending_name: Option<String>,
     pub new_session: bool,
@@ -14,6 +15,7 @@ pub fn parse_args(argv: &[String]) -> Result<Config, String> {
     let mut root: Option<String> = None;
     let mut mode: Option<String> = None;
     let mut project: Option<String> = None;
+    let mut project_id: Option<String> = None;
     let mut session: Option<String> = None;
     let mut pending_name: Option<String> = None;
     let mut new_session = false;
@@ -40,6 +42,13 @@ pub fn parse_args(argv: &[String]) -> Result<Config, String> {
                     return Err("--project requires a value".to_string());
                 }
                 project = Some(argv[i].clone());
+            }
+            "--project-id" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err("--project-id requires a value".to_string());
+                }
+                project_id = Some(argv[i].clone());
             }
             "--session" => {
                 i += 1;
@@ -75,22 +84,37 @@ pub fn parse_args(argv: &[String]) -> Result<Config, String> {
             usage()
         ));
     }
-    if mode == "project" && project.as_deref().unwrap_or("").is_empty() {
+    if mode == "project"
+        && project.as_deref().unwrap_or("").is_empty()
+        && project_id.as_deref().unwrap_or("").is_empty()
+    {
         return Err(format!(
-            "--project is required in project mode\n{}",
+            "--project-id or --project is required in project mode\n{}",
             usage()
         ));
     }
-    if mode != "project" && project.is_some() {
+    if mode != "project" && (project.is_some() || project_id.is_some()) {
         return Err(format!(
             "--project is only permitted in project mode\n{}",
             usage()
         ));
     }
+    if let Some(pid) = project_id.as_deref() {
+        // Canonical UUID check without pulling uuid crate: 8-4-4-4-12 hex.
+        let ok = pid.len() == 36
+            && pid.chars().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            });
+        if !ok {
+            return Err(format!("--project-id must be a UUID string\n{}", usage()));
+        }
+    }
     Ok(Config {
         root: PathBuf::from(root),
         mode,
         project,
+        project_id,
         session,
         pending_name,
         new_session,
@@ -98,7 +122,7 @@ pub fn parse_args(argv: &[String]) -> Result<Config, String> {
 }
 
 fn usage() -> String {
-    "usage: qs-agent-orchestrator --root PATH --mode project|journal|palette [--project PAGE] [--session FILE] [--pending-name NAME] [--new-session]".to_string()
+    "usage: qs-agent-orchestrator --root PATH --mode project|journal|palette [--project-id UUID] [--project PAGE] [--session FILE] [--pending-name NAME] [--new-session]".to_string()
 }
 
 #[cfg(test)]

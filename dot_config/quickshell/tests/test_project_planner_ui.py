@@ -1775,12 +1775,13 @@ console.log(JSON.stringify({{ok: true}}));
 class ProjectPlannerStructureTests(unittest.TestCase):
     def test_manual_project_routing_uses_the_new_surface(self):
         self.assertIn("ProjectPlanner {", SHELL)
-        self.assertIn("function onProjectPlanningRequested()", SHELL)
+        self.assertIn("onProjectPlanningRequested(projectId, action", SHELL)
+        self.assertIn("projectPlanner.openProject(projectId, action", SHELL)
         self.assertIn("projectPlanner.open()", SHELL)
-        self.assertIn("signal projectPlanningRequested()", PALETTE)
+        self.assertIn("signal projectPlanningRequested(string projectId, string action", PALETTE)
         self.assertIn('["Project planner", "projectPlanner"]', PALETTE)
-        self.assertIn("function handoffToProjectPlanner()", PALETTE)
-        self.assertIn("root.projectPlanningRequested()", PALETTE)
+        self.assertIn("function handoffToProjectPlanner(projectId, action", PALETTE)
+        self.assertIn("root.projectPlanningRequested(pid, act", PALETTE)
 
     def test_manual_surface_has_no_automatic_timer_or_ledger(self):
         self.assertNotIn("interval: 1500", PLANNER)
@@ -3018,6 +3019,592 @@ console.log(JSON.stringify({{path: context.selectedPath,
         self.assertEqual(value["startsB"], 1)
         self.assertIn("pages/B.md", value["agentForCalls"])
         self.assertIsNone(value["page"])
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class ZoteroCollectionPickerTests(unittest.TestCase):
+    def run_node(self, script):
+        completed = subprocess.run(
+            ["node", "-e", script], text=True, capture_output=True,
+        )
+        if completed.returncode:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_collection_rows_are_hierarchical_and_cycle_safe(self):
+        rows_fn = extract_function(PLANNER, "zoteroCollectionRows")
+        script = f"""
+const rowsOf = new Function("return " + {json.dumps(rows_fn)})();
+const fixture = [
+  {{key: "ROOTAAA1", name: "Zeta", parentCollection: null}},
+  {{key: "CHILDAA1", name: "alpha", parentCollection: "ROOTAAA1"}},
+  {{key: "GRANDAA1", name: "Gamma", parentCollection: "CHILDAA1"}},
+  {{key: "ROOTBBB2", name: "alpha", parentCollection: null}},
+  {{key: "ORPHAN01", name: "Orphan", parentCollection: "MISSING1"}},
+  {{key: "CYCLEA01", name: "Cycle A", parentCollection: "CYCLEB01"}},
+  {{key: "CYCLEB01", name: "Cycle B", parentCollection: "CYCLEA01"}}
+];
+const rows = rowsOf(fixture);
+const invalid = rowsOf([
+  {{key: "BAD!", name: "Bad key", parentCollection: null}},
+  {{key: "GOOD0001", name: "   ", parentCollection: null}},
+  {{key: "GOOD0002", name: "Good", parentCollection: null}},
+  {{key: "good0002", name: "Duplicate", parentCollection: null}},
+  {{key: "GOOD0003", name: "Also good", parentCollection: null}},
+  null, "x", 42, {{key: "SHORT", name: "short key"}},
+  {{name: "missing key"}}, {{key: "GOOD0004"}}
+]);
+console.log(JSON.stringify({{
+  seq: rows.map(r => r.key + ":" + r.depth),
+  names: rows.map(r => r.name),
+  nonArray: [rowsOf(null), rowsOf(undefined), rowsOf({{}}), rowsOf("x")],
+  invalidSeq: invalid.map(r => r.key + ":" + r.depth)
+}}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["seq"], [
+            "ROOTBBB2:0", "ORPHAN01:0", "ROOTAAA1:0", "CHILDAA1:1",
+            "GRANDAA1:2", "CYCLEA01:0", "CYCLEB01:1",
+        ])
+        self.assertEqual(value["names"], [
+            "alpha", "Orphan", "Zeta", "alpha", "Gamma", "Cycle A", "Cycle B",
+        ])
+        self.assertEqual(value["nonArray"], [[], [], [], []])
+        self.assertEqual(value["invalidSeq"], ["GOOD0003:0", "GOOD0002:0"])
+
+    def test_collection_payload_uses_form_library_only_when_valid(self):
+        payload_fn = extract_function(PLANNER, "zoteroCollectionsPayload")
+        script = f"""
+const vm = require("vm");
+const context = {{projectFormZoteroLibraryType: "", projectFormZoteroLibraryId: ""}};
+vm.createContext(context);
+const fn = vm.runInContext("(" + {json.dumps(payload_fn)} + ")", context);
+context.zoteroCollectionsPayload = fn;
+function payload(t, i) {{
+  context.projectFormZoteroLibraryType = t;
+  context.projectFormZoteroLibraryId = i;
+  return context.zoteroCollectionsPayload();
+}}
+console.log(JSON.stringify({{
+  empty: payload("", ""),
+  blank: payload("  ", "   "),
+  missingId: payload("user", ""),
+  missingType: payload("", "0"),
+  userZero: payload("user", "0"),
+  groupId: payload("group", "123"),
+  groupZero: payload("group", "0"),
+  userAbc: payload("user", "abc"),
+  tooLong: payload("user", "123456789012345678901"),
+  badType: payload("other", "123")
+}}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["empty"], {})
+        self.assertEqual(value["blank"], {})
+        self.assertEqual(value["missingId"], {})
+        self.assertEqual(value["missingType"], {})
+        self.assertEqual(value["userZero"], {"library_type": "user", "library_id": "0"})
+        self.assertEqual(value["groupId"], {"library_type": "group", "library_id": "123"})
+        self.assertEqual(value["groupZero"], {})
+        self.assertEqual(value["userAbc"], {})
+        self.assertEqual(value["tooLong"], {})
+        self.assertEqual(value["badType"], {})
+
+    def test_finish_and_pick_flow_is_read_only_and_stale_safe(self):
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in (
+                "zoteroCollectionRows", "finishZoteroCollections", "zoteroPickCollection",
+            )
+        }
+        script = f"""
+const vm = require("vm");
+const context = {{
+  zoteroPickerGeneration: 7, zoteroPickerLaunchGeneration: 7,
+  zoteroPickerRows: [], zoteroPickerIndex: 0,
+  zoteroPickerServer: "", zoteroPickerLibraryType: "user", zoteroPickerLibraryId: "0",
+  zoteroPickerStatus: "", zoteroPickerBusy: true, zoteroPickerOpen: true,
+  projectFormZoteroServer: "", projectFormZoteroLibraryType: "",
+  projectFormZoteroLibraryId: "", projectFormZoteroCollectionKey: "",
+  projectFormZoteroRaw: "sentinel", projectFormZoteroStatus: "",
+  zoteroPickerTimeout: {{stop() {{}}}},
+  safeText(value) {{ return String(value === undefined || value === null ? "" : value); }}
+}};
+vm.createContext(context);
+for (const value of {json.dumps(list(functions.values()))}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+const out = {{}};
+const payload = {{server_id: "srv1", library: {{type: "user", id: "0"}}, collections: [
+  {{key: "ROOTAAA1", name: "Zeta", parentCollection: null}},
+  {{key: "CHILDAA1", name: "alpha", parentCollection: "ROOTAAA1"}}
+]}};
+context.finishZoteroCollections(0, JSON.stringify(payload), "", 7);
+out.successSeq = context.zoteroPickerRows.map(r => r.key + ":" + r.depth);
+out.successStatus = context.zoteroPickerStatus;
+out.successServer = context.zoteroPickerServer;
+out.successBusy = context.zoteroPickerBusy;
+out.successLib = [context.zoteroPickerLibraryType, context.zoteroPickerLibraryId];
+const rowsBefore = JSON.stringify(context.zoteroPickerRows);
+const statusBefore = context.zoteroPickerStatus;
+context.finishZoteroCollections(0, JSON.stringify({{server_id: "other",
+  library: {{type: "group", id: "123"}}, collections: []}}), "diag", 6);
+out.staleUnchanged = JSON.stringify(context.zoteroPickerRows) === rowsBefore &&
+  context.zoteroPickerStatus === statusBefore;
+context.finishZoteroCollections(1, "",
+  "error: zotero server did not report a Zotero-Server-ID", 7);
+out.failureRows = context.zoteroPickerRows;
+out.failureStatus = context.zoteroPickerStatus;
+out.failureBusy = context.zoteroPickerBusy;
+context.finishZoteroCollections(0, JSON.stringify(payload), "", 7);
+context.zoteroPickerOpen = true;
+const picked = context.zoteroPickCollection("rootaaa1");
+out.pickResult = picked;
+out.pickForm = [context.projectFormZoteroServer, context.projectFormZoteroLibraryType,
+  context.projectFormZoteroLibraryId, context.projectFormZoteroCollectionKey];
+out.pickRaw = context.projectFormZoteroRaw;
+out.pickStatus = context.projectFormZoteroStatus;
+out.pickOpen = context.zoteroPickerOpen;
+const formBefore = JSON.stringify([context.projectFormZoteroServer,
+  context.projectFormZoteroLibraryType, context.projectFormZoteroLibraryId,
+  context.projectFormZoteroCollectionKey, context.projectFormZoteroStatus]);
+const unknown = context.zoteroPickCollection("DEADBEEF");
+out.unknownResult = unknown;
+out.unknownUntouched = JSON.stringify([context.projectFormZoteroServer,
+  context.projectFormZoteroLibraryType, context.projectFormZoteroLibraryId,
+  context.projectFormZoteroCollectionKey, context.projectFormZoteroStatus]) === formBefore;
+console.log(JSON.stringify(out));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["successSeq"], ["ROOTAAA1:0", "CHILDAA1:1"])
+        self.assertIn("2 collections", value["successStatus"])
+        self.assertEqual(value["successServer"], "srv1")
+        self.assertFalse(value["successBusy"])
+        self.assertEqual(value["successLib"], ["user", "0"])
+        self.assertTrue(value["staleUnchanged"])
+        self.assertEqual(value["failureRows"], [])
+        self.assertIn("manually", value["failureStatus"])
+        self.assertNotIn("Traceback", value["failureStatus"])
+        self.assertFalse(value["failureBusy"])
+        self.assertTrue(value["pickResult"])
+        self.assertEqual(value["pickForm"], ["srv1", "user", "0", "ROOTAAA1"])
+        self.assertIsNone(value["pickRaw"])
+        self.assertIn("Picked:", value["pickStatus"])
+        self.assertFalse(value["pickOpen"])
+        self.assertFalse(value["unknownResult"])
+        self.assertTrue(value["unknownUntouched"])
+
+    def test_picker_source_contracts(self):
+        starter = extract_function(PLANNER, "startZoteroCollections")
+        self.assertIn("scripts/zotero.py", starter)
+        self.assertIn('"collections"', starter)
+        process_block = PLANNER[PLANNER.index("id: zoteroCollectionsProcess"):PLANNER.index("property string toggleRevision")]
+        self.assertIn('"zoteroPicker"', process_block)
+        self.assertIn("zoteroPickerTimeout", PLANNER)
+        self.assertIn("root.openZoteroPicker()", PLANNER)
+        self.assertNotIn("Collection picker needs the Zotero backend", PLANNER)
+        segment = PLANNER[PLANNER.index("function zoteroCollectionRows"):PLANNER.index("function agentFor")]
+        self.assertNotIn("startProjectWrite", segment)
+        self.assertNotIn('"apply"', segment)
+        self.assertNotIn('"prepare"', segment)
+        self.assertIn("parentCollection", segment)
+        self.assertIn("property string projectFormZoteroCollectionKey", PLANNER)
+        self.assertIn("id: projectZoteroKeyField", PLANNER)
+        self.assertIn('Accessible.name: "Pick Zotero collection"', PLANNER)
+        self.assertIn('Accessible.name: "Zotero collection list"', PLANNER)
+
+    def test_picker_lifecycle_guards_busy_and_cancels_reads(self):
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in (
+                "openZoteroPicker", "startZoteroLibraries", "startZoteroCollections",
+                "cancelZoteroCollectionsRead", "cancelZoteroLibrariesRead",
+                "handleZoteroPickerStartFailure", "handleZoteroLibrariesStartFailure",
+                "closeZoteroPicker", "finishZoteroLibraries",
+                "zoteroCollectionsPayload", "zoteroLibraryIndexFor",
+            )
+        }
+        script = f"""
+const vm = require("vm");
+function makeContext(overrides) {{
+  const context = Object.assign({{
+    projectFormOpen: true, projectWriteBusy: false, projectWriteRetiring: false,
+    listBusy: false, listRetiring: false,
+    projectFormZoteroLibraryType: "", projectFormZoteroLibraryId: "",
+    zoteroPickerOpen: false, zoteroPickerBusy: false, zoteroPickerStarted: false,
+    zoteroPickerStartFailed: false, zoteroPickerRetiring: false,
+    zoteroPickerGeneration: 0, zoteroPickerProcessGeneration: 0,
+    zoteroPickerLaunchGeneration: 0, zoteroPickerRows: [], zoteroPickerIndex: 0,
+    zoteroPickerLibraries: [], zoteroPickerLibraryIndex: 0,
+    zoteroPickerStatus: "", zoteroPickerServer: "", zoteroPickerLibraryType: "user",
+    zoteroPickerLibraryId: "0",
+    zoteroLibrariesBusy: false, zoteroLibrariesStarted: false,
+    zoteroLibrariesStartFailed: false, zoteroLibrariesRetiring: false,
+    zoteroLibrariesGeneration: 0, zoteroLibrariesProcessGeneration: 0,
+    zoteroLibrariesLaunchGeneration: 0,
+    zoteroCollectionsProcess: {{running: false, stdinEnabled: false, command: []}},
+    zoteroLibrariesProcess: {{running: false, stdinEnabled: false, command: []}},
+    zoteroPickerTimeout: {{
+      restarts: 0, stops: 0,
+      restart() {{ this.restarts++; }}, stop() {{ this.stops++; }},
+    }},
+    zoteroLibrariesTimeout: {{
+      restarts: 0, stops: 0,
+      restart() {{ this.restarts++; }}, stop() {{ this.stops++; }},
+    }},
+    Quickshell: {{shellPath(v) {{ return v; }}, env(k) {{ return ""; }}}},
+    safeText(v) {{ return String(v === undefined || v === null ? "" : v); }},
+  }}, overrides || {{}});
+  vm.createContext(context);
+  for (const value of {json.dumps(list(functions.values()))}) {{
+    const fn = vm.runInContext("(" + value + ")", context);
+    context[fn.name] = fn;
+  }}
+  return context;
+}}
+const out = {{}};
+const opened = makeContext();
+out.open = opened.openZoteroPicker();
+out.openState = [opened.zoteroPickerOpen, opened.zoteroLibrariesBusy,
+  opened.zoteroLibrariesProcess.running, opened.zoteroLibrariesProcess.stdinEnabled,
+  opened.zoteroLibrariesGeneration, opened.zoteroLibrariesTimeout.restarts,
+  opened.zoteroLibrariesProcess.command.join(" "),
+  opened.zoteroPickerStatus, opened.zoteroPickerLibraries.length,
+  opened.zoteroCollectionsProcess.running];
+out.reopen = opened.openZoteroPicker();
+out.reopenStable = opened.zoteroLibrariesGeneration === 1 && opened.zoteroLibrariesBusy;
+const libGeneration = opened.zoteroLibrariesGeneration;
+opened.cancelZoteroLibrariesRead();
+out.cancelLib = [opened.zoteroLibrariesBusy, opened.zoteroLibrariesRetiring,
+  opened.zoteroLibrariesGeneration === libGeneration + 1,
+  opened.zoteroLibrariesProcess.running];
+opened.cancelZoteroLibrariesRead(); // idle cancel is a no-op
+out.cancelLibIdle = [opened.zoteroLibrariesBusy, opened.zoteroLibrariesRetiring,
+  opened.zoteroLibrariesGeneration === libGeneration + 1];
+// Libraries-then-collections flow: reopen and finish the library list.
+const flowed = makeContext();
+flowed.openZoteroPicker();
+flowed.finishZoteroLibraries(0, JSON.stringify({{server_id: "sPMHtLD6HHBd",
+  libraries: [{{type: "user", id: "0", name: "My Library"}},
+    {{type: "group", id: "12345", name: "Shared project"}}]}}), "", 1);
+out.flow = [flowed.zoteroPickerLibraries.length, flowed.zoteroPickerLibraryIndex,
+  flowed.zoteroPickerLibraryType, flowed.zoteroPickerLibraryId,
+  flowed.zoteroPickerServer, flowed.zoteroPickerStatus,
+  flowed.zoteroCollectionsProcess.running, flowed.zoteroCollectionsProcess.command.join(" "),
+  flowed.zoteroPickerBusy, flowed.zoteroLibrariesBusy];
+const colGeneration = flowed.zoteroPickerGeneration;
+flowed.cancelZoteroCollectionsRead();
+out.cancelCol = [flowed.zoteroPickerBusy, flowed.zoteroPickerRetiring,
+  flowed.zoteroPickerGeneration === colGeneration + 1,
+  flowed.zoteroCollectionsProcess.running];
+flowed.cancelZoteroCollectionsRead(); // idle cancel is a no-op
+out.cancelColIdle = [flowed.zoteroPickerBusy, flowed.zoteroPickerRetiring,
+  flowed.zoteroPickerGeneration === colGeneration + 1];
+const failing = makeContext();
+failing.openZoteroPicker();
+failing.handleZoteroLibrariesStartFailure(failing.zoteroLibrariesGeneration);
+out.startFailure = [failing.zoteroLibrariesBusy, failing.zoteroLibrariesRetiring,
+  failing.zoteroLibrariesTimeout.stops > 0, failing.zoteroPickerStatus];
+const failingCol = makeContext();
+failingCol.openZoteroPicker();
+failingCol.finishZoteroLibraries(0, JSON.stringify({{server_id: "s",
+  libraries: [{{type: "user", id: "0", name: "My Library"}}]}}), "", 1);
+failingCol.handleZoteroPickerStartFailure(failingCol.zoteroPickerGeneration);
+out.startFailureCol = [failingCol.zoteroPickerBusy, failingCol.zoteroPickerRetiring,
+  failingCol.zoteroPickerTimeout.stops > 0, failingCol.zoteroPickerStatus];
+out.blocked = [makeContext({{projectWriteBusy: true}}).openZoteroPicker(),
+  makeContext({{projectWriteRetiring: true}}).openZoteroPicker(),
+  makeContext({{listRetiring: true}}).openZoteroPicker(),
+  makeContext({{projectFormOpen: false}}).openZoteroPicker()];
+const closing = makeContext();
+closing.openZoteroPicker();
+closing.zoteroLibrariesProcess.running = false; // process exit clears running before onExited
+closing.finishZoteroLibraries(0, JSON.stringify({{server_id: "s",
+  libraries: [{{type: "user", id: "0", name: "My Library"}}]}}), "", 1);
+closing.closeZoteroPicker();
+out.closed = [closing.zoteroPickerOpen, closing.zoteroPickerBusy,
+  closing.zoteroPickerGeneration, closing.zoteroCollectionsProcess.running,
+  closing.zoteroLibrariesBusy, closing.zoteroLibrariesProcess.running];
+console.log(JSON.stringify(out));
+"""
+        value = self.run_node(script)
+        self.assertTrue(value["open"])
+        self.assertEqual(value["openState"][0:2], [True, True])
+        self.assertEqual(value["openState"][2:4], [True, True])
+        self.assertEqual(value["openState"][4], 1)
+        self.assertEqual(value["openState"][5], 1)
+        self.assertIn("scripts/zotero.py", value["openState"][6])
+        self.assertIn("libraries", value["openState"][6])
+        self.assertIn("Loading Zotero libraries", value["openState"][7])
+        self.assertEqual(value["openState"][8], 0)
+        self.assertFalse(value["openState"][9])
+        self.assertFalse(value["reopen"])
+        self.assertTrue(value["reopenStable"])
+        self.assertEqual(value["cancelLib"], [False, True, True, False])
+        self.assertEqual(value["cancelLibIdle"], [False, True, True])
+        self.assertEqual(value["flow"][0], 2)
+        self.assertEqual(value["flow"][1], 0)
+        self.assertEqual(value["flow"][2:5], ["user", "0", "sPMHtLD6HHBd"])
+        self.assertIn("Loading collections", value["flow"][5])
+        self.assertTrue(value["flow"][6])
+        self.assertIn("collections", value["flow"][7])
+        self.assertTrue(value["flow"][8])
+        self.assertFalse(value["flow"][9])
+        self.assertEqual(value["cancelCol"], [False, True, True, False])
+        self.assertEqual(value["cancelColIdle"], [False, True, True])
+        self.assertEqual(value["startFailure"][0:3], [False, False, True])
+        self.assertIn("Could not start", value["startFailure"][3])
+        self.assertEqual(value["startFailureCol"][0:3], [False, False, True])
+        self.assertIn("Could not start", value["startFailureCol"][3])
+        self.assertEqual(value["blocked"], [False, False, False, False])
+        self.assertEqual(value["closed"], [False, False, 2, False, False, False])
+
+    def test_zotero_library_index_for_is_pure(self):
+        index_fn = extract_function(PLANNER, "zoteroLibraryIndexFor")
+        script = f"""
+const indexFor = new Function("return " + {json.dumps(index_fn)})();
+const libs = [{{type: "user", id: "0", name: "My Library"}},
+  {{type: "group", id: "12345", name: "Shared project"}},
+  {{type: "group", id: "999", name: "Other"}}];
+console.log(JSON.stringify({{
+  user: indexFor(libs, "user", "0"),
+  group: indexFor(libs, "group", "12345"),
+  last: indexFor(libs, "group", "999"),
+  noMatchType: indexFor(libs, "other", "0"),
+  noMatchId: indexFor(libs, "group", "1"),
+  empty: indexFor([], "user", "0"),
+  notArray: [indexFor(null, "user", "0"), indexFor(undefined, "user", "0"), indexFor({{ }}, "user", "0")],
+  invalid: [indexFor(libs, "", ""), indexFor(libs, null, null),
+    indexFor(libs, undefined, undefined), indexFor(libs, "user", ""), indexFor(libs, "", "0")],
+  trimmed: indexFor(libs, " group ", " 12345 "),
+  firstWins: indexFor([{{type: "group", id: "7", name: "A"}}, {{type: "group", id: "7", name: "B"}}], "group", "7")
+}}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["user"], 0)
+        self.assertEqual(value["group"], 1)
+        self.assertEqual(value["last"], 2)
+        self.assertEqual(value["noMatchType"], 0)
+        self.assertEqual(value["noMatchId"], 0)
+        self.assertEqual(value["empty"], 0)
+        self.assertEqual(value["notArray"], [0, 0, 0])
+        self.assertEqual(value["invalid"], [0, 0, 0, 0, 0])
+        # Whitespace-trimmed type/id still matches the stored entry.
+        self.assertEqual(value["trimmed"], 1)
+        self.assertEqual(value["firstWins"], 0)
+
+    def test_finish_libraries_populates_and_defaults_to_form_library(self):
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in (
+                "finishZoteroLibraries", "zoteroCollectionsPayload",
+                "zoteroLibraryIndexFor", "startZoteroCollections",
+            )
+        }
+        script = f"""
+const vm = require("vm");
+function makeContext(formType, formId) {{
+  const context = {{
+    zoteroLibrariesGeneration: 3, zoteroLibrariesBusy: true,
+    zoteroLibrariesStarted: false, zoteroLibrariesStartFailed: false,
+    zoteroLibrariesRetiring: false, zoteroLibrariesProcessGeneration: 3,
+    zoteroLibrariesLaunchGeneration: 3,
+    zoteroPickerLibraries: [], zoteroPickerLibraryIndex: 0,
+    zoteroPickerRows: [], zoteroPickerIndex: 0,
+    zoteroPickerServer: "", zoteroPickerLibraryType: "user", zoteroPickerLibraryId: "0",
+    zoteroPickerStatus: "Loading Zotero libraries…",
+    zoteroPickerBusy: false, zoteroPickerStarted: false,
+    zoteroPickerStartFailed: false, zoteroPickerRetiring: false,
+    zoteroPickerGeneration: 0, zoteroPickerProcessGeneration: 0,
+    zoteroPickerLaunchGeneration: 0,
+    projectFormZoteroLibraryType: formType, projectFormZoteroLibraryId: formId,
+    zoteroCollectionsProcess: {{running: false, stdinEnabled: false, command: []}},
+    zoteroLibrariesProcess: {{running: false}},
+    zoteroPickerTimeout: {{restart() {{ this.restarts = (this.restarts || 0) + 1; }}, stop() {{ this.stops = (this.stops || 0) + 1; }}}},
+    zoteroLibrariesTimeout: {{stop() {{ this.stops = (this.stops || 0) + 1; }}}},
+    Quickshell: {{shellPath(v) {{ return v; }}, env(k) {{ return ""; }}}},
+    safeText(v) {{ return String(v === undefined || v === null ? "" : v); }},
+  }};
+  vm.createContext(context);
+  for (const value of {json.dumps(list(functions.values()))}) {{
+    const fn = vm.runInContext("(" + value + ")", context);
+    context[fn.name] = fn;
+  }}
+  return context;
+}}
+const out = {{}};
+const grouped = makeContext("group", "12345");
+grouped.finishZoteroLibraries(0, JSON.stringify({{server_id: "srv1",
+  libraries: [{{type: "user", id: "0", name: "My Library"}},
+    {{type: "group", id: "12345", name: "Shared project"}},
+    {{type: "nope", id: "x", name: ""}}, null, "bad",
+    {{type: "group", id: "0", name: "Bad group zero"}},
+    {{type: "group", id: "abc", name: "Bad id"}},
+    {{type: "user", id: "1", name: "   "}}]}}), "", 3);
+out.groupedLibs = grouped.zoteroPickerLibraries;
+out.groupedIndex = grouped.zoteroPickerLibraryIndex;
+out.groupedIdentity = [grouped.zoteroPickerLibraryType, grouped.zoteroPickerLibraryId];
+out.groupedServer = grouped.zoteroPickerServer;
+out.groupedStatus = grouped.zoteroPickerStatus;
+out.groupedCollections = [grouped.zoteroCollectionsProcess.running,
+  grouped.zoteroCollectionsProcess.command.join(" "), grouped.zoteroPickerBusy];
+const plain = makeContext("", "");
+plain.finishZoteroLibraries(0, JSON.stringify({{server_id: "srv1",
+  libraries: [{{type: "user", id: "0", name: "My Library"}},
+    {{type: "group", id: "12345", name: "Shared project"}}]}}), "", 3);
+out.plainIndex = plain.zoteroPickerLibraryIndex;
+out.plainIdentity = [plain.zoteroPickerLibraryType, plain.zoteroPickerLibraryId];
+const stale = makeContext("group", "12345");
+stale.finishZoteroLibraries(0, JSON.stringify({{server_id: "srv1",
+  libraries: [{{type: "user", id: "0", name: "My Library"}}]}}), "", 3);
+const before = JSON.stringify([stale.zoteroPickerLibraries, stale.zoteroPickerLibraryIndex]);
+stale.finishZoteroLibraries(0, JSON.stringify({{server_id: "other", libraries: []}}), "", 2);
+out.staleUnchanged = JSON.stringify([stale.zoteroPickerLibraries, stale.zoteroPickerLibraryIndex]) === before;
+const failed = makeContext("user", "0");
+failed.finishZoteroLibraries(1, "", "error: zotero server did not report a Zotero-Server-ID", 3);
+out.failedLibs = failed.zoteroPickerLibraries;
+out.failedIndex = failed.zoteroPickerLibraryIndex;
+out.failedStatus = failed.zoteroPickerStatus;
+out.failedBusy = failed.zoteroLibrariesBusy;
+out.failedCollections = failed.zoteroCollectionsProcess.running;
+console.log(JSON.stringify(out));
+"""
+        value = self.run_node(script)
+        self.assertEqual(len(value["groupedLibs"]), 2)
+        self.assertEqual(value["groupedLibs"][0], {"type": "user", "id": "0", "name": "My Library"})
+        self.assertEqual(value["groupedLibs"][1], {"type": "group", "id": "12345", "name": "Shared project"})
+        self.assertEqual(value["groupedIndex"], 1)
+        self.assertEqual(value["groupedIdentity"], ["group", "12345"])
+        self.assertEqual(value["groupedServer"], "srv1")
+        self.assertIn("Loading collections", value["groupedStatus"])
+        self.assertTrue(value["groupedCollections"][0])
+        self.assertIn("collections", value["groupedCollections"][1])
+        self.assertTrue(value["groupedCollections"][2])
+        self.assertEqual(value["plainIndex"], 0)
+        self.assertEqual(value["plainIdentity"], ["user", "0"])
+        self.assertTrue(value["staleUnchanged"])
+        self.assertEqual(value["failedLibs"], [])
+        self.assertEqual(value["failedIndex"], 0)
+        self.assertIn("Could not load Zotero libraries", value["failedStatus"])
+        self.assertIn("manually", value["failedStatus"])
+        self.assertNotIn("Traceback", value["failedStatus"])
+        self.assertFalse(value["failedBusy"])
+        self.assertFalse(value["failedCollections"])
+
+    def test_select_library_is_serialized_and_validates(self):
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in ("selectZoteroLibrary", "startZoteroCollections")
+        }
+        script = f"""
+const vm = require("vm");
+function makeContext(overrides) {{
+  const context = Object.assign({{
+    zoteroPickerLibraries: [{{type: "user", id: "0", name: "My Library"}},
+      {{type: "group", id: "12345", name: "Shared project"}}],
+    zoteroPickerLibraryIndex: 0, zoteroPickerLibraryType: "user", zoteroPickerLibraryId: "0",
+    zoteroPickerStatus: "", zoteroPickerBusy: false, zoteroPickerStarted: false,
+    zoteroPickerStartFailed: false, zoteroPickerRetiring: false,
+    zoteroPickerGeneration: 5, zoteroPickerProcessGeneration: 5,
+    zoteroPickerLaunchGeneration: 5,
+    zoteroCollectionsProcess: {{running: false, stdinEnabled: false, command: []}},
+    zoteroPickerTimeout: {{restart() {{ this.restarts = (this.restarts || 0) + 1; }}}},
+    Quickshell: {{shellPath(v) {{ return v; }}, env(k) {{ return ""; }}}},
+  }}, overrides || {{}});
+  vm.createContext(context);
+  for (const value of {json.dumps(list(functions.values()))}) {{
+    const fn = vm.runInContext("(" + value + ")", context);
+    context[fn.name] = fn;
+  }}
+  return context;
+}}
+const out = {{}};
+const idle = makeContext();
+out.idleOk = idle.selectZoteroLibrary(1);
+out.idle = [idle.zoteroPickerLibraryIndex, idle.zoteroPickerLibraryType,
+  idle.zoteroPickerLibraryId, idle.zoteroPickerStatus,
+  idle.zoteroCollectionsProcess.running, idle.zoteroPickerBusy];
+const busy = makeContext({{zoteroPickerBusy: true, zoteroPickerStarted: true,
+  zoteroCollectionsProcess: {{running: true, stdinEnabled: false, command: []}}}});
+const beforeGen = busy.zoteroPickerGeneration;
+out.busyOk = busy.selectZoteroLibrary(1);
+out.busy = [busy.zoteroPickerLibraryIndex, busy.zoteroPickerLibraryType,
+  busy.zoteroPickerLibraryId, busy.zoteroPickerGeneration === beforeGen,
+  busy.zoteroCollectionsProcess.running, busy.zoteroPickerBusy, busy.zoteroPickerRetiring,
+  busy.zoteroPickerStatus];
+out.bad = [makeContext().selectZoteroLibrary(-1), makeContext().selectZoteroLibrary(2),
+  makeContext().selectZoteroLibrary(1.5), makeContext().selectZoteroLibrary("x"),
+  makeContext().selectZoteroLibrary(undefined)];
+const badCtx = makeContext();
+const badBefore = JSON.stringify([badCtx.zoteroPickerLibraryIndex,
+  badCtx.zoteroPickerLibraryType, badCtx.zoteroPickerLibraryId]);
+badCtx.selectZoteroLibrary(99);
+out.badUntouched = JSON.stringify([badCtx.zoteroPickerLibraryIndex,
+  badCtx.zoteroPickerLibraryType, badCtx.zoteroPickerLibraryId]) === badBefore;
+console.log(JSON.stringify(out));
+"""
+        value = self.run_node(script)
+        self.assertTrue(value["idleOk"])
+        self.assertEqual(value["idle"][0:3], [1, "group", "12345"])
+        self.assertIn("Loading collections", value["idle"][3])
+        self.assertTrue(value["idle"][4])
+        self.assertTrue(value["idle"][5])
+        # An in-flight read is never overlapped: the switch is refused with a
+        # wait status and no state is mutated (Quickshell's Process.running
+        # stays true until the child exits, so a kill-and-restart would drop
+        # the new launch silently).
+        self.assertFalse(value["busyOk"])
+        self.assertEqual(value["busy"][0:3], [0, "user", "0"])
+        self.assertTrue(value["busy"][3])
+        self.assertTrue(value["busy"][4])
+        self.assertTrue(value["busy"][5])
+        self.assertFalse(value["busy"][6])
+        self.assertIn("Wait for the collection list", value["busy"][7])
+        self.assertEqual(value["bad"], [False, False, False, False, False])
+        self.assertTrue(value["badUntouched"])
+
+    def test_picker_library_source_contracts(self):
+        starter_libs = extract_function(PLANNER, "startZoteroLibraries")
+        self.assertIn("scripts/zotero.py", starter_libs)
+        self.assertIn('"libraries"', starter_libs)
+        starter_cols = extract_function(PLANNER, "startZoteroCollections")
+        self.assertIn("scripts/zotero.py", starter_cols)
+        self.assertIn('"collections"', starter_cols)
+        payload_fn = extract_function(PLANNER, "zoteroPickerCollectionsPayload")
+        self.assertIn("zoteroPickerLibraryType", payload_fn)
+        self.assertIn("zoteroPickerLibraryId", payload_fn)
+        self.assertIn("library_type", payload_fn)
+        self.assertIn("library_id", payload_fn)
+        process_block = PLANNER[PLANNER.index("id: zoteroLibrariesProcess"):PLANNER.index("property string toggleRevision")]
+        self.assertIn('"zoteroLibraries"', process_block)
+        self.assertIn("finishZoteroLibraries", process_block)
+        self.assertIn("zoteroLibrariesTimeout", PLANNER)
+        self.assertIn("zoteroPickerCollectionsPayload()", PLANNER)
+        collections_onstarted = PLANNER[PLANNER.index("id: zoteroCollectionsProcess"):PLANNER.index("id: zoteroLibrariesProcess")]
+        self.assertIn("zoteroPickerCollectionsPayload()", collections_onstarted)
+        self.assertNotIn("zoteroCollectionsPayload()", collections_onstarted)
+        # Library selector UI contracts.
+        self.assertIn('Accessible.name: "Zotero library: "', PLANNER)
+        self.assertIn("root.selectZoteroLibrary(index)", PLANNER)
+        self.assertIn("Flow {", PLANNER)
+        self.assertIn("root.zoteroPickerLibraries", PLANNER)
+        self.assertIn("root.zoteroPickerLibraryIndex", PLANNER)
+        self.assertIn("Theme.surface1", PLANNER)
+        self.assertIn("Theme.focusBorder", PLANNER)
+        self.assertIn("Theme.mantle", PLANNER)
+        self.assertIn("elide:", PLANNER)
+        # No-write guarantee across the whole picker segment.
+        segment = PLANNER[PLANNER.index("function zoteroCollectionRows"):PLANNER.index("function agentFor")]
+        self.assertNotIn("startProjectWrite", segment)
+        self.assertNotIn('"apply"', segment)
+        self.assertNotIn('"prepare"', segment)
+        self.assertNotIn(".running = false", segment.replace("zoteroCollectionsProcess.running = false", "").replace("zoteroLibrariesProcess.running = false", ""))
+        self.assertIn("parentCollection", segment)
+        # Picker still exposes the manual key field and cancel.
+        self.assertIn('Accessible.name: "Pick Zotero collection"', PLANNER)
+        self.assertIn('Accessible.name: "Zotero collection list"', PLANNER)
+        self.assertIn("root.closeZoteroPicker()", PLANNER)
+
 
 if __name__ == "__main__":
     unittest.main()

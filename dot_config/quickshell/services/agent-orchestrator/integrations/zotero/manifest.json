@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "QS Active Reader",
+  "description": "Publishes the Zotero-internal active reader (metadata only) on a local endpoint for the verified Hyprland bridge. No window binding, no content.",
+  "version": "0.1.0",
+  "applications": {
+    "zotero": {
+      "id": "qs-active-reader@quickshell.local",
+      "update_url": "https://qs-active-reader.invalid/updates.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "10.0.*"
+    }
+  }
+}

@@ -22,9 +22,10 @@ use qs_agent_orchestrator::desktop_context::{
 };
 use qs_agent_orchestrator::{ActivityStore, EnrichmentEnv};
 use qs_agent_orchestrator::app_context::{
-    clear_last_good_cache, cmdline_is_nvim, enrich_with_env, kitty_ls_argv, kitty_peer_pid,
-    logseq_page_from_title, normalize_kitty_socket_arg, parse_nvim_record, sanitize_abs_path,
-    select_kitty_pane,
+    clear_last_good_cache, cmdline_is_nvim, enrich_with_env, kitty_candidate_sockets,
+    kitty_ls_argv, kitty_peer_pid, logseq_page_from_title, normalize_kitty_socket_arg,
+    parse_nvim_record, sanitize_abs_path, select_kitty_pane, select_kitty_socket,
+    KittySocketChoice,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -266,6 +267,50 @@ fn kitty_command_boundary_and_peer_identity() {
 }
 
 #[test]
+fn kitty_socket_discovery_prefers_env_then_focused_default() {
+    // Pure candidate ordering/dedup plus peer-validated selection against a
+    // real bound socket. Never runs `kitty @ ls` against fake sockets
+    // (protocol mismatch would hang); selection only probes SO_PEERCRED.
+    let pid = 424242u32;
+    let configured = std::path::PathBuf::from("/run/user/1000/kitty.sock");
+    let c = kitty_candidate_sockets(Some(configured.as_path()), pid);
+    assert_eq!(c[0], configured, "env socket stays the preference");
+    let default_tmp = std::path::PathBuf::from(format!("/tmp/kitty-{pid}"));
+    assert!(c.contains(&default_tmp), "derived default must follow");
+    assert!(c.iter().all(|p| p.is_absolute()));
+    // Empty env still yields the derived default candidate.
+    let bare = kitty_candidate_sockets(None, pid);
+    assert_eq!(bare[0], default_tmp);
+    // Relative configured values are filtered, not probed.
+    let rel = kitty_candidate_sockets(Some(std::path::Path::new("relative.sock")), pid);
+    assert_eq!(rel[0], default_tmp);
+
+    // Peer-validated selection: hermetic temp dir only, never a literal
+    // /tmp/kitty-<pid> bind. First candidate missing, second bound by this
+    // process -> Matched on the second (foreign-first never stops the scan).
+    let dir = tmpdir("kitty-discover");
+    let sock = dir.join("second.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let accept = std::thread::spawn(move || {
+        if let Ok((s, _)) = listener.accept() {
+            std::mem::forget(s);
+        }
+    });
+    let me = std::process::id();
+    let missing = dir.join("first-missing.sock");
+    match select_kitty_socket(&[missing, sock.clone()], me) {
+        KittySocketChoice::Matched(path, peer) => {
+            assert_eq!(path, sock);
+            assert_eq!(peer, me);
+        }
+        other => panic!("expected Matched, got {other:?}"),
+    }
+    let _ = accept.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn kitty_real_shaped_selection_no_conflation() {
     clear_last_good_cache();
     // Distinct identities: kitty 4001 (peer==focused), shell 5001, nvim
@@ -352,7 +397,11 @@ fn logseq_title_only_with_page_extraction() {
     );
     assert!(logseq_page_from_title("Logseq").is_none());
     assert!(logseq_page_from_title("").is_none());
-    assert!(logseq_page_from_title("a - Logseq - extra").is_none());
+    // An internal (non-terminal) occurrence is part of a bare page name.
+    assert_eq!(
+        logseq_page_from_title("a - Logseq - extra").as_deref(),
+        Some("a - Logseq - extra")
+    );
     assert!(logseq_page_from_title(" - Logseq").is_none());
     let ctx = DesktopContext::available(
         Source::Hyprland,
@@ -366,7 +415,7 @@ fn logseq_title_only_with_page_extraction() {
     assert_eq!(r.title.as_deref(), Some("My Page - Logseq"));
     assert_eq!(r.page.as_deref(), Some("My Page"));
     assert_eq!(r.url, None, "never invent a URL");
-    // Bare title without suffix: title only, no page guess.
+    // App-name-only title (no page open): rejected structurally.
     let ctx2 = DesktopContext::available(
         Source::Hyprland,
         Some(FocusedWindow::new("0xL", "Logseq", "Logseq")),
@@ -376,6 +425,16 @@ fn logseq_title_only_with_page_extraction() {
     let out2 = enrich_with_env(ctx2, &EnrichmentEnv::default(), 2_000_000);
     let r2 = out2.resource.expect("fallback");
     assert_eq!(r2.page, None);
+    // The Electron app's window title is the bare page name (no suffix).
+    let ctx3 = DesktopContext::available(
+        Source::Hyprland,
+        Some(FocusedWindow::new("0xL", "Logseq", "Asset-Prices")),
+        None,
+        1,
+    );
+    let out3 = enrich_with_env(ctx3, &EnrichmentEnv::default(), 3_000_000);
+    let r3 = out3.resource.expect("fallback");
+    assert_eq!(r3.page.as_deref(), Some("Asset-Prices"));
 }
 
 #[test]

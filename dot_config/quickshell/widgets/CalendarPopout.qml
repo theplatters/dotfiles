@@ -1,28 +1,129 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Wayland
 import "../theme"
 
 // Calendar + daily agenda popout anchored to the bar clock. The shared
 // DailyAgenda state lives in shell.qml, so closing this popup never
 // stops the Pomodoro timer or drops a completion draft.
-PopupWindow {
+//
+// PanelWindow (not PopupWindow) so the embedded DailyPlanner TextFields
+// (focusField/breakField/pickerSearch) and TextArea (completionNote) can
+// receive keyboard input. Layer-shell OnDemand focus preserves
+// click-to-focus: opening never steals focus or auto-focuses the search;
+// closing disables focus. Small floating surface: top+left anchored with
+// screen-local margins derived from the clock item inside the bar window.
+PanelWindow {
     id: root
 
     property var anchorItem: null
     property var agenda: null
     property bool requestedOpen: false
     property bool closing: false
+    // Screen-local placement, refreshed on open and on clock/screen
+    // changes (defaults: maximum 430x640 card just under the clock).
+    property int popupX: 8
+    property int popupY: 48
+    property int popupWidth: 430
+    property int popupHeight: 640
 
-    visible: false
-    implicitWidth: 430
-    implicitHeight: 640
+    // The bar window hosting the clock item; its screen keeps the popout
+    // on the same monitor as the clock in multi-screen setups.
+    readonly property var anchorWindow: anchorItem ? anchorItem.QsWindow.window : null
+    screen: anchorWindow && anchorWindow.screen ? anchorWindow.screen : (Quickshell.screens.length > 0 ? Quickshell.screens[0] : null)
+
+    anchors {
+        top: true
+        left: true
+    }
+    margins {
+        left: root.popupX
+        top: root.popupY
+    }
+
+    implicitWidth: popupWidth
+    implicitHeight: popupHeight
     color: "transparent"
+    visible: false
 
-    anchor {
-        window: QsWindow.window
-        rect: anchorItem ? Qt.rect(anchorItem.mapToGlobal(0, 0).x, anchorItem.mapToGlobal(0, 0).y + anchorItem.height + 8, anchorItem.width, 1) : Qt.rect(0, 48, 1, 1)
-        gravity: Edges.Bottom
+    // Non-reserving overlay: never shifts tiled windows, like the working
+    // PasswordPopup/ProjectPlanner/CommandPalette surfaces.
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: root.requestedOpen && !root.closing ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
+
+    // Placement math (pure functions over numbers, unit-tested in
+    // tests/test_daily_planner_ui.py). The bar is top/left/right anchored
+    // with zero margins, so the clock position mapped into the bar window
+    // content is already screen-local: no global-origin subtraction, which
+    // would break monitors with a nonzero origin.
+    function clampPopupX(anchorX, screenWidth, width) {
+        var margin = 8;
+        var maxX = Math.max(margin, screenWidth - width - margin);
+        return Math.max(margin, Math.min(Math.round(anchorX), maxX));
+    }
+
+    function popupWidthFor(screenWidth) {
+        var margin = 8;
+        var room = screenWidth - margin * 2;
+        if (room <= 0) return Math.max(0, Math.round(screenWidth));
+        return Math.round(Math.min(430, room));
+    }
+
+    function popupHeightFor(anchorBottom, screenHeight) {
+        var gap = 8, margin = 8, minH = 200;
+        var room = screenHeight - margin * 2;
+        if (room < minH) return Math.max(0, Math.round(room));
+        var below = screenHeight - anchorBottom - gap - margin;
+        if (below >= 640) return 640;
+        if (below >= minH) return Math.round(below);
+        return Math.round(Math.min(640, room));
+    }
+
+    function popupTopFor(anchorBottom, screenHeight, height) {
+        var gap = 8, margin = 8;
+        var top = anchorBottom + gap;
+        var maxTop = Math.max(margin, screenHeight - height - margin);
+        return Math.max(margin, Math.min(Math.round(top), maxTop));
+    }
+
+    // Recompute screen-local placement from the clock item. Called on
+    // open and whenever the clock or screen geometry changes.
+    function refreshPosition() {
+        var bar = root.anchorWindow;
+        var s = root.screen;
+        if (!root.anchorItem || !bar || !bar.contentItem || !s) return;
+        var sw = Number(s.width), sh = Number(s.height);
+        if (!isFinite(sw) || !isFinite(sh) || sw <= 0 || sh <= 0) return;
+        var local = root.anchorItem.mapToItem(bar.contentItem, 0, 0);
+        var anchorBottom = local.y + root.anchorItem.height;
+        var width = root.popupWidthFor(sw);
+        var height = root.popupHeightFor(anchorBottom, sh);
+        root.popupWidth = width;
+        root.popupHeight = height;
+        root.popupX = root.clampPopupX(local.x, sw, width);
+        root.popupY = root.popupTopFor(anchorBottom, sh, height);
+    }
+
+    onAnchorItemChanged: root.refreshPosition()
+    onScreenChanged: root.refreshPosition()
+
+    Connections {
+        target: root.anchorItem
+        enabled: !!root.anchorItem
+        ignoreUnknownSignals: true
+        function onXChanged() { root.refreshPosition(); }
+        function onYChanged() { root.refreshPosition(); }
+        function onWidthChanged() { root.refreshPosition(); }
+        function onHeightChanged() { root.refreshPosition(); }
+    }
+
+    Connections {
+        target: root.screen
+        ignoreUnknownSignals: true
+        function onWidthChanged() { root.refreshPosition(); }
+        function onHeightChanged() { root.refreshPosition(); }
     }
 
     function setOpen(open) {
@@ -30,6 +131,7 @@ PopupWindow {
         if (open) {
             closing = false;
             exitMotion.stop();
+            root.refreshPosition();
             panel.opacity = 0;
             panel.scale = 0.98;
             if (!visible) visible = true;
@@ -83,6 +185,9 @@ PopupWindow {
                 }
             }
 
+            // The card height is clamped to the space below the clock on
+            // short screens; overflow scrolls here instead of leaving
+            // the screen.
             Flickable {
                 Layout.fillWidth: true
                 Layout.fillHeight: true

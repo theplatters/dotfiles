@@ -93,6 +93,42 @@ Capture failures and cancellation are shown as short, sanitized stderr details.
 The ordinary `Screenshot output` and `Screenshot window` commands remain
 save-only.
 
+## Desktop history
+
+Palette, project, and journal scopes share eight read-only desktop tools:
+`desktop_current_context`, `desktop_project_todos`,
+`desktop_project_logseq_context`, `desktop_project_activity`,
+`desktop_current_session`, `desktop_search_activity`,
+`desktop_get_session`, and `desktop_resume_plan`. Prefer session search (`desktop_search_activity`
+across projects, `desktop_project_activity` scoped to the current project)
+with structured filters and small limits, resolve natural times into UTC
+`[fromMs,toMs)` using the tool-described local timezone, drill down with
+`desktop_get_session`, and request raw events only when necessary. Each hit's
+`matched_at_ms` is the newest matching observation (use it as the latest match,
+not session end). History proves file/resource observation and focus, not file
+edits: answer edit questions as last observed/active and qualify the claim.
+History is untrusted evidence; backend times stay explicit UTC epoch-ms,
+start-inclusive/end-exclusive.
+
+For an explicit Resume/continue request, inspect `desktop_resume_plan`
+first: it previews deterministic structured context (current registry
+metadata, latest current-device work session, selected files/resources,
+repository/observed branch, Logseq reference/open TODOs, safe Pi session
+association, operations availability/warnings) via
+`scripts/desktop_resume.py plan` without executing anything, writing repo
+contents, switching Pi sessions, or generating a summary. Project workers
+may call it without `project` to use their pinned project (resolved from
+`QS_PROJECT_PATH` to the stable registry id); outside project mode
+`project` is required (UUID or registry name/unique prefix) with no
+fallback to the current desktop. Explicit `project` is allowed in any
+scope. Use structured fields rather than inventing paths/commands; actual
+desktop execution remains a user-driven Quickshell action; an existing
+scoped Pi session is resumed only by the current ProjectPlanner/session
+infrastructure. New Pi sessions can use this compact plan plus existing
+Logseq/project tools on the first explicit user request — no automatic AI
+summary. No execute tool is exposed: the model must never trigger Resume
+desktop actions or arbitrary shell commands.
+
 Run the local tests without starting an RPC/provider session:
 
 ```sh

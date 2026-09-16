@@ -78,10 +78,25 @@ fn build_pi_command_with_env(
             }
         }
     } else if cfg.mode == "project" {
+        // UUID-pinned workers pass --project-id (by-id/<uuid> scope, no note
+        // required, incl. Zotero-only). A legacy page may additionally be
+        // passed as --project for an explicit migration restore; the wrapper
+        // never scans another scope automatically. Legacy-only workers keep
+        // the previous --project behavior for compatibility.
         cmd.push("python3".to_string());
         cmd.push(format!("{root}/scripts/project_sessions.py"));
-        cmd.push("--project".to_string());
-        cmd.push(cfg.project.clone().unwrap_or_default());
+        if let Some(pid) = cfg.project_id.as_deref() {
+            if !pid.trim().is_empty() {
+                cmd.push("--project-id".to_string());
+                cmd.push(pid.trim().to_string());
+            }
+        }
+        if let Some(legacy) = cfg.project.as_deref() {
+            if !legacy.trim().is_empty() {
+                cmd.push("--project".to_string());
+                cmd.push(legacy.trim().to_string());
+            }
+        }
         if !session_file.is_empty() {
             cmd.push("--session".to_string());
             cmd.push(session_file.to_string());
@@ -116,15 +131,28 @@ fn build_pi_command_with_env(
     // inherited untouched.
     let mut env: HashMap<String, String> = base_env.clone();
     if cfg.mode == "palette" {
+        env.remove("QS_PROJECT_ID");
         env.remove("QS_PROJECT_PATH");
         env.remove("QS_PROJECT_SESSION_SCOPE");
         env.remove("QS_JOURNAL_MODE");
         env.remove("QS_JOURNAL_SESSION_SCOPE");
     } else if cfg.mode == "journal" {
         env.insert("QS_JOURNAL_MODE".to_string(), "1".to_string());
+        env.remove("QS_PROJECT_ID");
         env.insert("QS_PROJECT_PATH".to_string(), String::new());
         env.remove("QS_PROJECT_SESSION_SCOPE");
     } else {
+        // Pinned UUID plus optional legacy page (explicit restore only).
+        // Zotero-only workers carry QS_PROJECT_ID with an empty path.
+        if let Some(pid) = cfg.project_id.as_deref() {
+            if !pid.trim().is_empty() {
+                env.insert("QS_PROJECT_ID".to_string(), pid.trim().to_string());
+            } else {
+                env.remove("QS_PROJECT_ID");
+            }
+        } else {
+            env.remove("QS_PROJECT_ID");
+        }
         env.insert(
             "QS_PROJECT_PATH".to_string(),
             cfg.project.clone().unwrap_or_default(),
@@ -436,6 +464,7 @@ mod tests {
             root: std::path::PathBuf::from("/tmp"),
             mode: "palette".to_string(),
             project: None,
+            project_id: None,
             session: None,
             pending_name: None,
             new_session: false,

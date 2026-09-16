@@ -1,13 +1,13 @@
-//! Project history/query tests (schema v2 + CLI).
+//! Project history/query tests (schema v4, v3 migration, and CLI).
 //!
 //! Covers:
-//! - v1 -> v2 transactional migration (rows preserved, project_id backfilled
-//!   from stored JSON, never re-resolved; index exists)
 //! - project query ordering/limits/range filters + UUID validation
 //! - recently-used resources dedup (priority key file>url>cwd>page;
 //!   branch/title ignored, incl. same-file-different-cwd dedup)
 //! - unknown projects (empty, not error)
-//! - old v1 DB read-only compatibility without writes
+//! - pre-v3 (v1/v2) version/shape rejection untouched (no migration or
+//!   read-only compatibility), while exact coherent v3 migrates to v4 only
+//!   through the collector-lock-capability path
 //! - future/foreign rejection untouched
 //! - missing-DB CLI (array/null) with args-validated-first
 //! - `current` unavailable without compositor + stable fake-socket snapshot
@@ -101,128 +101,7 @@ fn res_file(file: &str, cwd: &str, branch: Option<&str>, title: Option<&str>) ->
     r
 }
 
-// --- Migration ---
-
-fn create_v1_db(path: &Path, rows: Vec<(i64, &str, &str, DesktopContext)>) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let _ = std::fs::remove_file(path);
-    let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-         CREATE TABLE activity (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           observed_at_ms INTEGER NOT NULL,
-           kind TEXT NOT NULL,
-           source TEXT NOT NULL,
-           snapshot_json TEXT NOT NULL
-         );
-         CREATE INDEX idx_activity_time ON activity (observed_at_ms, id);
-         INSERT INTO schema_version (version) VALUES (1);",
-    )
-    .unwrap();
-    for (ts, kind, source, ctx) in rows {
-        let json = serde_json::to_string(&ctx).unwrap();
-        conn.execute(
-            "INSERT INTO activity (observed_at_ms, kind, source, snapshot_json) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![ts, kind, source, json],
-        )
-        .unwrap();
-    }
-    drop(conn);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-}
-
-#[test]
-fn migration_v1_preserves_rows_and_backfills() {
-    let dir = tmpdir("migrate");
-    let db = dir.join("activity.db");
-    let a_ctx = ctx_with(
-        1000,
-        "0x1",
-        "a",
-        Some(ResourceContext::new(
-            "neovim",
-            Some("/tmp/a.md"),
-            Some("/tmp"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )),
-        Some(proj(A_ID, "Alpha", "file")),
-    );
-    let b_ctx = ctx_with(2000, "0x2", "b", None, None);
-    // Legacy Phase-1 JSON: no resource/project keys at all.
-    let legacy: DesktopContext = serde_json::from_str(
-        r#"{"focused_window":{"id":"0x3","application":"kitty","title":"old"},"workspace":{"id":"1","name":"1"},"available":true,"source":"hyprland","observed_at_ms":3000}"#,
-    )
-    .unwrap();
-    create_v1_db(
-        &db,
-        vec![
-            (1000, "focus", "hyprland", a_ctx.clone()),
-            (2000, "focus", "hyprland", b_ctx.clone()),
-            (3000, "focus", "hyprland", legacy.clone()),
-        ],
-    );
-    // Writable open migrates transactionally.
-    let store = ActivityStore::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
-    // Rows preserved.
-    let all = store.recent_activity(10).unwrap();
-    assert_eq!(all.len(), 3);
-    assert_eq!(all[0].observed_at_ms, 3000);
-    // Backfilled association is immutable historical truth.
-    let for_a = store.recent_activity_for_project(A_ID, 10).unwrap();
-    assert_eq!(for_a.len(), 1);
-    assert_eq!(for_a[0].observed_at_ms, 1000);
-    assert_eq!(for_a[0].snapshot().unwrap(), a_ctx);
-    assert_eq!(for_a[0].project_id().as_deref(), Some(A_ID));
-    // Unknown project: empty.
-    assert!(store
-        .recent_activity_for_project(UNKNOWN_ID, 10)
-        .unwrap()
-        .is_empty());
-    // Index exists.
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let idx: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_activity_project'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(idx, 1, "v2 must have idx_activity_project");
-    // Appending after migration stores the column directly.
-    let new_ctx = ctx_with(
-        4000,
-        "0x4",
-        "c",
-        Some(ResourceContext::new(
-            "kitty",
-            None,
-            Some("/tmp"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )),
-        Some(proj(A_ID, "Alpha", "cwd")),
-    );
-    store.append("context", "hyprland", &new_ctx).unwrap();
-    let for_a2 = store.recent_activity_for_project(A_ID, 10).unwrap();
-    assert_eq!(for_a2.len(), 2);
-    assert_eq!(for_a2[0].observed_at_ms, 4000);
-    let _ = std::fs::remove_dir_all(&dir);
-}
+// --- Project queries ---
 
 #[test]
 fn project_queries_ordering_limits_filters() {
@@ -266,9 +145,7 @@ fn project_queries_ordering_limits_filters() {
     // Validation.
     assert!(store.recent_activity_for_project("not-a-uuid", 10).is_err());
     assert!(store.recent_activity_for_project(A_ID, 0).is_err());
-    assert!(store
-        .recent_activity_for_project(A_ID, 1001)
-        .is_err());
+    assert!(store.recent_activity_for_project(A_ID, 1001).is_err());
     assert!(store
         .activity_in_range_for_project(A_ID, 2000, 1000, 10)
         .is_err());
@@ -279,10 +156,7 @@ fn project_queries_ordering_limits_filters() {
     // UUID normalization: uppercase queries match lowercase storage.
     let upper = A_ID.to_uppercase();
     assert_eq!(
-        store
-            .recent_activity_for_project(&upper, 10)
-            .unwrap()
-            .len(),
+        store.recent_activity_for_project(&upper, 10).unwrap().len(),
         3
     );
     assert!(normalize_project_id(&upper).unwrap() == A_ID);
@@ -295,7 +169,13 @@ fn resources_dedup_ignores_branch_title() {
     let r1 = res_file("/tmp/a.md", "/tmp", Some("main"), Some("T1"));
     let r2 = res_file("/tmp/a.md", "/tmp", Some("feature"), Some("T2"));
     let c1 = ctx_with(1000, "0x1", "t", Some(r1), Some(proj(A_ID, "A", "file")));
-    let c2 = ctx_with(2000, "0x1", "t", Some(r2.clone()), Some(proj(A_ID, "A", "file")));
+    let c2 = ctx_with(
+        2000,
+        "0x1",
+        "t",
+        Some(r2.clone()),
+        Some(proj(A_ID, "A", "file")),
+    );
     // Different file.
     let c3 = ctx_with(
         1500,
@@ -366,21 +246,19 @@ fn resources_dedup_ignores_branch_title() {
     ] {
         store.append(k, "hyprland", &c).unwrap();
     }
-    let items = store
-        .recently_used_resources_for_project(A_ID, 20)
-        .unwrap();
+    let items = store.recently_used_resources_for_project(A_ID, 20).unwrap();
     // Priority keys: f:/tmp/a.md, f:/tmp/b.md, u:https://.., c:/tmp/work = 4.
     assert_eq!(items.len(), 4, "got {items:?}");
     // Newest-first by latest observation.
     assert_eq!(items[0].observed_at_ms, 2700);
     assert_eq!(items[0].resource.cwd.as_deref(), Some("/tmp/work"));
     assert_eq!(items[1].observed_at_ms, 2600);
-    assert_eq!(
-        items[1].resource.url.as_deref(),
-        Some("https://a.example/")
-    );
+    assert_eq!(items[1].resource.url.as_deref(), Some("https://a.example/"));
     // Branch-change file entry keeps the LATEST branch/title but counts once.
-    let file_entry = items.iter().find(|e| e.resource.file.as_deref() == Some("/tmp/a.md")).unwrap();
+    let file_entry = items
+        .iter()
+        .find(|e| e.resource.file.as_deref() == Some("/tmp/a.md"))
+        .unwrap();
     assert_eq!(file_entry.observed_at_ms, 2000);
     assert_eq!(file_entry.resource.git_branch.as_deref(), Some("feature"));
     // Limit truncates output (newest first).
@@ -393,7 +271,9 @@ fn resources_dedup_ignores_branch_title() {
         .unwrap()
         .is_empty());
     // Validation.
-    assert!(store.recently_used_resources_for_project("bad", 10).is_err());
+    assert!(store
+        .recently_used_resources_for_project("bad", 10)
+        .is_err());
     assert!(store.recently_used_resources_for_project(A_ID, 0).is_err());
 }
 
@@ -432,13 +312,21 @@ fn resources_priority_file_wins_over_cwd_and_early_stop() {
         .append(
             "context",
             "hyprland",
-            &ctx_with(2000, "0x1", "t", Some(new.clone()), Some(proj(A_ID, "A", "file"))),
+            &ctx_with(
+                2000,
+                "0x1",
+                "t",
+                Some(new.clone()),
+                Some(proj(A_ID, "A", "file")),
+            ),
         )
         .unwrap();
-    let items = store
-        .recently_used_resources_for_project(A_ID, 10)
-        .unwrap();
-    assert_eq!(items.len(), 1, "same file+cwd change must not duplicate: {items:?}");
+    let items = store.recently_used_resources_for_project(A_ID, 10).unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "same file+cwd change must not duplicate: {items:?}"
+    );
     assert_eq!(items[0].observed_at_ms, 2000);
     assert_eq!(items[0].resource.file.as_deref(), Some("/tmp/a.md"));
     // Latest metadata carried (cwd/branch/title from newest row).
@@ -465,7 +353,13 @@ fn resources_priority_file_wins_over_cwd_and_early_stop() {
             .append(
                 "focus",
                 "hyprland",
-                &ctx_with(*ts, &format!("0x{i}"), "t", Some(r), Some(proj(A_ID, "A", "file"))),
+                &ctx_with(
+                    *ts,
+                    &format!("0x{i}"),
+                    "t",
+                    Some(r),
+                    Some(proj(A_ID, "A", "file")),
+                ),
             )
             .unwrap();
     }
@@ -489,9 +383,7 @@ fn resources_priority_file_wins_over_cwd_and_early_stop() {
             )
             .unwrap();
     }
-    let lim = store2
-        .recently_used_resources_for_project(A_ID, 2)
-        .unwrap();
+    let lim = store2.recently_used_resources_for_project(A_ID, 2).unwrap();
     assert_eq!(lim.len(), 2);
     // Newest-first distinct keys; streaming stops once 2 are found.
     assert_eq!(lim[0].observed_at_ms, 5000);
@@ -501,64 +393,32 @@ fn resources_priority_file_wins_over_cwd_and_early_stop() {
 }
 
 #[test]
-fn old_db_readonly_unchanged_and_compatible() {
-    let dir = tmpdir("readonly-v1");
-    let db = dir.join("activity.db");
-    let a_ctx = ctx_with(
-        1000,
-        "0x1",
-        "a",
-        Some(ResourceContext::new(
-            "neovim",
-            Some("/tmp/a.md"),
-            Some("/tmp"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )),
-        Some(proj(A_ID, "Alpha", "file")),
-    );
-    create_v1_db(&db, vec![(1000, "focus", "hyprland", a_ctx.clone())]);
-    // Ensure WAL sidecars from creation are checkpointed away so byte
-    // comparison is stable (raw connection may leave journal mode default).
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+fn pre_v3_shapes_rejected_unchanged() {
+    // Coherent pre-v3 databases (exact v1 shape + version 1, exact v2
+    // shape + version 2) reject on both opens with no mutation: there is
+    // no migration and no read-only compatibility for older schemas.
+    // (Mismatched version/shape pairings are covered separately by
+    // `strict_version_shape_mismatch_rejects` below.)
+    let v1_setup = "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); INSERT INTO schema_version (version) VALUES (1); INSERT INTO activity (observed_at_ms, kind, source, snapshot_json) VALUES (1000, 'focus', 'hyprland', '{}');";
+    let v2_setup = "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2); INSERT INTO activity (observed_at_ms, kind, source, snapshot_json, project_id) VALUES (1000, 'focus', 'hyprland', '{}', NULL);";
+    for (tag, setup) in [("v1-coherent", v1_setup), ("v2-coherent", v2_setup)] {
+        let dir = tmpdir(&format!("prev3-reject-{tag}"));
+        let db = dir.join("activity.db");
+        raw_db(&db, setup);
+        assert_both_reject_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    let before = std::fs::read(&db).unwrap();
-    let ro = ActivityStore::open_read_only(&db).unwrap();
-    assert_eq!(ro.schema_version().unwrap(), 1);
-    // Project queries work via json_extract fallback.
-    let rows = ro.recent_activity_for_project(A_ID, 10).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].snapshot().unwrap(), a_ctx);
-    let last = ro.last_activity_for_project(A_ID).unwrap().unwrap();
-    assert_eq!(last.id, rows[0].id);
-    let res = ro.recently_used_resources_for_project(A_ID, 10).unwrap();
-    assert_eq!(res.len(), 1);
-    assert_eq!(res[0].resource.file.as_deref(), Some("/tmp/a.md"));
-    // Writes through read-only handle fail.
-    assert!(ro.append("focus", "hyprland", &a_ctx).is_err());
-    let after = std::fs::read(&db).unwrap();
-    assert_eq!(before, after, "v1 read-only must not mutate");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn future_and_foreign_rejected_unchanged_v2() {
-    let dir = tmpdir("future-v2");
+fn future_and_foreign_rejected_unchanged() {
+    let dir = tmpdir("future-v3");
     let db = dir.join("activity.db");
     {
         let store = ActivityStore::open(&db).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 4);
         store
-            .append(
-                "focus",
-                "hyprland",
-                &ctx_with(7, "0x1", "t", None, None),
-            )
+            .append("focus", "hyprland", &ctx_with(7, "0x1", "t", None, None))
             .unwrap();
     }
     {
@@ -581,8 +441,10 @@ fn future_and_foreign_rejected_unchanged_v2() {
     let fdb = dir.join("foreign.db");
     {
         let conn = rusqlite::Connection::open(&fdb).unwrap();
-        conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY); INSERT INTO other VALUES (1);")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE other (id INTEGER PRIMARY KEY); INSERT INTO other VALUES (1);",
+        )
+        .unwrap();
     }
     #[cfg(unix)]
     {
@@ -634,9 +496,30 @@ fn assert_both_reject_unchanged(path: &Path) {
     assert_eq!(before, after, "rejected DB must be byte-unchanged");
 }
 
-fn legit_v2_db(path: &Path) {
+/// Deep data incoherence (provenance/projection rows): writable opens keep
+/// the exact rejection, while read-only opens succeed by design — the
+/// read-only query-performance contract validates structure plus cheap
+/// singleton/version/device metadata only, never full-history scans. Either
+/// way nothing is mutated; rows touched later still validate via parsers.
+fn assert_writable_rejects_readonly_opens_unchanged(path: &Path) {
+    use qs_agent_orchestrator::desktop_store::StoreError;
+    let before = std::fs::read(path).unwrap();
+    match ActivityStore::open(path) {
+        Err(StoreError::IncompatibleSchema(_)) => {}
+        Err(e) => panic!("writable open must reject IncompatibleSchema, got {e:?}"),
+        Ok(_) => panic!("writable open must reject corrupt data"),
+    }
+    let ro = ActivityStore::open_read_only(path)
+        .expect("read-only lightweight contract opens deep incoherence");
+    assert_eq!(ro.schema_version().unwrap(), 4);
+    drop(ro);
+    let after = std::fs::read(path).unwrap();
+    assert_eq!(before, after, "unmutated DB must be byte-unchanged");
+}
+
+fn legit_v3_db_minimal(path: &Path) {
     let store = ActivityStore::open(path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 4);
     store
         .append("focus", "hyprland", &ctx_with(1, "0x1", "t", None, None))
         .unwrap();
@@ -651,41 +534,57 @@ fn legit_v2_db(path: &Path) {
 
 #[test]
 fn strict_rejects_extra_objects_with_expected_names() {
-    // Each subcase starts from a legitimate v2 DB plus exactly one foreign
+    // Each subcase starts from a legitimate v3 DB plus exactly one foreign
     // object; both opens must reject IncompatibleSchema with no mutation.
     let cases: Vec<(&str, Box<dyn Fn(&Path)>)> = vec![
-        ("extra-table", Box::new(|db: &Path| {
-            let c = rusqlite::Connection::open(db).unwrap();
-            c.execute_batch("CREATE TABLE evil (id INTEGER PRIMARY KEY);").unwrap();
-        })),
-        ("extra-view", Box::new(|db: &Path| {
-            let c = rusqlite::Connection::open(db).unwrap();
-            c.execute_batch("CREATE VIEW v AS SELECT 1 AS x;").unwrap();
-        })),
-        ("extra-trigger", Box::new(|db: &Path| {
-            let c = rusqlite::Connection::open(db).unwrap();
-            c.execute_batch(
-                "CREATE TRIGGER trg AFTER INSERT ON activity BEGIN SELECT 1; END;",
-            )
-            .unwrap();
-        })),
-        ("extra-index", Box::new(|db: &Path| {
-            let c = rusqlite::Connection::open(db).unwrap();
-            c.execute_batch("CREATE INDEX idx_evil ON activity (observed_at_ms);")
+        (
+            "extra-table",
+            Box::new(|db: &Path| {
+                let c = rusqlite::Connection::open(db).unwrap();
+                c.execute_batch("CREATE TABLE evil (id INTEGER PRIMARY KEY);")
+                    .unwrap();
+            }),
+        ),
+        (
+            "extra-view",
+            Box::new(|db: &Path| {
+                let c = rusqlite::Connection::open(db).unwrap();
+                c.execute_batch("CREATE VIEW v AS SELECT 1 AS x;").unwrap();
+            }),
+        ),
+        (
+            "extra-trigger",
+            Box::new(|db: &Path| {
+                let c = rusqlite::Connection::open(db).unwrap();
+                c.execute_batch("CREATE TRIGGER trg AFTER INSERT ON activity BEGIN SELECT 1; END;")
+                    .unwrap();
+            }),
+        ),
+        (
+            "extra-index",
+            Box::new(|db: &Path| {
+                let c = rusqlite::Connection::open(db).unwrap();
+                c.execute_batch("CREATE INDEX idx_evil ON activity (observed_at_ms);")
+                    .unwrap();
+            }),
+        ),
+        (
+            "expected-plus-unrelated",
+            Box::new(|db: &Path| {
+                // Both expected tables present plus an unrelated table:
+                // strict object whitelisting must reject.
+                let c = rusqlite::Connection::open(db).unwrap();
+                c.execute_batch(
+                    "CREATE TABLE other (id INTEGER PRIMARY KEY); INSERT INTO other VALUES (1);",
+                )
                 .unwrap();
-        })),
-        ("expected-plus-unrelated", Box::new(|db: &Path| {
-            // Both expected tables present plus an unrelated table: the old
-            // name/version check would have migrated; strict must reject.
-            let c = rusqlite::Connection::open(db).unwrap();
-            c.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY); INSERT INTO other VALUES (1);")
-                .unwrap();
-        })),
+            }),
+        ),
     ];
     for (tag, add) in cases {
         let dir = tmpdir(&format!("strict-extra-{tag}"));
         let db = dir.join("activity.db");
-        legit_v2_db(&db);
+        legit_v3_db_minimal(&db);
         add(&db);
         chmod_0600(&db);
         assert_both_reject_unchanged(&db);
@@ -695,23 +594,29 @@ fn strict_rejects_extra_objects_with_expected_names() {
 
 #[test]
 fn strict_rejects_malformed_expected_tables() {
-    // Each DDL keeps expected names/version but breaks structure.
-    let v2_good_cols = "id INTEGER PRIMARY KEY AUTOINCREMENT,
+    // Each DDL keeps expected names/version (3) but breaks structure.
+    let v3_good_cols = "id INTEGER PRIMARY KEY AUTOINCREMENT,
             observed_at_ms INTEGER NOT NULL,
             kind TEXT NOT NULL,
             source TEXT NOT NULL,
             snapshot_json TEXT NOT NULL,
-            project_id TEXT";
+            project_id TEXT,
+            event_id TEXT,
+            device_id TEXT,
+            session_id TEXT";
+    // Full 9-column v3 activity in every case; exactly one structural defect each.
+    let tail = ", event_id TEXT, device_id TEXT, session_id TEXT";
     let cases: Vec<(&str, String)> = vec![
-        ("kind-nullable", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("kind-wrong-type", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind INTEGER NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("extra-column", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v2_good_cols}, extra TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("reordered-columns", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (observed_at_ms INTEGER NOT NULL, id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("project-id-wrong-type", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id INTEGER); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("project-id-not-null", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT NOT NULL); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("project-id-default", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT DEFAULT 'x'); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("schema-version-extra-col", "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, extra TEXT); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version, extra) VALUES (2, NULL);".to_string()),
-        ("schema-version-wrong-type", "CREATE TABLE schema_version (version TEXT PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES ('2');".to_string()),
+        ("kind-nullable", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT{tail}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("kind-wrong-type", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind INTEGER NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT{tail}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("extra-column", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v3_good_cols}, extra TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("reordered-columns", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (observed_at_ms INTEGER NOT NULL, id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT{tail}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("project-id-wrong-type", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id INTEGER{tail}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("project-id-not-null", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT NOT NULL{tail}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("project-id-default", format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT DEFAULT 'x'{tail}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);")),
+        ("session-id-missing", "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT, event_id TEXT, device_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);".to_string()),
+        ("schema-version-extra-col", "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, extra TEXT); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT, event_id TEXT, device_id TEXT, session_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version, extra) VALUES (3, NULL);".to_string()),
+        ("schema-version-wrong-type", "CREATE TABLE schema_version (version TEXT PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT, event_id TEXT, device_id TEXT, session_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES ('3');".to_string()),
     ];
     for (tag, setup) in cases {
         let dir = tmpdir(&format!("strict-malformed-{tag}"));
@@ -723,9 +628,12 @@ fn strict_rejects_malformed_expected_tables() {
 }
 
 #[test]
-fn strict_project_id_detection_is_structural() {
-    // SQL comment mentioning project_id must not fool detection: no real
-    // column => legitimate v1, migrates to v2 on writable open.
+fn strict_activity_shape_detection_is_structural() {
+    // Shape detection is structural via PRAGMA table_info: SQL comments or
+    // lookalike identifiers never count as the v3 provenance columns, and a
+    // wrong-typed provenance column rejects even though the name matches.
+    // (Coherent pre-v3 version/shape pairings are covered by
+    // `pre_v3_shapes_rejected_unchanged` and `strict_version_shape_mismatch_rejects`.)
     {
         let dir = tmpdir("strict-comment");
         let db = dir.join("activity.db");
@@ -737,21 +645,19 @@ fn strict_project_id_detection_is_structural() {
                observed_at_ms INTEGER NOT NULL,
                kind TEXT NOT NULL,
                source TEXT NOT NULL,
-               snapshot_json TEXT NOT NULL -- project_id
+               snapshot_json TEXT NOT NULL,
+               project_id TEXT,
+               event_id TEXT,
+               device_id TEXT -- session_id
              );
              CREATE INDEX idx_activity_time ON activity (observed_at_ms, id);
-             INSERT INTO schema_version (version) VALUES (1);",
+             CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id);
+             INSERT INTO schema_version (version) VALUES (3);",
         );
-        // Read-only sees v1 (fallback) and accepts.
-        let ro = ActivityStore::open_read_only(&db).unwrap();
-        assert_eq!(ro.schema_version().unwrap(), 1);
-        drop(ro);
-        // Writable migrates (adds the real column) and bumps to v2.
-        let store = ActivityStore::open(&db).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_both_reject_unchanged(&db);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    // Lookalike identifier without the exact column is malformed, not v2.
+    // Lookalike identifier without the exact column is malformed, not v3.
     {
         let dir = tmpdir("strict-lookalike");
         let db = dir.join("activity.db");
@@ -764,15 +670,19 @@ fn strict_project_id_detection_is_structural() {
                kind TEXT NOT NULL,
                source TEXT NOT NULL,
                snapshot_json TEXT NOT NULL,
-               project_id_fake TEXT
+               project_id TEXT,
+               event_id TEXT,
+               device_id TEXT,
+               session_id_fake TEXT
              );
              CREATE INDEX idx_activity_time ON activity (observed_at_ms, id);
-             INSERT INTO schema_version (version) VALUES (2);",
+             CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id);
+             INSERT INTO schema_version (version) VALUES (3);",
         );
         assert_both_reject_unchanged(&db);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    // Wrong-typed project_id column rejects even though the name matches.
+    // Wrong-typed session_id column rejects even though the name matches.
     {
         let dir = tmpdir("strict-wrongtype-col");
         let db = dir.join("activity.db");
@@ -785,11 +695,14 @@ fn strict_project_id_detection_is_structural() {
                kind TEXT NOT NULL,
                source TEXT NOT NULL,
                snapshot_json TEXT NOT NULL,
-               project_id INTEGER
+               project_id TEXT,
+               event_id TEXT,
+               device_id TEXT,
+               session_id INTEGER
              );
              CREATE INDEX idx_activity_time ON activity (observed_at_ms, id);
              CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id);
-             INSERT INTO schema_version (version) VALUES (2);",
+             INSERT INTO schema_version (version) VALUES (3);",
         );
         assert_both_reject_unchanged(&db);
         let _ = std::fs::remove_dir_all(&dir);
@@ -815,7 +728,7 @@ fn strict_rejects_same_name_wrong_index_and_allows_missing() {
     ] {
         let dir = tmpdir(&format!("strict-idx-{tag}"));
         let db = dir.join("activity.db");
-        legit_v2_db(&db);
+        legit_v3_db_minimal(&db);
         {
             let c = rusqlite::Connection::open(&db).unwrap();
             if tag.starts_with("project") {
@@ -829,22 +742,22 @@ fn strict_rejects_same_name_wrong_index_and_allows_missing() {
         assert_both_reject_unchanged(&db);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    // Missing project index on an otherwise legitimate v2 DB: read-only
+    // Missing project index on an otherwise legitimate v3 DB: read-only
     // accepts (fallback still correct), writable recreates it.
     {
         let dir = tmpdir("strict-idx-missing-ok");
         let db = dir.join("activity.db");
-        legit_v2_db(&db);
+        legit_v3_db_minimal(&db);
         {
             let c = rusqlite::Connection::open(&db).unwrap();
             c.execute_batch("DROP INDEX idx_activity_project;").unwrap();
         }
         chmod_0600(&db);
         let ro = ActivityStore::open_read_only(&db).unwrap();
-        assert_eq!(ro.schema_version().unwrap(), 2);
+        assert_eq!(ro.schema_version().unwrap(), 4);
         drop(ro);
         let store = ActivityStore::open(&db).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 4);
         let c = rusqlite::Connection::open(&db).unwrap();
         let n: i64 = c
             .query_row(
@@ -865,14 +778,18 @@ fn strict_rejects_hidden_index_constraints() {
     // repeat appends fail. Partial / UNIQUE / DESC / NOCASE variants of the
     // named indexes pass column-order checks alone but break indexed-query
     // assumptions. All must reject on both opens with no mutation.
-    let good_v2 = "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT);";
-    let good_idx = "CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id);";
+    // Complete v3 databases (all tables/indexes, version 3, one device row)
+    // so the injected hidden constraint is the only defect: object/index
+    // validation runs before data validation and must reject each case.
+    let good_v3 = "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT, event_id TEXT, device_id TEXT, session_id TEXT); CREATE TABLE device_info (device_id TEXT PRIMARY KEY); CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, first_activity_id INTEGER NOT NULL, last_activity_id INTEGER NOT NULL, event_count INTEGER NOT NULL, status TEXT NOT NULL, ended_reason TEXT, gap_ms INTEGER NOT NULL, interruption_ms INTEGER NOT NULL, device_id TEXT NOT NULL, unresolved_start_ms INTEGER, applications_json TEXT NOT NULL); CREATE TABLE session_resources (session_id TEXT NOT NULL, resource_key TEXT NOT NULL, kind TEXT NOT NULL, portable_identity TEXT, local_identity TEXT, latest_resource_json TEXT NOT NULL, occurrence_count INTEGER NOT NULL, first_seen_ms INTEGER NOT NULL, last_seen_ms INTEGER NOT NULL, first_activity_id INTEGER NOT NULL, last_activity_id INTEGER NOT NULL, PRIMARY KEY (session_id, resource_key));";
+    let good_idx = "CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); CREATE UNIQUE INDEX idx_activity_event_id ON activity (event_id); CREATE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id); CREATE INDEX idx_sessions_time ON sessions (end_ms, start_ms, session_id); CREATE INDEX idx_sessions_project ON sessions (project_id, end_ms, start_ms, session_id); CREATE INDEX idx_session_resources_seen ON session_resources (session_id, last_seen_ms, resource_key);";
+    let good_tail = "INSERT INTO schema_version (version) VALUES (3); INSERT INTO device_info (device_id) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');";
     let cases: Vec<(&str, String)> = vec![
-        ("unique-kind-column", format!("{good_v2} {good_idx} INSERT INTO schema_version (version) VALUES (2);").replace("kind TEXT NOT NULL,", "kind TEXT NOT NULL UNIQUE,")),
-        ("unique-named-index", format!("{good_v2} CREATE UNIQUE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
-        ("partial-project-index", format!("{good_v2} CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id) WHERE kind='focus'; INSERT INTO schema_version (version) VALUES (2);")),
-        ("desc-project-index", format!("{good_v2} CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id DESC); INSERT INTO schema_version (version) VALUES (2);")),
-        ("nocase-time-index", format!("{good_v2} CREATE INDEX idx_activity_time ON activity (observed_at_ms COLLATE NOCASE, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);")),
+        ("unique-kind-column", format!("{good_v3} {good_idx} {good_tail}").replace("kind TEXT NOT NULL,", "kind TEXT NOT NULL UNIQUE,")),
+        ("unique-named-index", format!("{good_v3} CREATE UNIQUE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); CREATE UNIQUE INDEX idx_activity_event_id ON activity (event_id); CREATE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id); CREATE INDEX idx_sessions_time ON sessions (end_ms, start_ms, session_id); CREATE INDEX idx_sessions_project ON sessions (project_id, end_ms, start_ms, session_id); CREATE INDEX idx_session_resources_seen ON session_resources (session_id, last_seen_ms, resource_key); {good_tail}")),
+        ("partial-project-index", format!("{good_v3} CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id) WHERE kind='focus'; CREATE UNIQUE INDEX idx_activity_event_id ON activity (event_id); CREATE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id); CREATE INDEX idx_sessions_time ON sessions (end_ms, start_ms, session_id); CREATE INDEX idx_sessions_project ON sessions (project_id, end_ms, start_ms, session_id); CREATE INDEX idx_session_resources_seen ON session_resources (session_id, last_seen_ms, resource_key); {good_tail}")),
+        ("desc-project-index", format!("{good_v3} CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id DESC); CREATE UNIQUE INDEX idx_activity_event_id ON activity (event_id); CREATE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id); CREATE INDEX idx_sessions_time ON sessions (end_ms, start_ms, session_id); CREATE INDEX idx_sessions_project ON sessions (project_id, end_ms, start_ms, session_id); CREATE INDEX idx_session_resources_seen ON session_resources (session_id, last_seen_ms, resource_key); {good_tail}")),
+        ("nocase-time-index", format!("{good_v3} CREATE INDEX idx_activity_time ON activity (observed_at_ms COLLATE NOCASE, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); CREATE UNIQUE INDEX idx_activity_event_id ON activity (event_id); CREATE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id); CREATE INDEX idx_sessions_time ON sessions (end_ms, start_ms, session_id); CREATE INDEX idx_sessions_project ON sessions (project_id, end_ms, start_ms, session_id); CREATE INDEX idx_session_resources_seen ON session_resources (session_id, last_seen_ms, resource_key); {good_tail}")),
     ];
     for (tag, setup) in cases {
         let dir = tmpdir(&format!("strict-hidden-{tag}"));
@@ -888,7 +805,7 @@ fn strict_rejects_hidden_index_constraints() {
         let db = dir.join("activity.db");
         raw_db(
             &db,
-            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL UNIQUE, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);",
+"CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL UNIQUE, source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT, event_id TEXT, device_id TEXT, session_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);",
         );
         let c = rusqlite::Connection::open(&db).unwrap();
         c.execute(
@@ -917,7 +834,7 @@ fn strict_rejects_check_constraints() {
     let db = dir.join("activity.db");
     raw_db(
         &db,
-        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL CHECK(length(kind) > 0), source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);",
+"CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL, kind TEXT NOT NULL CHECK(length(kind) > 0), source TEXT NOT NULL, snapshot_json TEXT NOT NULL, project_id TEXT, event_id TEXT, device_id TEXT, session_id TEXT); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (3);",
     );
     assert_both_reject_unchanged(&db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -956,10 +873,7 @@ fn append_normalizes_project_uuid_consistently() {
         "stored snapshot must project lowercase"
     );
     assert_eq!(
-        store
-            .recent_activity_for_project(&upper, 10)
-            .unwrap()
-            .len(),
+        store.recent_activity_for_project(&upper, 10).unwrap().len(),
         1
     );
     // Invalid (non-UUID) project ids fail closed with nothing persisted.
@@ -1016,13 +930,19 @@ fn cli_missing_db_validated_first() {
         &[],
     );
     assert_eq!(code, 0, "missing DB history must exit 0");
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&stdout).unwrap(), serde_json::json!([]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap(),
+        serde_json::json!([])
+    );
     let (code, stdout, _) = run_bin(&["--db", &m, "last-activity", "--project", A_ID], &[], &[]);
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "null");
     let (code, stdout, _) = run_bin(&["--db", &m, "resources", "--project", A_ID], &[], &[]);
     assert_eq!(code, 0);
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&stdout).unwrap(), serde_json::json!([]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap(),
+        serde_json::json!([])
+    );
     // Invalid args must fail even when DB is missing (validate first).
     let (code, _, _) = run_bin(&["--db", &m, "history", "--project", "bad-id"], &[], &[]);
     assert_ne!(code, 0, "bad UUID must fail before missing-DB fast path");
@@ -1034,7 +954,11 @@ fn cli_missing_db_validated_first() {
     assert_ne!(code, 0);
     let (code, _, _) = run_bin(&["--db", &m, "last-activity", "--project", "bad"], &[], &[]);
     assert_ne!(code, 0);
-    let (code, _, _) = run_bin(&["--db", &m, "resources", "--project", A_ID, "--limit", "0"], &[], &[]);
+    let (code, _, _) = run_bin(
+        &["--db", &m, "resources", "--project", A_ID, "--limit", "0"],
+        &[],
+        &[],
+    );
     assert_ne!(code, 0);
     // Missing required --project.
     let (code, _, _) = run_bin(&["--db", &m, "last-activity"], &[], &[]);
@@ -1086,7 +1010,11 @@ fn cli_history_project_and_resources_shapes() {
     store.append("context", "hyprland", &a2).unwrap();
     drop(store);
     // history --project: existing row shape.
-    let (code, stdout, _) = run_bin(&["--db", &m, "history", "--project", A_ID, "--limit", "10"], &[], &[]);
+    let (code, stdout, _) = run_bin(
+        &["--db", &m, "history", "--project", A_ID, "--limit", "10"],
+        &[],
+        &[],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let arr = v.as_array().unwrap();
@@ -1101,7 +1029,17 @@ fn cli_history_project_and_resources_shapes() {
     assert_eq!(arr[0]["observed_at_ms"], 2000);
     // history --project with range (supported combination).
     let (code, stdout, _) = run_bin(
-        &["--db", &m, "history", "--project", A_ID, "--from", "0", "--to", "1500"],
+        &[
+            "--db",
+            &m,
+            "history",
+            "--project",
+            A_ID,
+            "--from",
+            "0",
+            "--to",
+            "1500",
+        ],
         &[],
         &[],
     );
@@ -1113,7 +1051,11 @@ fn cli_history_project_and_resources_shapes() {
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(v["observed_at_ms"], 2000);
-    let (code, stdout, _) = run_bin(&["--db", &m, "last-activity", "--project", UNKNOWN_ID], &[], &[]);
+    let (code, stdout, _) = run_bin(
+        &["--db", &m, "last-activity", "--project", UNKNOWN_ID],
+        &[],
+        &[],
+    );
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "null");
     // resources: dedup branch change => one entry for /tmp/a.md.
@@ -1177,8 +1119,7 @@ fn spawn_fake_hypr(
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    static FAKE_SIG_CTR: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static FAKE_SIG_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = FAKE_SIG_CTR.fetch_add(1, Ordering::SeqCst);
     let sig = format!("fakesig{}-{n}", std::process::id());
     let dir = base.join("hypr").join(&sig);
@@ -1248,14 +1189,19 @@ fn cli_current_race_rejects_stale_on_recheck_switch() {
     let dir = tmpdir("current-race");
     let rt_base = dir.join("rt");
     std::fs::create_dir_all(&rt_base).unwrap();
-    let win_a = r#"{"address":"0x1","class":"kitty","title":"stable","workspace":{"id":1,"name":"1"}}"#;
+    let win_a =
+        r#"{"address":"0x1","class":"kitty","title":"stable","workspace":{"id":1,"name":"1"}}"#;
     let ws_a = r#"{"id":1,"name":"1"}"#;
-    let win_b = r#"{"address":"0x2","class":"kitty","title":"moved","workspace":{"id":1,"name":"1"}}"#;
+    let win_b =
+        r#"{"address":"0x2","class":"kitty","title":"moved","workspace":{"id":1,"name":"1"}}"#;
     let fake = spawn_fake_hypr(&rt_base, win_a, ws_a, win_b, ws_a, 4);
     let rt = rt_base.to_string_lossy().to_string();
     let sig = fake.sig.clone();
     // Empty registry (missing file => no projects, no Python spawn).
-    let missing_reg = dir.join("missing-projects.toml").to_string_lossy().to_string();
+    let missing_reg = dir
+        .join("missing-projects.toml")
+        .to_string_lossy()
+        .to_string();
     let (code, stdout, stderr) = run_bin(
         &["current"],
         &[
@@ -1263,7 +1209,12 @@ fn cli_current_race_rejects_stale_on_recheck_switch() {
             ("HYPRLAND_INSTANCE_SIGNATURE", sig.as_str()),
             ("QUICKSHELL_PROJECTS_FILE", missing_reg.as_str()),
         ],
-        &["QS_KITTY_SOCKET", "KITTY_LISTEN_ON", "QS_NVIM_CONTEXT_DIR", "QS_ZEN_CONTEXT_FILE"],
+        &[
+            "QS_KITTY_SOCKET",
+            "KITTY_LISTEN_ON",
+            "QS_NVIM_CONTEXT_DIR",
+            "QS_ZEN_CONTEXT_FILE",
+        ],
     );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -1419,11 +1370,11 @@ fn cli_current_project_positive_neovim() {
     assert_eq!(v["project"]["name"], want_name.as_str());
     assert_eq!(v["project"]["matched_by"], "file");
 
-    let (code, stdout, stderr) = run_bin(&["current-project"], &env_refs, &[
-        "QS_KITTY_SOCKET",
-        "KITTY_LISTEN_ON",
-        "QS_ZEN_CONTEXT_FILE",
-    ]);
+    let (code, stdout, stderr) = run_bin(
+        &["current-project"],
+        &env_refs,
+        &["QS_KITTY_SOCKET", "KITTY_LISTEN_ON", "QS_ZEN_CONTEXT_FILE"],
+    );
     assert_eq!(code, 0, "positive current-project must succeed: {stderr}");
     let p: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(p["id"], want_id.as_str());
@@ -1432,10 +1383,625 @@ fn cli_current_project_positive_neovim() {
 
     // `current` creates no DB anywhere near the scratch state dir.
     assert!(
-        !state.join("quickshell/desktop-activity/activity.db").exists()
+        !state
+            .join("quickshell/desktop-activity/activity.db")
+            .exists()
             && !dir.join("activity.db").exists(),
         "current must not create a DB"
     );
     drop(fake);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- Strict v3 coherence tests ---
+
+/// Legitimate v3 database with two sessions (projects A then B),
+/// checkpointed for stable byte comparison. Returns the device id.
+fn legit_v3_db(path: &Path) -> String {
+    let store = ActivityStore::open(path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 4);
+    store
+        .append(
+            "focus",
+            "hyprland",
+            &ctx_with(1000, "0x1", "a", None, Some(proj(A_ID, "Alpha", "file"))),
+        )
+        .unwrap();
+    store
+        .append(
+            "focus",
+            "hyprland",
+            &ctx_with(2000, "0x2", "b", None, Some(proj(B_ID, "Beta", "file"))),
+        )
+        .unwrap();
+    let dev = store.device_id().unwrap();
+    drop(store);
+    {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    chmod_0600(path);
+    dev
+}
+
+fn mutate_v3_db(path: &Path, sql: &str) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(sql).unwrap();
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    drop(conn);
+    chmod_0600(path);
+}
+
+#[test]
+fn strict_v3_rejects_wrong_uniqueness() {
+    // The event index MUST be unique; ordinary indexes MUST NOT be.
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "event-nonunique",
+            "DROP INDEX idx_activity_event_id; CREATE INDEX idx_activity_event_id ON activity (event_id);",
+        ),
+        (
+            "time-unique",
+            "DROP INDEX idx_activity_time; CREATE UNIQUE INDEX idx_activity_time ON activity (observed_at_ms, id);",
+        ),
+        (
+            "session-unique",
+            "DROP INDEX idx_activity_session; CREATE UNIQUE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id);",
+        ),
+    ];
+    for (tag, ddl) in cases {
+        let dir = tmpdir(&format!("strict-v3uniq-{tag}"));
+        let db = dir.join("activity.db");
+        legit_v3_db(&db);
+        mutate_v3_db(&db, ddl);
+        assert_both_reject_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn strict_v3_rejects_wrong_table_index() {
+    // An allowlisted NAME on the wrong table rejects (ownership is exact).
+    let dir = tmpdir("strict-v3wrongtbl");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(
+        &db,
+        "DROP INDEX idx_activity_time; CREATE INDEX idx_activity_time ON sessions (end_ms, start_ms, session_id);",
+    );
+    assert_both_reject_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_pk_nocase_collation() {
+    // A PK autoindex with non-BINARY collation rejects, even though the
+    // table shape itself is structurally valid.
+    let dir = tmpdir("strict-v3pkcoll");
+    let db = dir.join("activity.db");
+    raw_db(
+        &db,
+        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+         CREATE TABLE activity (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           observed_at_ms INTEGER NOT NULL,
+           kind TEXT NOT NULL,
+           source TEXT NOT NULL,
+           snapshot_json TEXT NOT NULL,
+           project_id TEXT,
+           event_id TEXT,
+           device_id TEXT,
+           session_id TEXT
+         );
+         CREATE TABLE device_info (device_id TEXT PRIMARY KEY);
+         CREATE TABLE sessions (
+           session_id TEXT PRIMARY KEY COLLATE NOCASE,
+           project_id TEXT,
+           project_name TEXT,
+           start_ms INTEGER NOT NULL,
+           end_ms INTEGER NOT NULL,
+           first_activity_id INTEGER NOT NULL,
+           last_activity_id INTEGER NOT NULL,
+           event_count INTEGER NOT NULL,
+           status TEXT NOT NULL,
+           ended_reason TEXT,
+           gap_ms INTEGER NOT NULL,
+           interruption_ms INTEGER NOT NULL,
+           device_id TEXT NOT NULL,
+           unresolved_start_ms INTEGER,
+           applications_json TEXT NOT NULL
+         );
+         CREATE TABLE session_resources (
+           session_id TEXT NOT NULL,
+           resource_key TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           portable_identity TEXT,
+           local_identity TEXT,
+           latest_resource_json TEXT NOT NULL,
+           occurrence_count INTEGER NOT NULL,
+           first_seen_ms INTEGER NOT NULL,
+           last_seen_ms INTEGER NOT NULL,
+           first_activity_id INTEGER NOT NULL,
+           last_activity_id INTEGER NOT NULL,
+           PRIMARY KEY (session_id, resource_key)
+         );
+         CREATE INDEX idx_activity_time ON activity (observed_at_ms, id);
+         CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id);
+         CREATE UNIQUE INDEX idx_activity_event_id ON activity (event_id);
+         CREATE INDEX idx_activity_session ON activity (session_id, observed_at_ms, id);
+         CREATE INDEX idx_sessions_time ON sessions (end_ms, start_ms, session_id);
+         CREATE INDEX idx_sessions_project ON sessions (project_id, end_ms, start_ms, session_id);
+         CREATE INDEX idx_session_resources_seen ON session_resources (session_id, last_seen_ms, resource_key);
+         INSERT INTO schema_version (version) VALUES (3);
+         INSERT INTO device_info (device_id) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');",
+    );
+    assert_both_reject_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_null_provenance() {
+    for col in ["event_id", "device_id", "session_id"] {
+        let dir = tmpdir(&format!("strict-v3null-{col}"));
+        let db = dir.join("activity.db");
+        legit_v3_db(&db);
+        mutate_v3_db(&db, &format!("UPDATE activity SET {col} = NULL;"));
+        assert_writable_rejects_readonly_opens_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn strict_v3_rejects_missing_sessions_table() {
+    let dir = tmpdir("strict-v3nosess");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(&db, "DROP TABLE sessions;");
+    assert_both_reject_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_device_mismatch() {
+    let dir = tmpdir("strict-v3devmismatch");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(
+        &db,
+        "UPDATE activity SET device_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';",
+    );
+    assert_writable_rejects_readonly_opens_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_dangling_session_ref() {
+    let dir = tmpdir("strict-v3dangling");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(
+        &db,
+        "UPDATE activity SET session_id = 'cccccccccccccccccccccccccccccccc';",
+    );
+    assert_writable_rejects_readonly_opens_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_empty_projection() {
+    let dir = tmpdir("strict-v3emptyproj");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(&db, "DELETE FROM sessions; DELETE FROM session_resources;");
+    assert_writable_rejects_readonly_opens_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_malformed_event_hex() {
+    let dir = tmpdir("strict-v3badhex");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(
+        &db,
+        "UPDATE activity SET event_id = 'not-hex-at-all' WHERE observed_at_ms = 1000;",
+    );
+    assert_writable_rejects_readonly_opens_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_rejects_noncanonical_uppercase_provenance() {
+    let dir = tmpdir("strict-v3uppercase");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(
+        &db,
+        "UPDATE device_info SET device_id = upper(device_id);
+         UPDATE sessions SET device_id = upper(device_id), session_id = upper(session_id);
+         UPDATE activity SET event_id = upper(event_id), device_id = upper(device_id), session_id = upper(session_id);",
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let uppercase: i64 = conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM device_info WHERE device_id != lower(device_id)) +
+                   (SELECT COUNT(*) FROM sessions WHERE session_id != lower(session_id) OR device_id != lower(device_id)) +
+                   (SELECT COUNT(*) FROM activity WHERE event_id != lower(event_id) OR device_id != lower(device_id) OR session_id != lower(session_id))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(uppercase > 0, "fixture must contain uppercase hex");
+    }
+    assert_both_reject_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_rejects_unversioned_activity_and_empty_version_marker_unchanged() {
+    let activity = "CREATE TABLE activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observed_at_ms INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        project_id TEXT,
+        event_id TEXT,
+        device_id TEXT,
+        session_id TEXT
+    );
+    INSERT INTO activity (observed_at_ms, kind, source, snapshot_json, project_id)
+    VALUES (1, 'focus', 'hyprland', '{}', NULL);";
+    let cases = [
+        ("activity-only", activity.to_string()),
+        (
+            "empty-version",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {activity}"),
+        ),
+    ];
+    for (tag, setup) in cases {
+        let dir = tmpdir(&format!("strict-unversioned-{tag}"));
+        let db = dir.join("activity.db");
+        raw_db(&db, &setup);
+        assert_both_reject_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn strict_version_shape_mismatch_rejects() {
+    // v1 shape under version 2, v2 shape under version 1, and v3 objects
+    // under versions 1/2 all reject untouched (exact pairing required).
+    let v1_cols = "id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at_ms INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL";
+    let v2_cols = "id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at_ms INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            project_id TEXT";
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "v1-shape-version-2",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v1_cols}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);"),
+        ),
+        (
+            "v2-shape-version-1",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v2_cols}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (1);"),
+        ),
+        (
+            "v2-shape-version-2-with-device-table",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v2_cols}); CREATE TABLE device_info (device_id TEXT PRIMARY KEY); INSERT INTO device_info (device_id) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);"),
+        ),
+        (
+            "v1-shape-version-1-with-device-table",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v1_cols}); CREATE TABLE device_info (device_id TEXT PRIMARY KEY); INSERT INTO device_info (device_id) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); INSERT INTO schema_version (version) VALUES (1);"),
+        ),
+        (
+            "v2-shape-version-2-with-v3-index",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); CREATE TABLE activity ({v2_cols}); CREATE INDEX idx_activity_time ON activity (observed_at_ms, id); CREATE INDEX idx_activity_project ON activity (project_id, observed_at_ms, id); CREATE INDEX idx_sessions_time ON activity (observed_at_ms, id); INSERT INTO schema_version (version) VALUES (2);"),
+        ),
+    ];
+    for (tag, setup) in cases {
+        let dir = tmpdir(&format!("strict-vermismatch-{tag}"));
+        let db = dir.join("activity.db");
+        raw_db(&db, &setup);
+        assert_both_reject_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn strict_v3_requires_event_id_index_unchanged() {
+    // Established v3 requires the UNIQUE idx_activity_event_id with its
+    // exact unique shape. Absence rejects on both opens and is never
+    // silently recreated.
+    let dir = tmpdir("strict-v3noeventidx");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    mutate_v3_db(&db, "DROP INDEX idx_activity_event_id;");
+    assert_both_reject_unchanged(&db);
+    // Writable open must not have recreated it.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_activity_event_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "missing UNIQUE event index must not be recreated");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_missing_event_index_with_duplicates_rejects_unchanged() {
+    // Without the UNIQUE index duplicates can accumulate; the missing
+    // index itself still rejects untouched (no silent recreation, no
+    // uniqueness repair).
+    let dir = tmpdir("strict-v3dupevent");
+    let db = dir.join("activity.db");
+    legit_v3_db(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch("DROP INDEX idx_activity_event_id;")
+            .unwrap();
+        // Duplicate the first event_id onto the second activity row. This
+        // succeeds only because uniqueness is no longer enforced.
+        let first: String = c
+            .query_row(
+                "SELECT event_id FROM activity ORDER BY id ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let changed = c
+            .execute(
+                "UPDATE activity SET event_id = ?1 WHERE id = (SELECT MAX(id) FROM activity)",
+                rusqlite::params![first],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let dupes: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT event_id FROM activity GROUP BY event_id HAVING COUNT(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(dupes > 0, "fixture must contain duplicate event_ids");
+        let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    chmod_0600(&db);
+    assert_both_reject_unchanged(&db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_v3_requires_all_tables_unchanged() {
+    // Established v3 requires all five tables before data validation.
+    // Table-by-table: dropping any one rejects on both opens untouched.
+    for tbl in [
+        "schema_version",
+        "activity",
+        "device_info",
+        "sessions",
+        "session_resources",
+    ] {
+        let dir = tmpdir(&format!("strict-v3notbl-{tbl}"));
+        let db = dir.join("activity.db");
+        legit_v3_db(&db);
+        mutate_v3_db(&db, &format!("DROP TABLE {tbl};"));
+        assert_both_reject_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn strict_marker_only_rejects_extra_objects_unchanged() {
+    // Marker-only init accepts only an otherwise-empty DB holding exactly
+    // `schema_version` with an empty or singleton-v3 marker. Any other
+    // v3-named table alongside it rejects before mutation.
+    let sessions_ddl = "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, first_activity_id INTEGER NOT NULL, last_activity_id INTEGER NOT NULL, event_count INTEGER NOT NULL, status TEXT NOT NULL, ended_reason TEXT, gap_ms INTEGER NOT NULL, interruption_ms INTEGER NOT NULL, device_id TEXT NOT NULL, unresolved_start_ms INTEGER, applications_json TEXT NOT NULL)";
+    let resources_ddl = "CREATE TABLE session_resources (session_id TEXT NOT NULL, resource_key TEXT NOT NULL, kind TEXT NOT NULL, portable_identity TEXT, local_identity TEXT, latest_resource_json TEXT NOT NULL, occurrence_count INTEGER NOT NULL, first_seen_ms INTEGER NOT NULL, last_seen_ms INTEGER NOT NULL, first_activity_id INTEGER NOT NULL, last_activity_id INTEGER NOT NULL, PRIMARY KEY (session_id, resource_key))";
+    let device_ddl = "CREATE TABLE device_info (device_id TEXT PRIMARY KEY)";
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "singleton-plus-sessions",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {sessions_ddl}; INSERT INTO schema_version (version) VALUES (3);"),
+        ),
+        (
+            "singleton-plus-resources",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {resources_ddl}; INSERT INTO schema_version (version) VALUES (3);"),
+        ),
+        (
+            "singleton-plus-device",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {device_ddl}; INSERT INTO device_info (device_id) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'); INSERT INTO schema_version (version) VALUES (3);"),
+        ),
+        (
+            "empty-plus-sessions",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {sessions_ddl};"),
+        ),
+        (
+            "empty-plus-device",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {device_ddl};"),
+        ),
+        (
+            "singleton-malformed-shape",
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, extra TEXT); INSERT INTO schema_version (version, extra) VALUES (3, NULL);".to_string(),
+        ),
+        (
+            "singleton-populated-sessions-row",
+            format!("CREATE TABLE schema_version (version INTEGER PRIMARY KEY); {sessions_ddl}; {device_ddl}; INSERT INTO schema_version (version) VALUES (3); INSERT INTO device_info (device_id) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'); INSERT INTO sessions (session_id, project_id, project_name, start_ms, end_ms, first_activity_id, last_activity_id, event_count, status, ended_reason, gap_ms, interruption_ms, device_id, unresolved_start_ms, applications_json) VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', NULL, NULL, 1000, 1000, 1, 1, 1, 'open', NULL, 1000, 200, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', NULL, '[]');"),
+        ),
+    ];
+    for (tag, setup) in cases {
+        let dir = tmpdir(&format!("strict-marker-{tag}"));
+        let db = dir.join("activity.db");
+        raw_db(&db, &setup);
+        assert_both_reject_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn marker_only_valid_completes() {
+    // Otherwise-empty marker layouts still complete via writable open:
+    // empty schema_version and singleton-v4 marker both initialize to a
+    // full exact v4 database.
+    for (tag, setup) in [
+        (
+            "empty",
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);",
+        ),
+        (
+            "singleton",
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); INSERT INTO schema_version (version) VALUES (4);",
+        ),
+    ] {
+        let dir = tmpdir(&format!("marker-valid-{tag}"));
+        let db = dir.join("activity.db");
+        raw_db(&db, setup);
+        let store = ActivityStore::open(&db).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 4);
+        // Full v4 shape present after completion.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        for tbl in [
+            "schema_version",
+            "activity",
+            "device_info",
+            "sessions",
+            "session_resources",
+            "activity_fts",
+            "activity_fts_data",
+            "activity_fts_idx",
+            "activity_fts_content",
+            "activity_fts_docsize",
+            "activity_fts_config",
+        ] {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![tbl],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "marker {tag} must complete table {tbl}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Single-session three-event v3 database (same project, tight
+/// timestamps): exactly one session with min/max bounds to mutate.
+fn legit_single_session_db(path: &Path) {
+    let store = ActivityStore::open(path).unwrap();
+    for (i, ts) in [1000, 1100, 1200].iter().enumerate() {
+        store
+            .append(
+                "focus",
+                "hyprland",
+                &ctx_with(
+                    *ts,
+                    &format!("0x{i}"),
+                    "t",
+                    None,
+                    Some(proj(A_ID, "Alpha", "file")),
+                ),
+            )
+            .unwrap();
+    }
+    assert_eq!(store.recent_sessions(10).unwrap().len(), 1);
+    drop(store);
+    {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    chmod_0600(path);
+}
+
+#[test]
+fn strict_v3_rejects_bad_session_projections_unchanged() {
+    // Session projections are exact: start=min observed, end=max observed,
+    // first=min id, last=max id. Bad timestamp bounds and wrong
+    // same-session endpoint ids all reject untouched.
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "bad-start-high",
+            "UPDATE sessions SET start_ms = end_ms WHERE start_ms != end_ms;",
+        ),
+        (
+            "bad-start-low",
+            "UPDATE sessions SET start_ms = start_ms - 1;",
+        ),
+        (
+            "bad-end-high",
+            "UPDATE sessions SET end_ms = end_ms + 1;",
+        ),
+        (
+            "bad-end-low",
+            "UPDATE sessions SET end_ms = start_ms;",
+        ),
+        (
+            "first-is-max",
+            "UPDATE sessions SET first_activity_id = last_activity_id;",
+        ),
+        (
+            "last-is-min",
+            "UPDATE sessions SET last_activity_id = first_activity_id;",
+        ),
+        (
+            "swapped-endpoints",
+            "UPDATE sessions SET first_activity_id = last_activity_id, last_activity_id = first_activity_id WHERE 0;",
+        ),
+    ];
+    for (tag, sql) in cases {
+        // `swapped-endpoints` needs a real swap via a temp sentinel because
+        // the naive double-assignment is a no-op in SQL.
+        let dir = tmpdir(&format!("strict-v3proj-{tag}"));
+        let db = dir.join("activity.db");
+        legit_single_session_db(&db);
+        if tag == "swapped-endpoints" {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            let (first, last): (i64, i64) = c
+                .query_row(
+                    "SELECT first_activity_id, last_activity_id FROM sessions",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert!(first < last, "fixture needs distinct endpoint ids");
+            c.execute(
+                "UPDATE sessions SET first_activity_id = ?1, last_activity_id = ?2",
+                rusqlite::params![last, first],
+            )
+            .unwrap();
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            drop(c);
+            chmod_0600(&db);
+        } else {
+            mutate_v3_db(&db, sql);
+        }
+        // Sanity: the mutation really changed the projection.
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            let mismatched: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions s WHERE s.start_ms != (SELECT MIN(a.observed_at_ms) FROM activity a WHERE a.session_id = s.session_id) OR s.end_ms != (SELECT MAX(a.observed_at_ms) FROM activity a WHERE a.session_id = s.session_id) OR s.first_activity_id != (SELECT MIN(a.id) FROM activity a WHERE a.session_id = s.session_id) OR s.last_activity_id != (SELECT MAX(a.id) FROM activity a WHERE a.session_id = s.session_id)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(mismatched > 0, "fixture {tag} must mismatch projection");
+        }
+        assert_writable_rejects_readonly_opens_unchanged(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

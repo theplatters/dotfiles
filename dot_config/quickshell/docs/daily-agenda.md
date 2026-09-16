@@ -166,8 +166,10 @@ Reuses the planner toggle and returns `{"page": <full read_page response>}`.
   on the currently selected date via `select` with `selected: true`),
   completion editor with a required note and `Complete & save`, Pomodoro
   controls, reload, and busy/error display.
-- `widgets/CalendarPopout.qml` — clock-anchored `PopupWindow` hosting the
-  planner UI; the bar clock (`widgets/Bar.qml` `clockAnchor`) toggles it.
+- `widgets/CalendarPopout.qml` — clock-anchored keyboard-capable
+  `PanelWindow` hosting the planner UI (layer-shell `OnDemand` focus so
+  its text fields are typeable); the bar clock (`widgets/Bar.qml`
+  `clockAnchor`) toggles it.
 - `widgets/ProjectPlanner.qml` — genuine `Daily` tab (`icons/history.svg`)
   embedding the same `DailyPlanner`; agenda writes arrive via `pageWritten`
   and refresh the page cache through `applyAgendaPage` without touching

@@ -14,17 +14,51 @@ mutation (history rows are still appended by the collector).
   the validated `list` JSON output only.
 - Overlay: `DesktopContext.project` is `{id, name, matched_by}` only
   (`src/desktop_context.rs`). `matched_by` is one of
-  `file` / `cwd` / `git_root` / `git_remote`. Missing `project` in older
-  JSON reads as `None`. Semantic equality includes `id`/`name`/
-  `matched_by` but never the registry `revision`, so identical mappings
-  at different revisions do not flap history.
+  `zotero_collection` / `file` / `cwd` / `git_root` / `logseq_page` /
+  `git_remote`.
+  Missing `project` in older JSON reads as `None`. Semantic equality
+  includes `id`/`name`/`matched_by` but never the registry `revision`, so
+  identical mappings at different revisions do not flap history.
 - Unknown stays unknown: ambiguity or no match yields no association.
   There is no UI-selected project fallback.
 
-## Match precedence (paths, then remotes)
+## Match precedence (explicit collection, then paths, then remotes)
 
-Path precedence: `file > cwd > git_root > git_remote`, resolved lazily
-in order (`src/project_context.rs`):
+Explicit collection precedence: `zotero_collection > file > cwd > git_root
+> logseq_page > git_remote` (`src/project_context.rs`, strict projection of
+the authoritative `scripts/projects.py` `zotero_collection` field):
+
+- Registry shape (optional, `null`/omitted when unlinked): `{server_id,
+  library_type ("user"|"group"), library_id (digit string; user `"0"` is the
+  server-bound personal-library alias), collection_key (8 uppercase alnum),
+  include_subcollections (bool, default true)}`. Unknown sub-fields are
+  rejected; TOML stores a linked value as an inline table.
+- Reader identity (`ResourceContext.zotero`, metadata only): qualified
+  `server_id` + `library_type`/`library_id` plus the stable parent
+  `item_key` / opened `attachment_key`, current direct `collections` +
+  `ancestor_collections`, `version` (freshness only), and a stable
+  `zotero://select/...` URI. Page turns, titles, versions, and URIs never
+  affect matching or session identity.
+- Server/library must agree exactly, except registry `user/"0"` matches any
+  user library on the same server. Then the entry's `collection_key` must be
+  in the reader's direct `collections` — or, when `include_subcollections`
+  is true, in `ancestor_collections` (descendants included via the published
+  ancestors; `false` matches direct membership only).
+- Exactly one distinct claiming project wins (`matched_by:
+  "zotero_collection"`). Two distinct claimants are ambiguous with **no file
+  fallback**; zero claims fall through to existing file/cwd/git matching.
+  Collection reads touch no filesystem and spawn no subprocess.
+- Collector binding for the reader itself is verified and fail-closed (see
+  `services/agent-orchestrator/integrations/zotero/README.md`): the Zotero
+  plugin cannot observe native window handles (local `/api/` exposes library
+  data only, `Zotero.Reader` exposes no OS handle), so a tiny bridge samples
+  `hyprctl activewindow` in the same tick and writes the verified
+  `QS_ZOTERO_CONTEXT_FILE` (`window_id` + `pid`, 30 s freshness, 60 s
+  last-good; closed/stale/mismatched readers evict; no title fallback, no
+  SQLite/cloud/content reads).
+
+Path precedence: `file > cwd > git_root > logseq_page > git_remote`,
+resolved lazily in order (`src/project_context.rs`):
 
 - Each candidate is tilde-expanded, then canonicalized with
   symlink-aware `..` semantics (the OS resolves `..` after symlinks).
@@ -33,9 +67,29 @@ in order (`src/project_context.rs`):
   `/a/bc/d`). Longest mapped folder wins at each level.
 - A tie between different projects at the same strength is ambiguous:
   no association, and no fallback to a weaker level.
-- Titles are never used for matching.
+- Window titles are never used for matching, with one explicit
+  exception: the Logseq page level below, which matches the focused
+  Logseq page extracted from the window title exactly against linked
+  registry pages (never a fuzzy title search).
 
-Remote fallback (only when every path level missed):
+Logseq page level (between `git_root` and `git_remote`):
+
+- Source is the title-only `logseq-title` extraction (`src/app_context.rs`):
+  the `<page> - Logseq` suffix form when present, otherwise the bare
+  trimmed title, carried as `ResourceContext.page`.
+- The claim matches exactly (case-sensitive) against a linked registry
+  row's derived page label (from `logseq_path` exactly like
+  `scripts/logseq_common.py page_name`: strip the `pages/` prefix and
+  `.md` suffix, percent-decode `%XX`, replace `___` with `/`) OR its
+  display name (registry names mirror page labels, so stale `logseq_path`
+  rows keep matching after underscore->space renames). The registry JSON
+  `page` field is the project name, never page identity, and is ignored.
+- Only rows with a non-empty derived page label are eligible (name-only
+  rows never match). Exactly one distinct claiming project wins
+  (`matched_by: "logseq_page"`); a tie between different projects is
+  ambiguous with no remote fallback.
+
+Remote fallback (only when every path and page level missed):
 
 - Canonical GitHub forms only: HTTPS / SSH / scp normalized to
   `https://github.com/owner/repo` (single trailing slash / single `.git`
@@ -74,24 +128,36 @@ Remote fallback (only when every path level missed):
   validated Python helper; a missing registry file reads as an empty
   mapping with no subprocess).
 
-## Store: schema v2, history is append-time
+## Store: schema v4 (v3 migratable to v4 only), history is append-time
 
-- Fresh databases are created at v2; schema is `activity(...,
-  project_id TEXT)` + `idx_activity_project(project_id,
-  observed_at_ms, id)`. `project_id` is extracted from
-  `snapshot_json $.project.id` at append time (lowercase-normalized) and
-  stored alongside the JSON.
-- Writable open migrates v1 → v2 transactionally (rows preserved,
-  `project_id` backfilled from stored JSON, never re-resolved).
-  Read-only open accepts v1 or v2 without writes (v1 uses a
-  `json_extract` fallback); foreign/newer schemas are rejected untouched.
+- Fresh databases are created at v4; schema is `activity(...,
+  project_id TEXT, event_id TEXT, device_id TEXT, session_id TEXT)` +
+  `idx_activity_project(project_id, observed_at_ms, id)` plus the
+  deterministic work-session tables `sessions`, `session_resources`,
+  the singleton `device_info` (durable local device identity), the
+  application-maintained FTS5 `activity_fts` table, and
+  `idx_sessions_device_time`. Full Phase 5 contract:
+  `docs/desktop-history-search.md`.
+  `project_id` is extracted from `snapshot_json $.project.id` at append
+  time (lowercase-normalized) and stored alongside the JSON. Full
+  session contract: `docs/desktop-work-sessions.md`.
+- The store accepts exact coherent v4 and migrates exact coherent v3 only
+  when the restarted collector holds the per-database lock (schema v3 is
+  migratable to v4 only; ordinary writable/read-only opens do not migrate;
+  v1/v2 remain unsupported with no migration or read-only compatibility).
+  Foreign/newer schemas are likewise rejected untouched.
 - No retroactive reassignment: later registry edits, removes, or renames
   never rewrite stored rows. Historical associations do not remap;
   queries reflect the mapping at append time.
-- Resource identity for `resources`: dedup key is the priority location
-  key `file` else `url` else `cwd` else `page`; `git_branch` / `title` /
-  `adapter` / `git_root` / `git_remote` never affect uniqueness. Rows
-  stream newest-first and stop at `limit` distinct keys.
+- Resource identity for `resources`/`session_resources`: a bound Zotero reader
+  aggregates by its stable document key
+  (`portable:zotero:<server>:<type>/<lib>:item:<item>:att:<att>` — titles,
+  versions, collections, URIs, and page turns never affect it); otherwise the
+  priority location key `file` else `url` else `cwd` else `page`;
+  `git_branch` / `title` / `adapter` / `git_root` / `git_remote` never affect
+  uniqueness. Rows stream newest-first and stop at `limit` distinct keys.
+  FTS search text additionally indexes the Zotero server/library/item/
+  attachment/collection keys and URI (metadata only, never content).
 
 ## CLI (`qs-desktop-context`)
 
@@ -103,12 +169,19 @@ cargo build --locked --release --manifest-path services/agent-orchestrator/Cargo
 ```
 
 ```text
-usage: qs-desktop-context [--db PATH] [collect]
+usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-interruption-ms MS]]
        qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS [--limit N]]
        qs-desktop-context current
        qs-desktop-context current-project
        qs-desktop-context [--db PATH] last-activity --project UUID
        qs-desktop-context [--db PATH] resources --project UUID [--limit N]
+       qs-desktop-context [--db PATH] current-session
+       qs-desktop-context [--db PATH] sessions [--project UUID] [--limit N] [--from START_MS --to END_MS]
+       qs-desktop-context [--db PATH] last-session --project UUID
+       qs-desktop-context [--db PATH] session-resources --session SESSION_ID [--limit N]
+       qs-desktop-context [--db PATH] session-events --session SESSION_ID [--limit N]
+       qs-desktop-context [--db PATH] search [--project UUID] [--application TEXT] [--resource TEXT] [--device 32HEX] [--query TEXT] [--from START_MS --to END_MS] [--limit N]
+       qs-desktop-context [--db PATH] session-detail --session SESSION_ID [--resource-limit N] [--include-events [--event-limit N]]
 ```
 
 - `current`: fresh on-demand snapshot with default enrichment
@@ -121,7 +194,14 @@ usage: qs-desktop-context [--db PATH] [collect]
 - `history --project UUID` / `last-activity --project UUID` /
   `resources --project UUID [--limit N]`: read-only indexed queries for
   one UUID. `--db` overrides the default DB; `current` ignores `--db`
-  (warns).
+  (warns). Work-session queries (`current-session`, `sessions`,
+  `last-session`, `session-resources`, `session-events`) are read-only
+  persisted-DB queries returning session objects with query-time
+   `effective_status` (`active`/`interrupted`/`stale`/`closed`); full
+  contract and examples: `docs/desktop-work-sessions.md`. Session-centric
+  retrieval (`search`, `session-detail`) is session-first with no raw
+  events by default; full contract and examples:
+  `docs/desktop-history-search.md`.
 
 Examples (scratch DB first; a pre-existing non-private leaf is rejected,
 not repaired):
@@ -136,6 +216,9 @@ UUID='existing-project-uuid'
 "$BIN" --db /tmp/qs-test/activity.db history --project "$UUID" --limit 5
 "$BIN" --db /tmp/qs-test/activity.db last-activity --project "$UUID"
 "$BIN" --db /tmp/qs-test/activity.db resources --project "$UUID" --limit 5
+"$BIN" --db /tmp/qs-test/activity.db current-session
+"$BIN" --db /tmp/qs-test/activity.db sessions --project "$UUID" --limit 5
+"$BIN" --db /tmp/qs-test/activity.db last-session --project "$UUID"
 ```
 
 ## Python backend (`scripts/desktop_projects.py`)
@@ -153,6 +236,15 @@ python3 scripts/desktop_projects.py logseq-context
 python3 scripts/desktop_projects.py recent-activity
 python3 scripts/desktop_projects.py last-activity --project 'existing-project-uuid'
 python3 scripts/desktop_projects.py resources --project 'existing-project-uuid' --limit 5
+python3 scripts/desktop_projects.py current-session
+python3 scripts/desktop_projects.py sessions [--project 'existing-project-uuid'] [--limit 5] [--from START_MS --to END_MS]
+python3 scripts/desktop_projects.py last-session --project 'existing-project-uuid'
+python3 scripts/desktop_projects.py session-resources --session '<32-hex-session-id>' --limit 5
+python3 scripts/desktop_projects.py session-events --session '<32-hex-session-id>' --limit 5
+python3 scripts/desktop_projects.py current-context
+python3 scripts/desktop_projects.py search-activity [--project UUID] [--application TEXT] [--resource TEXT] [--device 32HEX] [--query TEXT] [--from START_MS --to END_MS] [--limit 5]
+python3 scripts/desktop_projects.py get-session --session '<32-hex-session-id>' [--resource-limit 5] [--include-events [--event-limit 5]]
+python3 scripts/desktop_projects.py project-activity [--project UUID] [--application TEXT] [--resource TEXT] [--device 32HEX] [--query TEXT] [--from START_MS --to END_MS] [--limit 5]
 ```
 
 - `current-project` captures `current` once per request and looks the
@@ -172,23 +264,39 @@ python3 scripts/desktop_projects.py resources --project 'existing-project-uuid' 
   started automatically; a missing binary names its path plus the manual
   cargo build command.
 
-## Pi tools (additive, 5)
+## Pi tools (7 coherent history tools)
 
-`desktop_current_project`, `desktop_project_todos`,
-`desktop_project_logseq_context`, `desktop_project_activity`,
-`desktop_project_resources` (`.pi/extensions/desktop-agent.ts`). Each
+`desktop_current_context`, `desktop_project_todos`,
+`desktop_project_logseq_context`, plus the session-centric retrieval
+tools `desktop_current_session`, `desktop_search_activity`,
+`desktop_get_session`, `desktop_project_activity`
+(`.pi/extensions/desktop-agent.ts`; authoritative tool contract:
+`docs/desktop-history-search.md`). Each
 call runs one bounded `scripts/desktop_projects.py` subprocess. The
 fresh `current` identity is captured once per call only when no explicit
 `--project` UUID is given; an explicit UUID skips the compositor query
-and resolves history directly. Available in every scope (palette, project,
+  and resolves history directly. Available in every scope (palette, project,
 journal); they never touch `QS_PROJECT_PATH`, never mutate, never
-infer. Additive read-tool allowlist entries only; scoped mutation rules
+infer. The work-session tools serve deterministic DB-derived activity
+clusters (32-hex `session_id`) and never list, switch, resume, or mutate
+Pi agent chat sessions (the `SessionManager`/`desktop-sessions` picker
+is a separate conversational-session system). Additive read-tool
+allowlist entries only; scoped mutation rules
 are unchanged.
+
+## Deterministic work sessions (Phase 4)
+
+Implemented. Full contract: `docs/desktop-work-sessions.md`.
 
 ## What this is not
 
-No LLM, no embeddings, no screenshots, no session management, no
-Resume integration. Titles/app names/URLs/paths are stored verbatim
+No LLM, no embeddings, no screenshots, no
+sync. Deterministic work sessions exist (query-only activity clusters;
+see `docs/desktop-work-sessions.md`) — there is still no session
+mutation and no Pi chat-session management. Resume is a separate
+read-only backend over these primitives (`docs/desktop-resume.md`;
+command-palette and read-only Pi plan integration implemented), not part of
+attribution. Titles/app names/URLs/paths are stored verbatim
 (no redaction, no retention controls); automatic attribution never reads
 working file contents — only an explicitly requested Logseq view reads
 the linked page via the existing `read_page` API.
@@ -214,9 +322,17 @@ the linked page via the existing `read_page` API.
   (`<manifest>/../../scripts/projects.py`); relocating the checkout
   needs a rebuild, not merely a registry-path override.
 
-## Next-phase constraints
+## Retrieval consumer constraints (Phase 5 implemented)
 
-A future search/session consumer must treat `resource` as best-effort
+Phase 5 session-centric retrieval is implemented (authoritative guide:
+`docs/desktop-history-search.md`). Its consumers already follow these
+rules: treat `resource` as best-effort
 and stale-tolerant, re-validate before acting, and respect the existing
 resource-id identity and ordering (`observed_at_ms` + `id`) and
-retention behavior. No new semantic layer is introduced here.
+retention behavior. Session consumers must use sessions as the primary
+unit but keep raw `session-events` for audit, join on stable
+`session_id`/`event_id`/`device_id`, resolve portable resource identity
+against the current registry before acting (never trust stale absolute
+paths/window IDs/PIDs/workspace IDs), and treat any later LLM summaries
+as derived/versioned artifacts — never session boundaries. No new
+semantic layer is introduced here.

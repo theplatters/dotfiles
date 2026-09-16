@@ -1,10 +1,12 @@
 //! Deterministic project resolution tests (no live compositor).
 //!
 //! Covers the worker contract: path precedence FILE > CWD > GIT_ROOT >
-//! GIT_REMOTE, component-boundary descendants, longest-folder wins, ties at
-//! the same strength are ambiguous (no weaker fallback), remote form
-//! normalization, unknown/old-JSON handling, mapping mutation/deletion/
-//! corruption fail-closed + invalidation, and project semantic transitions.
+//! LOGSEQ_PAGE > GIT_REMOTE, component-boundary descendants, longest-folder
+//! wins, ties at the same strength are ambiguous (no weaker fallback),
+//! exact Logseq page matching (derived label or display name, linked rows
+//! only), remote form normalization, unknown/old-JSON handling, mapping
+//! mutation/deletion/corruption fail-closed + invalidation, and project
+//! semantic transitions.
 
 use qs_agent_orchestrator::desktop_context::{
     classify_transition, ActivityKind, DesktopContext, FocusedWindow, ProjectContext,
@@ -69,6 +71,25 @@ fn resolver_for(registry: &Path) -> ProjectResolver {
 
 fn res(adapter: &str, file: Option<&str>, cwd: Option<&str>, root: Option<&str>) -> ResourceContext {
     ResourceContext::new(adapter, file, cwd, root, None, None, None, None)
+}
+
+fn reg_table_page(id: &str, name: &str, folder: &str, url: &str, logseq_path: &str) -> String {
+    let mut s = format!("[[projects]]\nid = \"{id}\"\nname = \"{name}\"\n");
+    if !folder.is_empty() {
+        s.push_str(&format!("local_folder = \"{folder}\"\n"));
+    }
+    if !url.is_empty() {
+        s.push_str(&format!("github_url = \"{url}\"\n"));
+    }
+    if !logseq_path.is_empty() {
+        s.push_str(&format!("logseq_path = \"{logseq_path}\"\n"));
+    }
+    s.push('\n');
+    s
+}
+
+fn res_page(adapter: &str, page: &str) -> ResourceContext {
+    ResourceContext::new(adapter, None, None, None, None, None, Some(page), None)
 }
 
 fn git_available() -> bool {
@@ -986,6 +1007,174 @@ fn symlink_retarget_converges_without_registry_reload() {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+}
+
+#[test]
+fn logseq_page_matches_derived_label() {
+    let base = tmpdir("logseqpage");
+    let reg = base.join("projects.toml");
+    write_registry(
+        &reg,
+        &registry_doc(&[reg_table_page(
+            A_ID,
+            "Asset-Prices",
+            "",
+            "",
+            "pages/Asset-Prices.md",
+        )]),
+    );
+    let mut r = resolver_for(&reg);
+    let hit = r
+        .resolve_resource(&res_page("logseq-title", "Asset-Prices"), 20_000_000)
+        .expect("derived page label must match");
+    assert_eq!(hit.id, A_ID);
+    assert_eq!(hit.name, "Asset-Prices");
+    assert_eq!(hit.matched_by, "logseq_page");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn logseq_page_matches_display_name_despite_stale_path() {
+    // Stale underscore `logseq_path` derives `Gender_Norm_ABM`, but the
+    // registry display name mirrors the real page label, so it still matches.
+    let base = tmpdir("logseqstale");
+    let reg = base.join("projects.toml");
+    write_registry(
+        &reg,
+        &registry_doc(&[reg_table_page(
+            A_ID,
+            "Gender Norm ABM",
+            "",
+            "",
+            "pages/Gender_Norm_ABM.md",
+        )]),
+    );
+    let mut r = resolver_for(&reg);
+    let hit = r
+        .resolve_resource(&res_page("logseq-title", "Gender Norm ABM"), 21_000_000)
+        .expect("display name must keep stale paths matching");
+    assert_eq!(hit.id, A_ID);
+    assert_eq!(hit.matched_by, "logseq_page");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn logseq_page_unknown_matches_nothing() {
+    let base = tmpdir("logsequnknown");
+    let reg = base.join("projects.toml");
+    write_registry(
+        &reg,
+        &registry_doc(&[reg_table_page(
+            A_ID,
+            "Asset-Prices",
+            "",
+            "",
+            "pages/Asset-Prices.md",
+        )]),
+    );
+    let mut r = resolver_for(&reg);
+    assert_eq!(
+        r.resolve_resource(&res_page("logseq-title", "No-Such-Page"), 22_000_000),
+        None
+    );
+    // Empty page carries no signal either.
+    assert_eq!(
+        r.resolve_resource(&res_page("logseq-title", ""), 22_000_001),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn logseq_page_tie_is_ambiguous_without_remote_fallback() {
+    // Two distinct entries claim the same page; the remote fallback must
+    // NOT rescue the tie even though a mapped remote is present.
+    let base = tmpdir("logseqpagetie");
+    let reg = base.join("projects.toml");
+    write_registry(
+        &reg,
+        &registry_doc(&[
+            reg_table_page(A_ID, "Shared", "", "", "pages/Shared.md"),
+            reg_table_page(
+                B_ID,
+                "Shared",
+                "",
+                "https://github.com/acme/shared",
+                "pages/Shared.md",
+            ),
+        ]),
+    );
+    let mut r = resolver_for(&reg);
+    let claimed = ResourceContext::new(
+        "logseq-title",
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("Shared"),
+        None,
+    )
+    .with_git_remote(Some("https://github.com/acme/shared"));
+    assert_eq!(
+        r.resolve_resource(&claimed, 23_000_000),
+        None,
+        "page tie must not fall back to the remote level"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn linked_folder_cwd_beats_logseq_page() {
+    // Entry A matches at CWD strength, entry B at page strength: the
+    // stronger path level wins.
+    let base = tmpdir("logseqcwdbeats");
+    let folder_a = base.join("proj-a");
+    std::fs::create_dir_all(&folder_a).unwrap();
+    let reg = base.join("projects.toml");
+    write_registry(
+        &reg,
+        &registry_doc(&[
+            reg_table(A_ID, "A", &folder_a.to_string_lossy(), ""),
+            reg_table_page(B_ID, "Bee", "", "", "pages/Bee.md"),
+        ]),
+    );
+    let mut r = resolver_for(&reg);
+    let both = ResourceContext::new(
+        "logseq-title",
+        None,
+        Some(&folder_a.to_string_lossy()),
+        None,
+        None,
+        None,
+        Some("Bee"),
+        None,
+    );
+    let hit = r
+        .resolve_resource(&both, 24_000_000)
+        .expect("cwd must beat the page level");
+    assert_eq!(hit.id, A_ID);
+    assert_eq!(hit.matched_by, "cwd");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn logseq_page_name_only_entry_matches_nothing() {
+    // A name-only row (no `logseq_path`) never matches the page level,
+    // even when its display name equals the focused page.
+    let base = tmpdir("logseqnameonly");
+    let reg = base.join("projects.toml");
+    write_registry(
+        &reg,
+        &registry_doc(&[reg_table(A_ID, "Asset-Prices", "", "")]),
+    );
+    let mut r = resolver_for(&reg);
+    assert_eq!(
+        r.resolve_resource(&res_page("logseq-title", "Asset-Prices"), 25_000_000),
+        None,
+        "name-only entries carry no page signal"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

@@ -102,7 +102,9 @@ property. The helper-side registry override is the
 
 ## Desktop project context (deterministic attribution)
 
-Full contract: `docs/desktop-project-context.md`.
+Full contract: `docs/desktop-project-context.md`. Work sessions (Phase 4):
+`docs/desktop-work-sessions.md`. Session-centric retrieval (Phase 5):
+`docs/desktop-history-search.md`.
 
 The live desktop snapshot is attributed to the existing registry only —
 no new model, no inference, no writes, no UI-selected fallback. The
@@ -114,24 +116,46 @@ HTTPS/SSH/scp (credentials stripped, never persisted); unmapped
 upstreams are ignored; discovery is local `git config` only (linked
 worktrees supported). The registry subprocess runs only on metadata
 change (folder projection TTL 5 s, remotes 30 s + config
-invalidation). History store is schema v2 with indexed append-time
-`project_id` (transactional v1 migration, read-only v1 support, no
-retroactive reassignment).
+  invalidation). History store is schema v4 (schema v3 is migratable to
+  v4 only; no v1/v2 migration, no read-only compatibility for older schemas,
+  no retroactive reassignment) plus materialized deterministic work sessions
+  and session-centric retrieval (`search`, `session-detail`).
 
 - CLI: `current`, `current-project`, `history --project UUID`,
-  `last-activity --project UUID`, `resources --project UUID [--limit]`
+  `last-activity --project UUID`, `resources --project UUID [--limit]`,
+  plus work-session queries `current-session`, `sessions [--project
+  UUID] [--limit] [--from/--to]`, `last-session --project UUID`,
+  `session-resources --session ID [--limit]`, `session-events --session
+  ID [--limit]`, plus session-centric retrieval `search` and
+  `session-detail` (full contract: `docs/desktop-history-search.md`)
   (`current` is a fresh snapshot + focus recheck, not collector IPC).
 - Python: `scripts/desktop_projects.py current-project | todos |
-  logseq-context | recent-activity | last-activity | resources`
+  logseq-context | recent-activity | last-activity | resources |
+  current-session | sessions | last-session | session-resources |
+  session-events | current-context | search-activity | get-session |
+  project-activity`
   (overrides `--projects-file --graph --db --desktop-bin`; reuses the
   `read_page` task parser; a name-only project is valid, has history,
   but returns explicit no-Logseq-linkage).
-- Five additive Pi tools only; existing scopes unaffected. Build with
+- Eight coherent read-only desktop tools (`desktop_current_context`,
+  `desktop_current_session`, `desktop_search_activity`,
+  `desktop_get_session`, `desktop_project_activity` plus the separate
+  Logseq views `desktop_project_todos`,
+  `desktop_project_logseq_context` and deterministic preview
+  `desktop_resume_plan`); existing scopes
+  unaffected. Work sessions are deterministic DB-derived activity
+  clusters — never Pi chat sessions (the `SessionManager`/
+  `desktop-sessions` picker is separate). Build with
   `cargo build --locked --release --manifest-path
   services/agent-orchestrator/Cargo.toml`; nothing auto-installs or
-  auto-starts. No LLM/embeddings/screenshots/sessions/Resume. Next
-  phase keeps resource-id identity/ordering and retention with no new
-  semantic layer.
+  auto-starts. No LLM/embeddings/screenshots/sync (Resume is a separate
+  read-only backend and typed execution: `docs/desktop-resume.md`; integrated
+  through the command palette and the read-only Pi plan tool). Retrieval
+  consumes sessions as the primary unit with raw events only via explicit
+  `session-detail`/`get-session` drill-down, resolves portable resource
+  identity against the current registry before acting (never stale absolute
+  paths/window IDs/PIDs/workspace IDs), and treats any later LLM summaries
+  as derived/versioned — never boundaries — with no new semantic layer.
 
 ## Journal tab
 
@@ -441,3 +465,16 @@ Full ops, envelope fields, bounds, and tests are documented in
 ```sh
 cargo test --locked --manifest-path services/agent-orchestrator/Cargo.toml
 ```
+
+
+## Project UUID scope + Zotero collection
+
+Project workers are pinned by stable registry UUID (`QS_PROJECT_ID`), not by a frozen note path, and work without Logseq including Zotero-only projects. The current optional note/folder/collection is resolved per operation from a fresh `scripts/projects.py list` read:
+
+- Registry contract (backend worker owns persistence): optional `zotero_collection` null or `{server_id:string, library_type:'user'|'group', library_id:digit string ('0' allowed user bound server), collection_key:8 uppercase alnum, include_subcollections:bool default true}`. Old projects without the field keep working.
+- Project form offers picker/status/open/unlink; unknown/offline links are preserved verbatim in edits. Picker covers both My Library and shared/group libraries (enumerated read-only from the local API via `scripts/zotero.py libraries`) and lists the selected library's collections from `scripts/zotero.py collections` in hierarchical order (subcollections nested by `parentCollection`, siblings sorted by name); selection fills server/library/collection for the next save, with manual key entry kept for offline/unknown links. Picking a shared collection records `library_type:"group"` + group id.
+- Helper `python3 scripts/zotero.py <command>` with JSON stdin/stdout and structured nonzero failures: `capabilities {}`, `collections {library_type?,library_id?}`, `search {project_id,query?,limit?,start?}`, `item {project_id,item_key}`, `read-pdf {project_id,attachment_key,query?,start_page?,end_page?}`, `prepare {project_id,operation,params} => {prepared,preview}`, `apply {project_id,prepared}` (backend worker implements; integration tests use a fake helper until then).
+- Extension tools `zotero_search/item/read_pdf` plus `zotero_prepare/apply` (prepare/ask/apply, cancellation checks, bounded output). Operations: add-item metadata, add-existing, update-item, add/remove membership, create/update subcollection. Project ID comes from the pinned env (fresh registry); palette takes an explicit project ID; journal is denied unless deliberately project-explicit (no broadened default). Allowlist updated; no keys in output/prompts. Mutations show explicit previews with shared-item edit warnings; no library deletion. Citations are on-demand (metadata vs fulltext, no unsolicited whole-library ingestion).
+- Sessions: `scripts/project_sessions.py --project-id UUID [--project pages/X.md]` scopes to `.../projects/by-id/<uuid>`; `--project` alone keeps legacy `.../projects/<sha256>` compatibility. `latest_session` never scans another scope; legacy restores only when the page is explicitly declared. Agent cache is UUID-keyed; no-note prompt/send works without a page read; note tools fail clearly without a note; the generic scope block is preserved. New scope vars are cleared across palette/journal.
+
+Integration assumptions/limits (until the backend exists): `scripts/zotero.py` is absent, so the extension fails closed with `zotero helper exited`; tests cover UUID/no-note sessions, migration, scoped access/approval denial, and QML contracts against a fake helper. Final schema alignment will inspect the backend once available.

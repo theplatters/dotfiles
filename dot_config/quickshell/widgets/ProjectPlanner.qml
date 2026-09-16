@@ -42,6 +42,40 @@ PanelWindow {
     property string projectFormNote: ""
     property string projectFormFolder: ""
     property string projectFormGithub: ""
+    // Optional Zotero collection link (shared registry contract, backend
+    // worker owns persistence; unknown/offline shapes are preserved verbatim
+    // in projectFormZoteroRaw so edits never drop them; old projects without
+    // the field keep working with null).
+    property string projectFormZoteroServer: ""
+    property string projectFormZoteroLibraryType: "user"
+    property string projectFormZoteroLibraryId: ""
+    property string projectFormZoteroCollectionKey: ""
+    property bool projectFormZoteroIncludeSub: true
+    property string projectFormZoteroStatus: ""
+    property var projectFormZoteroRaw: null
+    property bool zoteroPickerOpen: false
+    property bool zoteroPickerBusy: false
+    property bool zoteroPickerStarted: false
+    property bool zoteroPickerStartFailed: false
+    property bool zoteroPickerRetiring: false
+    property int zoteroPickerGeneration: 0
+    property int zoteroPickerProcessGeneration: 0
+    property int zoteroPickerLaunchGeneration: 0
+    property bool zoteroLibrariesBusy: false
+    property bool zoteroLibrariesStarted: false
+    property bool zoteroLibrariesStartFailed: false
+    property bool zoteroLibrariesRetiring: false
+    property int zoteroLibrariesGeneration: 0
+    property int zoteroLibrariesProcessGeneration: 0
+    property int zoteroLibrariesLaunchGeneration: 0
+    property var zoteroPickerRows: []
+    property int zoteroPickerIndex: 0
+    property var zoteroPickerLibraries: []
+    property int zoteroPickerLibraryIndex: 0
+    property string zoteroPickerStatus: ""
+    property string zoteroPickerServer: ""
+    property string zoteroPickerLibraryType: "user"
+    property string zoteroPickerLibraryId: "0"
     property string projectFormError: ""
     property bool projectDeleteOpen: false
     property string projectDeleteId: ""
@@ -155,6 +189,17 @@ PanelWindow {
     // clock CalendarPopout bind to the same object, so the date, drafts,
     // and Pomodoro survive popup close/reopen.
     property var agenda: null
+    // Resume handoff from the command palette: stable project id plus the
+    // requested action ("resume"/"ask"/"history"/""). Consumed after the
+    // authoritative registry list completes so selection is by stable id.
+    // Bound to interactionGeneration so a superseding navigation/open or a
+    // close invalidates the stale ask/history before it can run on a later
+    // normal open. The compact restoration message (bounded) survives the
+    // handoff so partial failures stay visible.
+    property string pendingOpenProjectId: ""
+    property string pendingOpenAction: ""
+    property string pendingOpenMessage: ""
+    property int pendingOpenInteraction: -1
 
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
@@ -217,6 +262,20 @@ PanelWindow {
         interval: 12000
         repeat: false
         onTriggered: root.cancelPageRead()
+    }
+
+    Timer {
+        id: zoteroPickerTimeout
+        interval: 12000
+        repeat: false
+        onTriggered: root.cancelZoteroCollectionsRead()
+    }
+
+    Timer {
+        id: zoteroLibrariesTimeout
+        interval: 12000
+        repeat: false
+        onTriggered: root.cancelZoteroLibrariesRead()
     }
 
     // A write is never killed on a wall-clock timeout: it may already have
@@ -283,6 +342,50 @@ PanelWindow {
             if (failed) root.handleToggleStartFailure(generation)
             else root.finishToggle(code, toggleOutput.text, toggleError.text,
                                    generation, interaction, root.toggleLaunchPath)
+        }
+    }
+
+    Process {
+        id: zoteroCollectionsProcess
+        workingDirectory: Quickshell.shellPath(".")
+        stdinEnabled: false
+        stdout: StdioCollector { id: zoteroPickerOutput; waitForEnd: true }
+        stderr: StdioCollector { id: zoteroPickerError; waitForEnd: true }
+        onStarted: {
+            root.zoteroPickerStarted = true
+            root.writeJson(zoteroCollectionsProcess, root.zoteroPickerCollectionsPayload())
+        }
+        onRunningChanged: root.handleProcessRunningChanged("zoteroPicker")
+        onExited: (code) => {
+            let failed = root.zoteroPickerStartFailed
+            let generation = root.zoteroPickerLaunchGeneration
+            root.zoteroPickerStarted = false
+            root.zoteroPickerStartFailed = false
+            root.zoteroPickerRetiring = false
+            if (failed) root.handleZoteroPickerStartFailure(generation)
+            else root.finishZoteroCollections(code, zoteroPickerOutput.text, zoteroPickerError.text, generation)
+        }
+    }
+
+    Process {
+        id: zoteroLibrariesProcess
+        workingDirectory: Quickshell.shellPath(".")
+        stdinEnabled: false
+        stdout: StdioCollector { id: zoteroLibrariesOutput; waitForEnd: true }
+        stderr: StdioCollector { id: zoteroLibrariesError; waitForEnd: true }
+        onStarted: {
+            root.zoteroLibrariesStarted = true
+            root.writeJson(zoteroLibrariesProcess, ({}))
+        }
+        onRunningChanged: root.handleProcessRunningChanged("zoteroLibraries")
+        onExited: (code) => {
+            let failed = root.zoteroLibrariesStartFailed
+            let generation = root.zoteroLibrariesLaunchGeneration
+            root.zoteroLibrariesStarted = false
+            root.zoteroLibrariesStartFailed = false
+            root.zoteroLibrariesRetiring = false
+            if (failed) root.handleZoteroLibrariesStartFailure(generation)
+            else root.finishZoteroLibraries(code, zoteroLibrariesOutput.text, zoteroLibrariesError.text, generation)
         }
     }
 
@@ -472,10 +575,14 @@ PanelWindow {
     }
 
     function draftFor(path) {
+        // Legacy path-keyed drafts keep working; an empty path falls back to
+        // the selected UUID so Zotero-only projects keep a draft.
+        if (!path && typeof selectedProjectId !== "undefined" && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim())) path = "id:" + String(selectedProjectId).trim().toLowerCase()
         return path && drafts[path] !== undefined ? String(drafts[path]) : ""
     }
 
     function setDraft(path, value) {
+        if (!path && typeof selectedProjectId !== "undefined" && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim())) path = "id:" + String(selectedProjectId).trim().toLowerCase()
         if (!path) return
         let copy = Object.assign({}, drafts)
         copy[path] = String(value || "")
@@ -518,7 +625,7 @@ PanelWindow {
     // the control RPC and its project-specific session directory.
     function sessionControlBlockedReason() {
         let worker = selectedAgent
-        if (!selectedPath || !worker) return "Select a project before managing its session."
+        if ((!selectedPath && !(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim()))) || !worker) return "Select a project before managing its session."
         if (pageBusy || pageRetiring) return "Wait for the page refresh to finish."
         if (sendBusy) return "Wait for the current request to finish loading."
         if (toggleBusy || toggleRetiring) return "Wait for the page checkbox write to finish."
@@ -1232,7 +1339,463 @@ PanelWindow {
         return true
     }
 
+    function isUuid(value) {
+        return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(value === undefined || value === null ? "" : value).trim());
+    }
+
+    function agentKeyFor(project) {
+        // Stable cache key: registry UUID when present, else the legacy note
+        // path. Legacy {path,page} records fall back to path, so existing
+        // page-keyed tests keep working; UUID projects never collide.
+        try {
+            let id = projectId(project)
+            if ((typeof isUuid === "function" ? isUuid(id) : (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(id || "").trim())))) return "id:" + String(id).trim().toLowerCase()
+        } catch (error) {}
+        try {
+            let note = projectNotePath(project)
+            if (note) return String(note)
+        } catch (error) {}
+        return ""
+    }
+
+    function draftKey() {
+        // Composer key: UUID projects (incl. Zotero-only with no note) use
+        // their stable id; note projects keep the legacy path key.
+        if ((/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim()))) return "id:" + String(selectedProjectId).trim().toLowerCase()
+        return String(selectedPath || "")
+    }
+
+    function projectZotero(project) {
+        if (!project || typeof project !== "object") return null
+        let raw = project.zotero_collection
+        if (raw === undefined || raw === null) return null
+        return raw
+    }
+
+    function zoteroStatusText(project) {
+        let link = projectZotero(project || selectedProject)
+        if (!link) return "No Zotero collection linked."
+        try {
+            if (typeof link === "object" && link.collection_key)
+                return "Linked: " + String(link.library_type || "user") + "/" + String(link.library_id || "") + "/" + String(link.collection_key || "");
+        } catch (error) {}
+        return "Linked (offline/unknown shape preserved)."
+    }
+
+    function zoteroOpen(project) {
+        let link = projectZotero(project || selectedProject)
+        if (!link || typeof link !== "object" || !link.collection_key) { notice = "This project has no linked Zotero collection."; return false }
+        // Collection keys are opaque; open via the Zotero web library when a
+        // server id is known, else surface status. Never embeds API keys.
+        let server = String(link.server_id || "").trim()
+        if (!server) { notice = zoteroStatusText(project || selectedProject); return false }
+        Qt.openUrlExternally("https://" + server + "/collection/" + String(link.collection_key))
+        return true
+    }
+
+    function zoteroUnlink() {
+        projectFormZoteroServer = ""
+        projectFormZoteroLibraryType = "user"
+        projectFormZoteroLibraryId = ""
+        projectFormZoteroCollectionKey = ""
+        projectFormZoteroIncludeSub = true
+        projectFormZoteroRaw = null
+        projectFormZoteroStatus = "Unlinked; save to apply."
+        return true
+    }
+
+    function zoteroFormLink() {
+        // Returns null (unlink) or the validated link object; preserves
+        // unknown/offline raw shapes by returning the raw when the visible
+        // fields are untouched and raw exists.
+        if (!projectFormZoteroCollectionKey && projectFormZoteroRaw !== null && projectFormZoteroRaw !== undefined) {
+            // Untouched unknown link: preserve verbatim for the backend.
+            if (!projectFormZoteroServer && !projectFormZoteroLibraryId) return projectFormZoteroRaw
+        }
+        if (!String(projectFormZoteroCollectionKey || "").trim()) return null
+        let key = String(projectFormZoteroCollectionKey || "").trim().toUpperCase()
+        if (!/^[A-Z0-9]{8}$/.test(key)) { projectFormError = "Zotero collection key must be 8 uppercase alphanumerics."; return undefined }
+        let libId = String(projectFormZoteroLibraryId || "").trim()
+        if (libId && !/^[0-9]+$/.test(libId)) { projectFormError = "Zotero library id must be digits ('0' allowed for user libraries)."; return undefined }
+        let libType = String(projectFormZoteroLibraryType || "user").trim()
+        if (libType !== "user" && libType !== "group") { projectFormError = "Zotero library type must be 'user' or 'group'."; return undefined }
+        return { server_id: String(projectFormZoteroServer || "").trim(),
+            library_type: libType, library_id: libId,
+            collection_key: key, include_subcollections: !!projectFormZoteroIncludeSub }
+    }
+
+    // Read-only Zotero collection picker. The helper call never writes,
+    // saves, or mutates anything; picking only fills the form fields and
+    // saving still goes through zoteroFormLink().
+    function zoteroCollectionRows(collections) {
+        if (!Array.isArray(collections)) return []
+        let known = {}
+        let items = []
+        for (let i = 0; i < collections.length; i++) {
+            let entry = collections[i]
+            if (!entry || typeof entry !== "object") continue
+            if (entry.key === undefined || entry.key === null) continue
+            let key = String(entry.key).trim().toUpperCase()
+            if (!/^[A-Z0-9]{8}$/.test(key)) continue
+            if (known[key]) continue
+            if (entry.name === undefined || entry.name === null) continue
+            let name = String(entry.name).trim()
+            if (!name) continue
+            known[key] = true
+            let parent = ""
+            if (entry.parentCollection !== undefined && entry.parentCollection !== null
+                    && entry.parentCollection !== false) {
+                parent = String(entry.parentCollection).trim().toUpperCase()
+            }
+            items.push({ key: key, name: name, parent: parent })
+        }
+        let byKey = {}
+        for (let i = 0; i < items.length; i++) byKey[items[i].key] = items[i]
+        function siblingLess(a, b) {
+            let an = a.name.toLowerCase()
+            let bn = b.name.toLowerCase()
+            if (an < bn) return -1
+            if (an > bn) return 1
+            if (a.key < b.key) return -1
+            if (a.key > b.key) return 1
+            return 0
+        }
+        let children = {}
+        let roots = []
+        for (let i = 0; i < items.length; i++) {
+            let item = items[i]
+            if (item.parent && byKey[item.parent] && item.parent !== item.key) {
+                if (!children[item.parent]) children[item.parent] = []
+                children[item.parent].push(item)
+            } else {
+                roots.push(item)
+            }
+        }
+        roots.sort(siblingLess)
+        for (let parentKey in children) children[parentKey].sort(siblingLess)
+        // Cycle-safe depth-first walk: the visited set guarantees
+        // termination, and any entry unreachable from a root (e.g. cycle
+        // members) is appended afterwards as a depth-0 root so nothing is
+        // lost.
+        let visited = {}
+        let rows = []
+        function walk(item, depth) {
+            if (visited[item.key]) return
+            visited[item.key] = true
+            rows.push({ key: item.key, name: item.name, depth: depth })
+            let kids = children[item.key] || []
+            for (let k = 0; k < kids.length; k++) walk(kids[k], depth + 1)
+        }
+        for (let r = 0; r < roots.length; r++) walk(roots[r], 0)
+        for (let i = 0; i < items.length; i++) {
+            if (!visited[items[i].key]) walk(items[i], 0)
+        }
+        return rows
+    }
+
+    function zoteroCollectionsPayload() {
+        let libType = String(projectFormZoteroLibraryType || "").trim()
+        let libId = String(projectFormZoteroLibraryId || "").trim()
+        if ((libType === "user" || libType === "group") && /^[0-9]{1,20}$/.test(libId)
+                && !(libType === "group" && libId === "0")) {
+            return { library_type: libType, library_id: libId }
+        }
+        return {}
+    }
+
+    function zoteroLibraryIndexFor(libraries, type, id) {
+        if (!Array.isArray(libraries) || !libraries.length) return 0
+        let wantType = String(type === undefined || type === null ? "" : type).trim()
+        let wantId = String(id === undefined || id === null ? "" : id).trim()
+        if (!wantType || !wantId) return 0
+        for (let i = 0; i < libraries.length; i++) {
+            let entry = libraries[i]
+            if (!entry || typeof entry !== "object") continue
+            let entryType = ""
+            let entryId = ""
+            try { entryType = String(entry.type || "").trim() } catch (error) { entryType = "" }
+            try { entryId = String(entry.id === undefined || entry.id === null ? "" : entry.id).trim() } catch (error) { entryId = "" }
+            if (entryType === wantType && entryId === wantId) return i
+        }
+        return 0
+    }
+
+    function zoteroPickerCollectionsPayload() {
+        return { library_type: zoteroPickerLibraryType, library_id: zoteroPickerLibraryId }
+    }
+
+    function openZoteroPicker() {
+        if (!projectFormOpen) return false
+        if (projectWriteBusy || projectWriteRetiring || listBusy || listRetiring) return false
+        if (zoteroPickerBusy || zoteroPickerRetiring) return false
+        if (zoteroLibrariesBusy || zoteroLibrariesRetiring) return false
+        zoteroPickerOpen = true
+        zoteroPickerRows = []
+        zoteroPickerIndex = 0
+        zoteroPickerLibraries = []
+        zoteroPickerLibraryIndex = 0
+        zoteroPickerServer = ""
+        zoteroPickerLibraryType = "user"
+        zoteroPickerLibraryId = "0"
+        zoteroPickerStatus = "Loading Zotero libraries…"
+        return startZoteroLibraries()
+    }
+
+    function closeZoteroPicker() {
+        if (typeof cancelZoteroCollectionsRead === "function") cancelZoteroCollectionsRead()
+        if (typeof cancelZoteroLibrariesRead === "function") cancelZoteroLibrariesRead()
+        zoteroPickerOpen = false
+        return true
+    }
+
+    function startZoteroCollections() {
+        if (zoteroPickerBusy || zoteroCollectionsProcess.running || zoteroPickerRetiring) {
+            if (zoteroPickerRetiring) zoteroPickerStatus = "The previous collection read is still shutting down."
+            return false
+        }
+        zoteroPickerGeneration++
+        zoteroPickerProcessGeneration = zoteroPickerGeneration
+        zoteroPickerLaunchGeneration = zoteroPickerGeneration
+        zoteroPickerBusy = true
+        zoteroPickerStarted = false
+        zoteroPickerStartFailed = false
+        zoteroPickerRetiring = false
+        zoteroCollectionsProcess.command = ["python3", Quickshell.shellPath("scripts/zotero.py"), "collections"]
+        zoteroPickerTimeout.restart()
+        zoteroCollectionsProcess.stdinEnabled = true
+        zoteroCollectionsProcess.running = true
+        return true
+    }
+
+    function startZoteroLibraries() {
+        if (zoteroLibrariesBusy || zoteroLibrariesProcess.running || zoteroLibrariesRetiring) {
+            if (zoteroLibrariesRetiring) zoteroPickerStatus = "The previous library read is still shutting down."
+            return false
+        }
+        zoteroLibrariesGeneration++
+        zoteroLibrariesProcessGeneration = zoteroLibrariesGeneration
+        zoteroLibrariesLaunchGeneration = zoteroLibrariesGeneration
+        zoteroLibrariesBusy = true
+        zoteroLibrariesStarted = false
+        zoteroLibrariesStartFailed = false
+        zoteroLibrariesRetiring = false
+        zoteroLibrariesProcess.command = ["python3", Quickshell.shellPath("scripts/zotero.py"), "libraries"]
+        zoteroLibrariesTimeout.restart()
+        zoteroLibrariesProcess.stdinEnabled = true
+        zoteroLibrariesProcess.running = true
+        return true
+    }
+
+    function finishZoteroLibraries(code, output, diagnostic, generation) {
+        if (generation !== zoteroLibrariesGeneration) return
+        zoteroLibrariesTimeout.stop()
+        zoteroLibrariesBusy = false
+        let data = null
+        if (code === 0) {
+            try { data = JSON.parse(output || "{}") } catch (error) { data = null }
+        }
+        if (data && typeof data === "object" && Array.isArray(data.libraries)) {
+            let libs = []
+            for (let i = 0; i < data.libraries.length; i++) {
+                let entry = data.libraries[i]
+                if (!entry || typeof entry !== "object") continue
+                let entryType = ""
+                try { entryType = String(entry.type || "").trim() } catch (error) { entryType = "" }
+                if (entryType !== "user" && entryType !== "group") continue
+                let entryId = ""
+                try { entryId = String(entry.id === undefined || entry.id === null ? "" : entry.id).trim() } catch (error) { entryId = "" }
+                if (!/^[0-9]{1,20}$/.test(entryId)) continue
+                if (entryType === "group" && entryId === "0") continue
+                if (entry.name === undefined || entry.name === null) continue
+                let entryName = ""
+                try { entryName = String(entry.name).trim() } catch (error) { entryName = "" }
+                if (!entryName) continue
+                if (entryName.length > 255) entryName = entryName.substring(0, 255)
+                libs.push({ type: entryType, id: entryId, name: entryName })
+            }
+            zoteroPickerLibraries = libs
+            zoteroPickerLibraryIndex = 0
+            try { zoteroPickerServer = String(data.server_id || "") } catch (error) { zoteroPickerServer = "" }
+            let defIndex = 0
+            try {
+                let wanted = zoteroCollectionsPayload()
+                let wantType = wanted && wanted.library_type ? String(wanted.library_type) : ""
+                let wantId = wanted && wanted.library_id ? String(wanted.library_id) : ""
+                defIndex = zoteroLibraryIndexFor(libs, wantType, wantId)
+            } catch (error) { defIndex = 0 }
+            if (!isFinite(defIndex) || defIndex < 0 || defIndex >= libs.length) defIndex = 0
+            if (libs.length > 0) {
+                zoteroPickerLibraryIndex = defIndex
+                let chosen = libs[defIndex] || libs[0]
+                zoteroPickerLibraryType = chosen.type === "group" ? "group" : "user"
+                zoteroPickerLibraryId = String(chosen.id)
+            } else {
+                zoteroPickerLibraryIndex = 0
+                zoteroPickerLibraryType = "user"
+                zoteroPickerLibraryId = "0"
+            }
+            zoteroPickerStatus = "Loading collections…"
+            startZoteroCollections()
+            return
+        }
+        zoteroPickerLibraries = []
+        zoteroPickerLibraryIndex = 0
+        let detail = ""
+        try { detail = safeText(diagnostic) || safeText(output) } catch (error) { detail = "" }
+        zoteroPickerStatus = "Could not load Zotero libraries (exit " + code + ")" +
+            (detail ? ": " + detail : "") + ". Enter the key manually or retry."
+    }
+
+    function cancelZoteroLibrariesRead() {
+        if (!zoteroLibrariesBusy) return
+        zoteroLibrariesRetiring = true
+        zoteroLibrariesGeneration++
+        zoteroLibrariesBusy = false
+        zoteroLibrariesStartFailed = false
+        zoteroLibrariesProcess.running = false
+        zoteroPickerStatus = "Library list timed out; retry."
+    }
+
+    function handleZoteroLibrariesStartFailure(generation) {
+        if (generation !== zoteroLibrariesGeneration) return
+        zoteroLibrariesTimeout.stop()
+        if (!zoteroLibrariesStarted && !zoteroLibrariesProcess.running) zoteroLibrariesRetiring = false
+        zoteroLibrariesBusy = false
+        zoteroPickerStatus = "Could not start the Zotero helper process; enter the key manually or retry."
+    }
+
+    function selectZoteroLibrary(index) {
+        let at = Number(index)
+        if (!isFinite(at) || Math.floor(at) !== at) return false
+        if (!Array.isArray(zoteroPickerLibraries) || at < 0 || at >= zoteroPickerLibraries.length) return false
+        let entry = zoteroPickerLibraries[at]
+        if (!entry || typeof entry !== "object") return false
+        // Helper calls are serialized like every other process in this
+        // widget: a running or retiring read is never overlapped (Quickshell
+        // keeps Process.running true until the child actually exits, so a
+        // kill-and-restart here would be silently dropped). Wait for the
+        // current exit, then switch.
+        if (zoteroPickerBusy || zoteroPickerStarted || zoteroPickerRetiring || zoteroCollectionsProcess.running) {
+            zoteroPickerStatus = "Wait for the collection list to finish loading."
+            return false
+        }
+        zoteroPickerLibraryIndex = at
+        let entryType = ""
+        try { entryType = String(entry.type || "").trim() } catch (error) { entryType = "" }
+        zoteroPickerLibraryType = entryType === "group" ? "group" : "user"
+        let entryId = ""
+        try { entryId = String(entry.id === undefined || entry.id === null ? "" : entry.id).trim() } catch (error) { entryId = "" }
+        zoteroPickerLibraryId = /^[0-9]{1,20}$/.test(entryId) ? entryId : "0"
+        zoteroPickerStatus = "Loading collections…"
+        return startZoteroCollections()
+    }
+
+    function finishZoteroCollections(code, output, diagnostic, generation) {
+        if (generation !== zoteroPickerGeneration) return
+        zoteroPickerTimeout.stop()
+        zoteroPickerBusy = false
+        let data = null
+        if (code === 0) {
+            try { data = JSON.parse(output || "{}") } catch (error) { data = null }
+        }
+        if (data && typeof data === "object" && Array.isArray(data.collections)) {
+            let rows = []
+            try { rows = zoteroCollectionRows(data.collections) } catch (error) { rows = [] }
+            if (!Array.isArray(rows)) rows = []
+            zoteroPickerRows = rows
+            zoteroPickerIndex = 0
+            try { zoteroPickerServer = String(data.server_id || "") } catch (error) { zoteroPickerServer = "" }
+            try {
+                let library = data.library
+                if (library && typeof library === "object") {
+                    let libType = String(library.type || "user").trim()
+                    zoteroPickerLibraryType = libType === "group" ? "group" : "user"
+                    let libId = String(library.id === undefined || library.id === null ? "0" : library.id).trim()
+                    zoteroPickerLibraryId = /^[0-9]{1,20}$/.test(libId) ? libId : "0"
+                } else {
+                    zoteroPickerLibraryType = "user"
+                    zoteroPickerLibraryId = "0"
+                }
+            } catch (error) {
+                zoteroPickerLibraryType = "user"
+                zoteroPickerLibraryId = "0"
+            }
+            if (rows.length > 0) {
+                let label = zoteroPickerLibraryType + "/" + zoteroPickerLibraryId
+                try {
+                    if (typeof zoteroPickerLibraries !== "undefined" && Array.isArray(zoteroPickerLibraries)) {
+                        for (let i = 0; i < zoteroPickerLibraries.length; i++) {
+                            let known = zoteroPickerLibraries[i]
+                            if (known && typeof known === "object" &&
+                                    String(known.type || "") === String(zoteroPickerLibraryType || "") &&
+                                    String(known.id === undefined || known.id === null ? "" : known.id) === String(zoteroPickerLibraryId || "") &&
+                                    known.name !== undefined && known.name !== null && String(known.name).trim() !== "") {
+                                label = String(known.name).trim().substring(0, 255)
+                                break
+                            }
+                        }
+                    }
+                } catch (error) {}
+                zoteroPickerStatus = String(rows.length) + " collections in " + label
+            } else {
+                zoteroPickerStatus = "No collections found in this library."
+            }
+            return
+        }
+        zoteroPickerRows = []
+        zoteroPickerIndex = 0
+        let detail = ""
+        try { detail = safeText(diagnostic) || safeText(output) } catch (error) { detail = "" }
+        zoteroPickerStatus = "Could not load Zotero collections (exit " + code + ")" +
+            (detail ? ": " + detail : "") + ". Enter the key manually or retry."
+    }
+
+    function cancelZoteroCollectionsRead() {
+        if (!zoteroPickerBusy) return
+        zoteroPickerRetiring = true
+        zoteroPickerGeneration++
+        zoteroPickerBusy = false
+        zoteroPickerStartFailed = false
+        zoteroCollectionsProcess.running = false
+        zoteroPickerStatus = "Collection list timed out; retry."
+    }
+
+    function handleZoteroPickerStartFailure(generation) {
+        if (generation !== zoteroPickerGeneration) return
+        zoteroPickerTimeout.stop()
+        if (!zoteroPickerStarted && !zoteroCollectionsProcess.running) zoteroPickerRetiring = false
+        zoteroPickerBusy = false
+        zoteroPickerStatus = "Could not start the Zotero helper process; enter the key manually or retry."
+    }
+
+    function zoteroPickCollection(key) {
+        let wanted = String(key === undefined || key === null ? "" : key).trim().toUpperCase()
+        let row = null
+        for (let i = 0; i < zoteroPickerRows.length; i++) {
+            let candidate = zoteroPickerRows[i]
+            if (candidate && String(candidate.key).trim().toUpperCase() === wanted) { row = candidate; break }
+        }
+        if (!row) return false
+        projectFormZoteroServer = zoteroPickerServer
+        projectFormZoteroLibraryType = zoteroPickerLibraryType
+        projectFormZoteroLibraryId = zoteroPickerLibraryId
+        projectFormZoteroCollectionKey = row.key
+        projectFormZoteroRaw = null
+        projectFormZoteroStatus = "Picked: " + zoteroPickerLibraryType + "/" + zoteroPickerLibraryId +
+            "/" + row.key + " (" + row.name + "); save to apply."
+        zoteroPickerOpen = false
+        return true
+    }
+
     function agentFor(path) {
+        // Legacy path entry point preserved for tests: a UUID string (or
+        // "id:<uuid>") creates/returns the UUID-pinned worker; otherwise the
+        // legacy per-note worker.
+        let key = String(path || "")
+        let asId = ""
+        if (key.indexOf("id:") === 0) asId = key.substring(3)
+        else if ((typeof isUuid === "function" ? isUuid(key) : (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(key || "").trim())))) asId = key
+        if (asId && (typeof isUuid === "function" ? isUuid(asId) : (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(asId || "").trim())))) { try { if (typeof agentForId === "function") return agentForId(asId); } catch (error) {} }
         if (!path) return null
         let existing = agentCache[path]
         if (existing) {
@@ -1256,6 +1819,42 @@ PanelWindow {
         return worker
     }
 
+    function agentForId(id) {
+        let norm = String(id || "").trim().toLowerCase()
+        if (!(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(norm || "").trim()))) return null
+        let key = "id:" + norm
+        let existing = agentCache[key]
+        if (existing) {
+            if (existing.idleStopped || existing.idleStopping) existing.start()
+            return existing
+        }
+        // UUID-pinned worker: projectId primary, legacy page empty unless a
+        // note is linked (resolved per operation, not frozen here).
+        let note = ""
+        try {
+            let proj = projectById(norm)
+            if (proj) note = projectNotePath(proj)
+        } catch (error) {}
+        let worker = projectAgentComponent.createObject(root, { projectId: norm, projectPath: note })
+        if (!worker) {
+            agentError = "Could not create a project agent."
+            return null
+        }
+        let copy = Object.assign({}, agentCache)
+        copy[key] = worker
+        agentCache = copy
+        worker.start()
+        return worker
+    }
+
+    function agentForProject(project) {
+        let key = ""
+        try { key = agentKeyFor(project) } catch (error) { key = "" }
+        if (!key) return null
+        if (key.indexOf("id:") === 0) return agentForId(key.substring(3))
+        return agentFor(key)
+    }
+
     function pauseIdleAgents(exceptPath) {
         for (let path of Object.keys(agentCache)) {
             if (exceptPath && path === exceptPath) continue
@@ -1270,6 +1869,13 @@ PanelWindow {
         agentError = ""
         notice = "Retrying project agent…"
         return worker.start()
+    }
+
+    function clearPendingOpenProject() {
+        pendingOpenProjectId = "";
+        pendingOpenAction = "";
+        pendingOpenMessage = "";
+        pendingOpenInteraction = -1;
     }
 
     function selectProject(project) {
@@ -1292,6 +1898,17 @@ PanelWindow {
             path = String((project.logseq_path !== undefined && project.logseq_path !== null ? project.logseq_path : project.path) || "")
         }
         if (!id) return false
+        // Superseding manual navigation invalidates a queued palette
+        // handoff for a different project so an old ask/history cannot
+        // execute on a later selection. The consume path clears the queue
+        // before calling selectProject, so a matching id is never dropped
+        // here.
+        try {
+            if (String(pendingOpenProjectId || "") !== "" &&
+                    String(pendingOpenProjectId || "") !== String(id || "")) {
+                root.clearPendingOpenProject()
+            }
+        } catch (error) {}
         if (typeof pageProcess !== "undefined" && pageProcess && pageProcess.running) {
             notice = "The previous page read is still shutting down; retry selection shortly."
             return false
@@ -1323,10 +1940,19 @@ PanelWindow {
         }
         let reason = blockedReason()
         if (reason) { notice = reason; return false }
-        // Note-backed selection pauses other agents; a note-less project
-        // has no agent to resume and must never launch one.
-        if (path) pauseIdleAgents(path)
-        else pauseIdleAgents()
+        // UUID-pinned selection pauses other agents by stable key; legacy
+        // path behavior preserved. Zotero-only (no note) projects own a
+        // UUID worker and must launch one.
+        try {
+            let _key = ""
+            try { _key = (typeof agentKeyFor === "function" ? agentKeyFor(project) : "") } catch (error) { _key = "" }
+            if (_key) pauseIdleAgents(_key)
+            else if (path) pauseIdleAgents(path)
+            else pauseIdleAgents()
+        } catch (error) {
+            if (path) pauseIdleAgents(path)
+            else pauseIdleAgents()
+        }
         interactionGeneration++
         try { selectedProjectId = id } catch (error) {}
         selectedPath = path
@@ -1344,7 +1970,16 @@ PanelWindow {
             }
             selectedIndex = Math.max(0, _found)
         } catch (error) { selectedIndex = 0 }
-        if (path) {
+        if ((/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(id || "").trim()))) {
+            try { selectedAgent = (typeof agentForId === "function" ? agentForId(id) : agentFor(path)) } catch (error) { selectedAgent = null }
+            try { currentPage = path ? pageFor(path) : null } catch (error) { currentPage = null }
+            // Keep the legacy ScopedAgent page in sync when a note is linked;
+            // Zotero-only workers keep an empty page.
+            try {
+                if (selectedAgent && String(selectedAgent.projectPath || "") !== String(path || ""))
+                    selectedAgent.projectPath = String(path || "")
+            } catch (error) {}
+        } else if (path) {
             selectedAgent = agentFor(path)
             try { currentPage = pageFor(path) } catch (error) { currentPage = null }
         } else {
@@ -1398,6 +2033,198 @@ PanelWindow {
         }
     }
 
+    // Resume handoff entry point (palette shell handoff). Opens the existing
+    // projects tab, loads the authoritative registry, then selects by stable
+    // id after list completion and reuses selectProject/agentFor. Never
+    // spawns a Pi worker directly and never auto-sends: ask prefills the
+    // composer, history focuses the transcript, resume opens the context.
+    // The optional bounded message carries the compact restoration summary
+    // so partial failures stay visible; empty preserves legacy behavior.
+    function openProject(projectId, action, message) {
+        let wanted = String(projectId === undefined || projectId === null ? "" : projectId)
+        let act = String(action === undefined || action === null ? "" : action)
+        if (act !== "" && act !== "resume" && act !== "ask" && act !== "history") act = ""
+        let msg = String(message === undefined || message === null ? "" : message).substring(0, 300)
+        // Plain open (no stable id): keep the legacy palette behavior and
+        // invalidate any queued handoff so an old ask/history cannot run
+        // on this normal open.
+        if (!wanted) {
+            try { root.clearPendingOpenProject() } catch (error) {}
+            activeTab = "projects"
+            root.open()
+            return true
+        }
+        let reason = blockedReason()
+        if (reason) {
+            // Do not bypass busy/history/approval gates; surface and open.
+            // A blocked handoff is dropped, never queued.
+            try { root.clearPendingOpenProject() } catch (error) {}
+            activeTab = "projects"
+            root.open()
+            notice = reason
+            return false
+        }
+        pendingOpenProjectId = wanted
+        pendingOpenAction = act
+        pendingOpenMessage = msg
+        pendingOpenInteraction = interactionGeneration
+        activeTab = "projects"
+        if (!requestedOpen) root.open()
+        else startList()
+        // Fast path: the authoritative list is already present and idle.
+        // Selection still goes through selectProject/agentFor only.
+        if (requestedOpen && !listBusy && !listRetiring && projects.length) {
+            let target = root.projectById(wanted)
+            if (target) root.consumePendingOpenProject()
+        }
+        return true
+    }
+
+    function resumeContinuationText(project) {
+        let name = ""
+        try { name = root.projectName(project) } catch (error) { name = "" }
+        if (!name) name = String((project && project.id) || "this project")
+        return "Continue work on " + name + ". Inspect the deterministic desktop ResumePlan and linked project context, then propose the next step."
+    }
+
+    function focusComposer() {
+        try {
+            Qt.callLater(function() {
+                try { composer.forceActiveFocus() } catch (error) {}
+            })
+        } catch (error) {}
+    }
+
+    function focusTranscript() {
+        try {
+            Qt.callLater(function() {
+                try { historyList.forceActiveFocus() } catch (error) {}
+            })
+        } catch (error) {}
+    }
+
+    function consumePendingOpenProject() {
+        let wanted = String(pendingOpenProjectId || "")
+        if (!wanted) return false
+        // Bound to the opening interaction: a superseding navigation or a
+        // close/open cycle invalidates the queued ask/history.
+        try {
+            if (Number(pendingOpenInteraction) !== Number(interactionGeneration)) {
+                try { root.clearPendingOpenProject() } catch (ignored) {}
+                return false
+            }
+        } catch (error) {}
+        let target = null
+        try { target = root.projectById(wanted) } catch (error) { target = null }
+        if (!target) {
+            notice = "That project is no longer in the registry."
+            try { root.clearPendingOpenProject() } catch (ignored) {}
+            return false
+        }
+        let act = String(pendingOpenAction || "")
+        let msg = String(pendingOpenMessage || "")
+        let targetPath = ""
+        try { targetPath = root.projectNotePath(target) } catch (error) { targetPath = "" }
+        let alreadySelected = String(selectedProjectId || "") === wanted &&
+            String(selectedPath || "") === String(targetPath || "")
+        if (alreadySelected) {
+            // Same id/path: never drop the action merely because
+            // selectProject would report no change. Run a fresh guard,
+            // reconcile to the authoritative registry record, refresh the
+            // page when idle, then apply the action.
+            let reason = ""
+            try { reason = root.blockedReason() } catch (error) { reason = "" }
+            if (reason) {
+                notice = reason
+                root.clearPendingOpenProject()
+                return false
+            }
+            try { selectedProject = target } catch (error) {}
+            // Reconcile the list cursor to the authoritative record.
+            try {
+                let _all = filteredProjects()
+                for (let _k = 0; _k < _all.length; _k++) {
+                    let _kid = ""
+                    try {
+                        _kid = (typeof projectId === "function") ? projectId(_all[_k]) :
+                            String((_all[_k].id !== undefined && _all[_k].id !== null ? _all[_k].id : _all[_k].path) || "")
+                    } catch (ignored) { _kid = "" }
+                    if (_kid === wanted) {
+                        selectedIndex = _k
+                        try {
+                            if (typeof projectList !== "undefined" && projectList) {
+                                projectList.currentIndex = _k
+                                projectList.positionViewAtIndex(_k, ListView.Contain)
+                            }
+                        } catch (ignored) {}
+                        break
+                    }
+                }
+            } catch (error) {}
+            if (targetPath) {
+                try {
+                    if (!currentPage || String(currentPage.path || "") !== String(targetPath || ""))
+                        currentPage = pageFor(targetPath)
+                } catch (error) {}
+                if (!hasBusyAgent() && !pageBusy && !pageRetiring && !toggleBusy && !toggleRetiring && !sendBusy) {
+                    try { selectedAgent = agentFor(targetPath) } catch (error) {}
+                    try {
+                        if (!currentPage || String(currentPage.path || "") !== String(targetPath || ""))
+                            startPage(targetPath, "refresh", "")
+                    } catch (error) {}
+                } else if (!selectedAgent) {
+                    try { selectedAgent = agentCache[targetPath] || null } catch (error) {}
+                }
+            } else {
+                selectedAgent = null
+                currentPage = null
+            }
+            try { root.clearPendingOpenProject() } catch (error) {}
+            if (msg) notice = msg
+            if (act === "ask") {
+                if (selectedPath) {
+                    let current = ""
+                    try { current = root.draftFor(selectedPath) } catch (error) { current = "" }
+                    if (!String(current || "").trim()) {
+                        try { root.setDraft(selectedPath, root.resumeContinuationText(target)) } catch (error) {}
+                    }
+                    root.focusComposer()
+                }
+            } else if (act === "history") {
+                root.focusTranscript()
+            } else {
+                if (selectedPath) root.focusComposer()
+            }
+            // A restoration summary must survive the page refresh guards.
+            if (msg) notice = msg
+            return true
+        }
+        try { root.clearPendingOpenProject() } catch (error) {}
+        // Different project: the normal guarded selectProject pauses old
+        // agents, increments generation, reconciles selection/index, and
+        // starts the page read.
+        if (!root.selectProject(target)) return false
+        if (msg) notice = msg
+        if (act === "ask") {
+            // Prefill only; never auto-send and never generate an AI summary.
+            if (root.selectedPath) {
+                let current = ""
+                try { current = root.draftFor(root.selectedPath) } catch (error) { current = "" }
+                if (!String(current || "").trim()) {
+                    try { root.setDraft(root.selectedPath, root.resumeContinuationText(target)) } catch (error) {}
+                }
+                root.focusComposer()
+            }
+        } else if (act === "history") {
+            root.focusTranscript()
+        } else {
+            // resume/default: open the selected project context.
+            if (root.selectedPath) root.focusComposer()
+        }
+        if (msg) notice = msg
+        return true
+    }
+
     function close() {
         try { root.closeModelPopup() } catch (error) {}
         try { root.closeSessionMenu() } catch (error) {}
@@ -1407,6 +2234,8 @@ PanelWindow {
         if (activeTab === "journal" && journalChild && !journalChild.pause()) return false
         pauseIdleAgents()
         interactionGeneration++
+        try { root.clearPendingOpenProject() } catch (error) {}
+        if (typeof closeZoteroPicker === "function") closeZoteroPicker()
         requestedOpen = false
         closing = true
         approvalRequest = null
@@ -1474,13 +2303,27 @@ PanelWindow {
     }
 
     function send() {
-        if (!requestedOpen || closing || !selectedPath || !selectedAgent) return false
+        // UUID-pinned (incl. Zotero-only with no note) sends are allowed;
+        // legacy path gates preserved. Note tools fail clearly without a
+        // note inside the agent; folder/Zotero tools stay available.
+        if (!requestedOpen || closing || (!selectedPath && !(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim()))) || !selectedAgent) return false
         if (toggleBusy || toggleRetiring || pageBusy || sendBusy || approvalOpen() || hasBusyAgent()) {
             notice = blockedReason() || "The project agent is busy."
             return false
         }
-        let text = draftFor(selectedPath).trim()
+        // Draft key is UUID-aware via draftFor fallback; keep the legacy
+        // selectedPath call shape for compatibility.
+        let text = ""
+        try { text = draftFor(selectedPath).trim() } catch (error) { text = "" }
+        if (!text && (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim()))) {
+            try { text = draftFor("id:" + String(selectedProjectId).trim().toLowerCase()).trim() } catch (error) {}
+        }
         if (!text) { notice = "Describe the completed work or the markdown change to make."; return false }
+        // Zotero-only (no note): prompt the UUID worker directly without a
+        // page read; citations are fetched on demand by the agent.
+        if (!selectedPath && (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim()))) {
+            return sendWithoutNote(text)
+        }
         sendGeneration++
         sendInteraction = interactionGeneration
         sendPath = selectedPath
@@ -1495,6 +2338,54 @@ PanelWindow {
             return false
         }
         return true
+    }
+
+    function sendWithoutNote(text) {
+        // Direct UUID prompt without a Logseq page read. History gating
+        // mirrors the page flow: the worker must be ready and history
+        // loaded/valid, otherwise the send is blocked with a retry notice.
+        let worker = selectedAgent
+        if (!worker) { notice = "Select a project before sending."; return false }
+        if (!worker.ready) { notice = worker.status || "Wait for the project agent to become ready."; return false }
+        if (worker.sessionRefreshPending || worker.messagesAwaitingSessionState) {
+            notice = "Loading session history…"
+            return false
+        }
+        sendGeneration++
+        sendInteraction = interactionGeneration
+        sendPath = ""
+        sendText = String(text || "")
+        sendBusy = true
+        errorMessage = ""
+        notice = "Sending…"
+        let key = (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim())) ? "id:" + String(selectedProjectId).trim().toLowerCase() : String(selectedPath || "")
+        pendingPrompt = { worker: worker, path: key, text: String(text || ""), id: "" }
+        let rid = ""
+        try { rid = worker.prompt(String(text || "")) } catch (error) { rid = "" }
+        if (!rid) {
+            sendBusy = false
+            pendingPrompt = null
+            notice = worker.status || "Project agent rejected the prompt."
+            return false
+        }
+        if (rid === true) {
+            // Legacy synchronous mock: already accepted.
+            try { setDraft(key, "") } catch (error) {}
+            pendingPrompt = null
+            sendBusy = false
+            notice = ""
+            return true
+        }
+        pendingPrompt.id = rid
+        // Page-load gate clears like the page flow (sendBusy only guards the
+        // fresh-context load); the accepted ack clears the draft.
+        sendBusy = false
+        notice = ""
+        return true
+    }
+
+    function clearSendBusy() {
+        sendBusy = false
     }
 
     function stopAgent() {
@@ -1582,10 +2473,28 @@ PanelWindow {
     }
 
     function handleProcessRunningChanged(kind) {
-        let process = kind === "list" ? listProcess : (kind === "page" ? pageProcess : (kind === "projectWrite" ? projectWriteProcess : toggleProcess))
-        let busy = kind === "list" ? listBusy : (kind === "page" ? pageBusy : (kind === "projectWrite" ? projectWriteBusy : toggleBusy))
-        let started = kind === "list" ? listStarted : (kind === "page" ? pageStarted : (kind === "projectWrite" ? projectWriteStarted : toggleStarted))
-        let failed = kind === "list" ? listStartFailed : (kind === "page" ? pageStartFailed : (kind === "projectWrite" ? projectWriteStartFailed : toggleStartFailed))
+        if (kind === "zoteroLibraries") {
+            let librariesProcess = null
+            let librariesBusy = false
+            let librariesStarted = false
+            let librariesFailed = false
+            try { librariesProcess = zoteroLibrariesProcess } catch (error) { librariesProcess = null }
+            try { librariesBusy = zoteroLibrariesBusy } catch (error) { librariesBusy = false }
+            try { librariesStarted = zoteroLibrariesStarted } catch (error) { librariesStarted = false }
+            try { librariesFailed = zoteroLibrariesStartFailed } catch (error) { librariesFailed = false }
+            if (!librariesProcess) return
+            if (!librariesProcess.running && (librariesBusy || librariesStarted))
+                zoteroLibrariesRetiring = true
+            if (!librariesProcess.running && librariesBusy && !librariesStarted && !librariesFailed) {
+                zoteroLibrariesStartFailed = true
+                handleZoteroLibrariesStartFailure(zoteroLibrariesProcessGeneration)
+            }
+            return
+        }
+        let process = kind === "zoteroPicker" ? zoteroCollectionsProcess : (kind === "list" ? listProcess : (kind === "page" ? pageProcess : (kind === "projectWrite" ? projectWriteProcess : toggleProcess)))
+        let busy = kind === "zoteroPicker" ? zoteroPickerBusy : (kind === "list" ? listBusy : (kind === "page" ? pageBusy : (kind === "projectWrite" ? projectWriteBusy : toggleBusy)))
+        let started = kind === "zoteroPicker" ? zoteroPickerStarted : (kind === "list" ? listStarted : (kind === "page" ? pageStarted : (kind === "projectWrite" ? projectWriteStarted : toggleStarted)))
+        let failed = kind === "zoteroPicker" ? zoteroPickerStartFailed : (kind === "list" ? listStartFailed : (kind === "page" ? pageStartFailed : (kind === "projectWrite" ? projectWriteStartFailed : toggleStartFailed)))
         // Process.running becomes false before onExited. Retire the launch in
         // that gap so a new request cannot overwrite the metadata that the
         // delayed exit handler still needs to classify its response.
@@ -1597,6 +2506,8 @@ PanelWindow {
             toggleRetiring = true
         if (!process.running && kind === "projectWrite" && (projectWriteBusy || projectWriteStarted))
             projectWriteRetiring = true
+        if (!process.running && kind === "zoteroPicker" && (zoteroPickerBusy || zoteroPickerStarted))
+            zoteroPickerRetiring = true
         if (!process.running && busy && !started && !failed) {
             if (kind === "list") { listStartFailed = true; handleListStartFailure() }
             else if (kind === "page") {
@@ -1605,6 +2516,9 @@ PanelWindow {
             } else if (kind === "projectWrite") {
                 projectWriteStartFailed = true
                 handleProjectWriteStartFailure(projectWriteProcessGeneration, projectWriteOp)
+            } else if (kind === "zoteroPicker") {
+                zoteroPickerStartFailed = true
+                handleZoteroPickerStartFailure(zoteroPickerProcessGeneration)
             } else {
                 toggleStartFailed = true
                 handleToggleStartFailure(toggleProcessGeneration)
@@ -1616,6 +2530,8 @@ PanelWindow {
         listTimeout.stop()
         if (!listStarted && !listProcess.running) listRetiring = false
         listBusy = false
+        // Terminal failure invalidates any queued palette handoff.
+        try { root.clearPendingOpenProject() } catch (error) {}
         errorMessage = failure("Project list", 0, "process could not start")
     }
 
@@ -1655,6 +2571,9 @@ PanelWindow {
         listBusy = false
         listStartFailed = false
         listProcess.running = false
+        // Terminal timeout invalidates any queued palette handoff so an
+        // old ask/history cannot run on a later normal open.
+        try { root.clearPendingOpenProject() } catch (error) {}
         errorMessage = failure("Project list", 0, "read timed out; retry")
     }
 
@@ -1703,18 +2622,38 @@ PanelWindow {
         }
         let nextPath = projectNotePath(project)
         let oldPath = String(selectedPath || "")
+        let oldId = String(selectedProjectId || "")
         selectedProjectId = wanted
         selectedProject = project
-        if (nextPath !== oldPath) {
-            // The note changed: drop the stale per-note page snapshot so a
-            // linked-note project never shows another note's tasks/chat.
-            // Agent workers stay cached per path; busy agents are never
-            // touched here (selection itself is blocked while busy).
-            // Reconcile via agentFor so a cached idleStopped worker is
-            // resumed; failed workers stay stopped for explicit Retry.
+        // UUID workers are keyed by stable id so a note change never shows
+        // another note's tasks/chat and never mixes sessions across projects.
+        let wantKey = ""
+        try { wantKey = (typeof agentKeyFor === "function" ? agentKeyFor(project) : "") } catch (error) { wantKey = "" }
+        if (nextPath !== oldPath || wanted !== oldId) {
+            // The note or identity changed: drop the stale per-note page
+            // snapshot so a linked-note project never shows another note's
+            // tasks/chat. Busy agents are never touched here (selection
+            // itself is blocked while busy). Reconcile via the UUID-aware
+            // agentForProject so a cached idleStopped worker resumes;
+            // failed workers stay stopped for explicit Retry.
             currentPage = nextPath ? pageFor(nextPath) : null
             selectedPath = nextPath
-            if (!nextPath) {
+            if (!wantKey) {
+                // Isolated legacy harness (helpers absent): legacy path fallback.
+                if (!nextPath) {
+                    selectedAgent = null
+                } else if (!hasBusyAgent() && !pageBusy && !toggleBusy && !toggleRetiring && !sendBusy) {
+                    selectedAgent = agentFor(nextPath)
+                } else {
+                    selectedAgent = agentCache[nextPath] || null
+                }
+            } else if (wantKey.indexOf("id:") === 0) {
+                if (!hasBusyAgent() && !pageBusy && !toggleBusy && !toggleRetiring && !sendBusy) {
+                    try { selectedAgent = (typeof agentForId === "function" ? agentForId(wanted) : agentFor(nextPath)) } catch (error) { selectedAgent = null }
+                } else {
+                    try { selectedAgent = agentCache[wantKey] || null } catch (error) { selectedAgent = null }
+                }
+            } else if (!nextPath) {
                 selectedAgent = null
             } else if (!hasBusyAgent() && !pageBusy && !toggleBusy && !toggleRetiring && !sendBusy) {
                 selectedAgent = agentFor(nextPath)
@@ -1729,7 +2668,9 @@ PanelWindow {
             historyRetryGeneration = 0
         } else {
             selectedProject = project
-            if (nextPath && !hasBusyAgent() && !pageBusy && !sendBusy) {
+            if (wantKey && wantKey.indexOf("id:") === 0 && !hasBusyAgent() && !pageBusy && !sendBusy) {
+                try { selectedAgent = (typeof agentForId === "function" ? agentForId(wanted) : selectedAgent) } catch (error) {}
+            } else if (nextPath && !hasBusyAgent() && !pageBusy && !sendBusy) {
                 // Same note (e.g. list refresh after Daily/Journal pause):
                 // reconcile even when retained so an idleStopped cached
                 // worker resumes here instead of staying paused.
@@ -1746,18 +2687,34 @@ PanelWindow {
         listBusy = false
         // A list launched for Projects must not select a worker after the user
         // has moved to Journal.  This also protects the lazy Journal open
-        // path from a late list exit.
-        if (!requestedOpen || root.activeTab !== "projects") return
+        // path from a late list exit. A queued handoff is dropped with it.
+        if (!requestedOpen || root.activeTab !== "projects") {
+            try { root.clearPendingOpenProject() } catch (error) {}
+            return
+        }
         let data = null
         if (code === 0) {
             try { data = JSON.parse(output || "{}") } catch (error) { data = null }
         }
         if (!validRegistryList(data)) {
+            try { root.clearPendingOpenProject() } catch (error) {}
             errorMessage = failure("Project list", code, diagnostic || "invalid JSON output")
             return
         }
-        let previouslySelected = String(selectedProjectId || "")
-        applyRegistryList(data, previouslySelected)
+        // Apply the authoritative registry while retaining the prior
+        // selection. A queued palette handoff is consumed afterwards via
+        // the normal guarded selectProject so switching projects pauses
+        // old agents, increments generation, reconciles selection/index,
+        // and starts the page read. Preselecting the pending id here would
+        // bypass that path.
+        let retainedSelected = String(selectedProjectId || "")
+        applyRegistryList(data, retainedSelected)
+        try {
+            if (String(root.pendingOpenProjectId || "")) {
+                root.consumePendingOpenProject()
+                return
+            }
+        } catch (error) {}
         // Refresh the linked note when one is selected and the UI is idle.
         // Note-less projects have no page to refresh and never read the graph.
         // Reconcile via agentFor even when retained: Daily/Journal pause
@@ -1782,7 +2739,20 @@ PanelWindow {
         projectFormNote = ""
         projectFormFolder = ""
         projectFormGithub = ""
+        projectFormZoteroServer = ""
+        projectFormZoteroLibraryType = "user"
+        projectFormZoteroLibraryId = ""
+        projectFormZoteroCollectionKey = ""
+        projectFormZoteroIncludeSub = true
+        projectFormZoteroStatus = ""
+        projectFormZoteroRaw = null
         projectFormError = ""
+        zoteroPickerOpen = false
+        zoteroPickerRows = []
+        zoteroPickerIndex = 0
+        zoteroPickerLibraries = []
+        zoteroPickerLibraryIndex = 0
+        zoteroPickerStatus = ""
         projectDeleteOpen = false
         projectFormOpen = true
         return true
@@ -1799,7 +2769,44 @@ PanelWindow {
         projectFormNote = projectNotePath(target)
         projectFormFolder = projectFolder(target)
         projectFormGithub = projectGithub(target)
+        // Zotero link: known fields populate the picker; unknown/offline
+        // shapes are preserved verbatim so edits never drop them and old
+        // projects keep working.
+        try {
+            let link = (typeof projectZotero === "function" ? projectZotero(target) : (target ? target.zotero_collection : null))
+            projectFormZoteroRaw = (link === undefined ? null : link)
+            if (link && typeof link === "object" && link.collection_key) {
+                projectFormZoteroServer = String(link.server_id || "")
+                projectFormZoteroLibraryType = String(link.library_type || "user")
+                projectFormZoteroLibraryId = String(link.library_id || "")
+                projectFormZoteroCollectionKey = String(link.collection_key || "")
+                projectFormZoteroIncludeSub = link.include_subcollections !== false
+                projectFormZoteroStatus = (typeof zoteroStatusText === "function" ? zoteroStatusText(target) : "")
+            } else if (link) {
+                projectFormZoteroServer = ""
+                projectFormZoteroLibraryType = "user"
+                projectFormZoteroLibraryId = ""
+                projectFormZoteroCollectionKey = ""
+                projectFormZoteroIncludeSub = true
+                projectFormZoteroStatus = "Existing link has an unknown/offline shape; it will be preserved unless replaced."
+            } else {
+                projectFormZoteroServer = ""
+                projectFormZoteroLibraryType = "user"
+                projectFormZoteroLibraryId = ""
+                projectFormZoteroCollectionKey = ""
+                projectFormZoteroIncludeSub = true
+                projectFormZoteroStatus = ""
+            }
+        } catch (error) {
+            projectFormZoteroStatus = ""
+        }
         projectFormError = ""
+        zoteroPickerOpen = false
+        zoteroPickerRows = []
+        zoteroPickerIndex = 0
+        zoteroPickerLibraries = []
+        zoteroPickerLibraryIndex = 0
+        zoteroPickerStatus = ""
         projectDeleteOpen = false
         projectFormOpen = true
         return true
@@ -1812,6 +2819,7 @@ PanelWindow {
             notice = "Wait for the project write to finish."
             return false
         }
+        if (typeof closeZoteroPicker === "function") closeZoteroPicker()
         projectFormOpen = false
         return true
     }
@@ -1834,8 +2842,15 @@ PanelWindow {
             notice = projectFormError
             return false
         }
+        // Zotero link: null unlinks, validated object links, undefined
+        // aborts save with projectFormError. Unknown/offline raw links are
+        // preserved when the picker is untouched so old projects keep working.
+        let zlink = undefined
+        try { zlink = (typeof zoteroFormLink === "function" ? zoteroFormLink() : null) } catch (error) { zlink = null }
+        if (zlink === undefined) { notice = projectFormError; return false }
         let payload = { name: name, logseq_path: String(projectFormNote || ""),
-            local_folder: String(projectFormFolder || ""), github_url: String(projectFormGithub || "") }
+            local_folder: String(projectFormFolder || ""), github_url: String(projectFormGithub || ""),
+            zotero_collection: zlink }
         let op = projectFormMode === "edit" ? "update" : "create"
         if (op === "update") {
             payload.id = String(projectFormId || "")
@@ -1961,11 +2976,15 @@ PanelWindow {
             if (saved) {
                 selectedProject = saved
                 selectedPath = projectNotePath(saved)
+                // UUID-pinned worker (works with no note for Zotero-only).
+                try {
+                    if (!selectedAgent) selectedAgent = (typeof agentForProject === "function" ? agentForProject(saved) : (selectedPath ? agentFor(selectedPath) : selectedAgent))
+                } catch (error) {
+                    if (selectedPath && !selectedAgent) selectedAgent = agentFor(selectedPath)
+                }
                 if (selectedPath) {
-                    if (!selectedAgent) selectedAgent = agentFor(selectedPath)
                     if (!pageBusy && !sendBusy) startPage(selectedPath, "select", "")
                 } else {
-                    selectedAgent = null
                     currentPage = null
                 }
             }
@@ -1976,18 +2995,22 @@ PanelWindow {
             // same id+path returns early, so the write itself triggers it.
             // Any change to a nonempty note requests a fresh read even when
             // applyRegistryList assigned a stale cached page for the
-            // destination. Clearing the note never reads.
+            // destination. Clearing the note keeps the UUID worker (folder/
+            // Zotero stay usable) and never reads.
+            try {
+                if ((/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(selectedProjectId || "").trim())) && !selectedAgent)
+                    try { selectedAgent = (typeof agentForId === "function" ? agentForId(selectedProjectId) : selectedAgent) } catch (error) {}
+            } catch (error) {}
             if (!selectedPath) {
-                selectedAgent = null
                 currentPage = null
             } else if (String(selectedPath || "") !== String(prevLinkedPath || "")) {
                 if (!pageBusy && !pageRetiring && !toggleBusy && !toggleRetiring && !sendBusy && !hasBusyAgent()) {
-                    selectedAgent = agentFor(selectedPath)
+                    try { selectedAgent = (typeof agentForProject === "function" ? agentForProject(selectedProject) : agentFor(selectedPath)) } catch (error) { selectedAgent = agentFor(selectedPath) }
                     startPage(selectedPath, "select", "")
                 }
             } else if (!currentPage || String(currentPage.path || "") !== String(selectedPath || "")) {
                 if (!pageBusy && !pageRetiring && !toggleBusy && !toggleRetiring && !sendBusy && !hasBusyAgent()) {
-                    selectedAgent = agentFor(selectedPath)
+                    try { selectedAgent = (typeof agentForProject === "function" ? agentForProject(selectedProject) : agentFor(selectedPath)) } catch (error) { selectedAgent = agentFor(selectedPath) }
                     startPage(selectedPath, "select", "")
                 }
             }
@@ -3265,19 +4288,27 @@ PanelWindow {
                                                 }
                                             }
                                         }
-                                        Button {
+                                        WidgetIconButton {
+                                            id: projectSendButton
+                                            Layout.alignment: Qt.AlignVCenter
                                             text: root.sendBusy ? "Loading…" : "Send"
+                                            iconSource: "icons/send.svg"
+                                            tooltipText: root.sendBusy ? "Loading fresh context…" : "Send message (Ctrl+Enter)"
                                             enabled: !!root.selectedAgent && root.selectedAgent.ready && !root.selectedAgent.busy && !root.pageBusy && !root.toggleBusy && !root.toggleRetiring && !root.sendBusy && !root.approvalRequest && !root.hasBusyAgent()
+                                            Accessible.name: root.sendBusy ? "Loading fresh context" : "Send message"
+                                            Accessible.description: "Send the composer draft, loading fresh context before sending"
                                             onClicked: root.send()
-                                            contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                            background: Rectangle { color: parent.enabled ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
                                         }
-                                        Button {
+                                        WidgetIconButton {
+                                            id: projectStopButton
+                                            Layout.alignment: Qt.AlignVCenter
                                             text: "Stop"
+                                            iconSource: "icons/stop.svg"
+                                            tooltipText: "Stop project agent"
                                             enabled: !!root.selectedAgent && (root.selectedAgent.busy || root.selectedAgent.pendingApproval)
+                                            Accessible.name: "Stop project agent"
+                                            Accessible.description: "Abort the running project agent"
                                             onClicked: root.stopAgent()
-                                            contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                            background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
                                         }
                                     }
                                 }
@@ -3760,6 +4791,51 @@ PanelWindow {
                     onTextChanged: root.projectFormGithub = text
                     background: Rectangle { color: Theme.mantle; radius: Theme.controlRadius; border.color: projectGithubField.activeFocus ? Theme.focusBorder : Theme.border }
                 }
+                Text { text: "Zotero collection (optional)"; color: Theme.text; font.family: Theme.fontFamily }
+                Text {
+                    text: root.projectFormZoteroStatus || root.zoteroStatusText(root.selectedProject)
+                    color: Theme.subtext1
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Accessible.name: "Zotero link status"
+                }
+                TextField {
+                    id: projectZoteroKeyField
+                    Layout.fillWidth: true
+                    text: root.projectFormZoteroCollectionKey
+                    placeholderText: "Collection key (8 uppercase alnum) or empty"
+                    color: Theme.text
+                    font.family: Theme.fontFamily
+                    placeholderTextColor: Theme.subtext0
+                    Accessible.name: "Zotero collection key"
+                    onTextChanged: root.projectFormZoteroCollectionKey = text
+                    background: Rectangle { color: Theme.mantle; radius: Theme.controlRadius; border.color: projectZoteroKeyField.activeFocus ? Theme.focusBorder : Theme.border }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Button {
+                        text: "Pick collection"
+                        Accessible.name: "Pick Zotero collection"
+                        onClicked: root.openZoteroPicker()
+                        contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
+                    }
+                    Button {
+                        text: "Open"
+                        Accessible.name: "Open Zotero collection"
+                        onClicked: root.zoteroOpen()
+                        contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
+                    }
+                    Button {
+                        text: "Unlink"
+                        Accessible.name: "Unlink Zotero collection"
+                        onClicked: root.zoteroUnlink()
+                        contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
+                    }
+                }
                 Text {
                     visible: root.projectFormError !== ""
                     text: root.projectFormError
@@ -3786,6 +4862,169 @@ PanelWindow {
                         onClicked: root.saveProjectForm()
                         contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                         background: Rectangle { color: parent.enabled ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
+                    }
+                }
+            }
+        }
+    }
+
+    // Read-only Zotero collection picker. The list is fetched from
+    // scripts/zotero.py (collections) and picking only fills the project
+    // form fields; nothing here writes, saves, or mutates anything. The
+    // manual collection-key field stays usable when Zotero is offline.
+    FocusScope {
+        id: zoteroPickerDialog
+        z: 19
+        anchors.fill: parent
+        visible: root.visible && root.requestedOpen && !root.closing &&
+            root.projectFormOpen && root.zoteroPickerOpen && root.approvalRequest === null
+        focus: visible
+        onVisibleChanged: if (visible) zoteroPickerList.forceActiveFocus()
+        Keys.onPressed: (event) => {
+            if (event.key === Qt.Key_Escape) { root.closeZoteroPicker(); event.accepted = true }
+        }
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(Math.max(340, parent.width - 40), 600)
+            height: Math.min(Math.max(300, parent.height - 40), 640)
+            color: Theme.base
+            radius: Theme.cardRadius
+            border.color: Theme.focusBorder
+            Accessible.name: "Pick Zotero collection"
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 18
+                spacing: 10
+                Text {
+                    text: "Pick Zotero collection"
+                    color: Theme.text
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 20
+                    font.bold: true
+                    Layout.fillWidth: true
+                }
+                Text {
+                    text: root.zoteroPickerStatus
+                    color: Theme.subtext1
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Accessible.name: "Zotero collection status"
+                }
+                Flow {
+                    visible: root.zoteroPickerLibraries.length >= 2
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Repeater {
+                        model: root.zoteroPickerLibraries
+                        delegate: Button {
+                            text: modelData.name
+                            enabled: !root.zoteroLibrariesBusy && !root.zoteroLibrariesRetiring &&
+                                !root.zoteroPickerBusy && !root.zoteroPickerRetiring
+                            opacity: enabled ? 1.0 : 0.5
+                            Accessible.name: "Zotero library: " + modelData.name
+                            onClicked: root.selectZoteroLibrary(index)
+                            contentItem: Text {
+                                text: parent.text
+                                color: Theme.text
+                                font.family: Theme.fontFamily
+                                elide: Text.ElideRight
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                width: Math.min(implicitWidth, 180)
+                            }
+                            background: Rectangle {
+                                color: index === root.zoteroPickerLibraryIndex ? Theme.surface1 : Theme.mantle
+                                radius: Theme.controlRadius
+                                border.color: index === root.zoteroPickerLibraryIndex ? Theme.focusBorder : Theme.border
+                            }
+                        }
+                    }
+                }
+                ListView {
+                    id: zoteroPickerList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 4
+                    model: root.zoteroPickerRows
+                    currentIndex: root.zoteroPickerIndex
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    Accessible.name: "Zotero collection list"
+                    delegate: Rectangle {
+                        width: zoteroPickerList.width
+                        height: 37
+                        radius: Theme.controlRadius
+                        color: index === zoteroPickerList.currentIndex ? Theme.surface1 : Theme.mantle
+                        border.color: index === zoteroPickerList.currentIndex ? Theme.focusBorder : Theme.border
+                        border.width: 1
+                        Row {
+                            anchors.fill: parent
+                            anchors.leftMargin: 9 + Math.min(modelData.depth, 8) * 16
+                            anchors.rightMargin: 9
+                            spacing: 8
+                            Text {
+                                text: modelData.name
+                                color: Theme.text
+                                font.family: Theme.fontFamily
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: parent.width - 90
+                            }
+                            Text {
+                                text: modelData.key
+                                color: Theme.subtext0
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 11
+                                verticalAlignment: Text.AlignVCenter
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: { root.zoteroPickerIndex = index; root.zoteroPickCollection(modelData.key) }
+                        }
+                    }
+                    Keys.onPressed: (event) => {
+                        if (event.key === Qt.Key_Up) {
+                            root.zoteroPickerIndex = Math.max(0, root.zoteroPickerIndex - 1)
+                            zoteroPickerList.positionViewAtIndex(root.zoteroPickerIndex, ListView.Contain)
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Down) {
+                            root.zoteroPickerIndex = Math.min(zoteroPickerList.count - 1, root.zoteroPickerIndex + 1)
+                            zoteroPickerList.positionViewAtIndex(root.zoteroPickerIndex, ListView.Contain)
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            if (root.zoteroPickerRows.length > 0) {
+                                let current = root.zoteroPickerRows[Math.max(0, Math.min(root.zoteroPickerIndex, root.zoteroPickerRows.length - 1))]
+                                if (current) root.zoteroPickCollection(current.key)
+                            }
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Escape) {
+                            root.closeZoteroPicker()
+                            event.accepted = true
+                        }
+                    }
+                }
+                Text {
+                    visible: !root.zoteroPickerBusy && root.zoteroPickerRows.length === 0
+                    text: "No collections loaded."
+                    color: Theme.subtext1
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        text: "Cancel"
+                        Accessible.name: "Cancel Zotero collection picker"
+                        onClicked: root.closeZoteroPicker()
+                        contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
                     }
                 }
             }

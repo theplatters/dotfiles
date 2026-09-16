@@ -31,22 +31,43 @@
 //!   staleness <= 5 s; the old location stops matching once refreshed).
 //!
 //! Match contract:
-//! - `ProjectContext { id, name, matched_by }` only (`file`/`cwd`/`git_root`/
-//!   `git_remote`), serde-default on `DesktopContext.project`. Semantic
-//!   equality includes these three (explainability) but never the registry
-//!   `revision`.
-//! - Path precedence `FILE > CWD > GIT_ROOT > GIT_REMOTE`, resolved lazily in
-//!   order: the `FILE` candidate is canonicalized and matched first; weaker
-//!   levels touch the filesystem only when no stronger level hit or tied.
-//!   Each candidate is tilde-expanded then canonicalized with symlink-aware
-//!   `..` semantics (the OS resolves `..` AFTER symlinks: `/work/link/../f`
-//!   with `link -> /repos/B/sub` is `/repos/B/f`, never `/work/f`); a
-//!   nonexistent trailing suffix keeps the resolved existing prefix's
-//!   semantics, else fails closed. Descendant matching honors component
-//!   boundaries (`/a/b` does not match `/a/bc/d`), longest mapped folder
-//!   wins. A tie between different projects at the same strength is
-//!   ambiguous: no association and NO fallback to a weaker strength. Titles
-//!   are never inferred from.
+//! - `ProjectContext { id, name, matched_by }` only (`zotero_collection`/
+//!   `file`/`cwd`/`git_root`/`logseq_page`/`git_remote`), serde-default on
+//!   `DesktopContext.project`. Semantic equality includes these three
+//!   (explainability) but never the registry `revision`.
+//! - Explicit collection precedence `ZOTERO_COLLECTION > FILE > CWD >
+//!   GIT_ROOT > LOGSEQ_PAGE > GIT_REMOTE`: a bound Zotero reader is matched first on its
+//!   server/library/collection identity (descendant-aware via the published
+//!   ancestor keys); weaker levels touch the filesystem only when no
+//!   collection matched at all. A tie between different projects at the
+//!   collection level is ambiguous (no association, NO fallback to file).
+//!   When no collection matches, existing file/cwd/git matching applies
+//!   unchanged (file fallback after a collection miss).
+//! - Path precedence `FILE > CWD > GIT_ROOT > LOGSEQ_PAGE > GIT_REMOTE`,
+//!   resolved lazily in order: the `FILE` candidate is canonicalized and
+//!   matched first; weaker levels touch the filesystem only when no
+//!   stronger level hit or tied. Each candidate is tilde-expanded then
+//!   canonicalized with symlink-aware `..` semantics (the OS resolves `..`
+//!   AFTER symlinks: `/work/link/../f` with `link -> /repos/B/sub` is
+//!   `/repos/B/f`, never `/work/f`); a nonexistent trailing suffix keeps
+//!   the resolved existing prefix's semantics, else fails closed.
+//!   Descendant matching honors component boundaries (`/a/b` does not match
+//!   `/a/bc/d`), longest mapped folder wins. A tie between different
+//!   projects at the same strength is ambiguous: no association and NO
+//!   fallback to a weaker strength. Window titles are never otherwise used
+//!   for matching (see the page level below).
+//! - Page level (`LOGSEQ_PAGE`, between `GIT_ROOT` and `GIT_REMOTE`):
+//!   source is the title-only extraction in `app_context.rs`
+//!   (`logseq-title` adapter: `<page> - Logseq` suffix form, else the bare
+//!   trimmed title) carried as `ResourceContext.page`. The claim matches
+//!   exactly (case-sensitive) against a linked registry row's derived page
+//!   label (`derive_logseq_page_name` over `logseq_path`) OR its display
+//!   name (which mirrors page labels, so stale `logseq_path` rows keep
+//!   matching after underscore->space renames). Only rows with a non-empty
+//!   derived page label are eligible (name-only rows never match). Exactly
+//!   one distinct claiming project wins (`matched_by: "logseq_page"`); a
+//!   tie between different projects is ambiguous with NO fallback to the
+//!   remote level.
 //! - Remote fallback runs `git -C <root> config --local --includes --null
 //!   --get-regexp ^remote\..*\.url$` (repository-local config only: no
 //!   network, no shell, no global/system config, bounded time/output; ambient
@@ -467,12 +488,121 @@ pub fn is_descendant_of(candidate: &str, folder: &str) -> bool {
 /// projection (symlink resolution) happens lazily per precedence level with
 /// a short TTL (see `ProjectResolver::project_folder`), so a symlink retarget
 /// while the registry is unchanged converges without spawning Python.
+///
+/// `page_name` is the derived Logseq page label (see
+/// `derive_logseq_page_name` over the registry `logseq_path`); `None` when
+/// the row carries no `logseq_path` (name-only rows never match the page
+/// level).
 #[derive(Clone, Debug)]
 pub struct ProjectEntry {
     pub id: String,
     pub name: String,
     pub folder_raw: Option<String>,
     pub remote: Option<String>,
+    pub zotero: Option<ZoteroCollection>,
+    /// Derived Logseq page label (`None` when no `logseq_path`).
+    pub page_name: Option<String>,
+}
+
+/// Validated optional `zotero_collection` registry projection.
+///
+/// `server_id` pins the Zotero instance (`Zotero-Server-ID` header, Zotero
+/// 10+); `library_type`/`library_id` qualify the library (`user/"0"` is the
+/// server-bound personal-library alias and matches any user library on the
+/// same server); `collection_key` is 8 uppercase alnum;
+/// `include_subcollections` (default `true`) allows descendant collections
+/// (the reader's published ancestor keys) to match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZoteroCollection {
+    pub server_id: String,
+    pub library_type: String,
+    pub library_id: String,
+    pub collection_key: String,
+    pub include_subcollections: bool,
+}
+
+/// True for an 8-char Zotero collection/item key (`[A-Z0-9]{8}`).
+pub fn is_zotero_collection_key(s: &str) -> bool {
+    s.len() == 8 && s.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// True for a Zotero library id (digit string, `1..32` chars).
+pub fn is_zotero_library_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// True for a Zotero server id (non-blank, `1..128` chars, no NUL/controls).
+pub fn is_zotero_server_id(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 128
+        && !t.contains('\0')
+        && !t.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// Parse + validate the authoritative `zotero_collection` JSON projection
+/// (`null`/missing as `None`). Unknown fields or any shape violation is
+/// `Err` (fail the whole registry load closed, never a partial mapping).
+pub fn parse_zotero_collection(
+    v: Option<&serde_json::Value>,
+) -> Result<Option<ZoteroCollection>, String> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let obj = v.as_object().ok_or("zotero_collection must be object or null")?;
+    for key in obj.keys() {
+        match key.as_str() {
+            "server_id" | "library_type" | "library_id" | "collection_key"
+            | "include_subcollections" => {}
+            other => return Err(format!("zotero_collection has unsupported field: {other}")),
+        }
+    }
+    let server_id = obj
+        .get("server_id")
+        .and_then(|x| x.as_str())
+        .ok_or("zotero_collection server_id missing")?;
+    if !is_zotero_server_id(server_id) {
+        return Err("zotero_collection server_id is unsafe".to_string());
+    }
+    let library_type = obj
+        .get("library_type")
+        .and_then(|x| x.as_str())
+        .ok_or("zotero_collection library_type missing")?;
+    if library_type != "user" && library_type != "group" {
+        return Err("zotero_collection library_type must be user or group".to_string());
+    }
+    let library_id = obj
+        .get("library_id")
+        .and_then(|x| x.as_str())
+        .ok_or("zotero_collection library_id missing")?;
+    if !is_zotero_library_id(library_id) {
+        return Err("zotero_collection library_id must be digit string".to_string());
+    }
+    if library_type == "group" && library_id == "0" {
+        return Err("zotero_collection library_id 0 only for user".to_string());
+    }
+    let collection_key = obj
+        .get("collection_key")
+        .and_then(|x| x.as_str())
+        .ok_or("zotero_collection collection_key missing")?;
+    if !is_zotero_collection_key(collection_key) {
+        return Err("zotero_collection collection_key must be 8 upper alnum".to_string());
+    }
+    let include_subcollections = match obj.get("include_subcollections") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(b)) => *b,
+        _ => return Err("zotero_collection include_subcollections must be bool".to_string()),
+    };
+    Ok(Some(ZoteroCollection {
+        server_id: server_id.trim().to_string(),
+        library_type: library_type.to_string(),
+        library_id: library_id.to_string(),
+        collection_key: collection_key.to_string(),
+        include_subcollections,
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -694,10 +824,16 @@ impl ProjectResolver {
     /// Deterministic resolve for one resource. `None` = unknown/ambiguous/
     /// unavailable (fail closed, never a guess).
     ///
-    /// Path levels resolve LAZILY in precedence order: the `FILE` candidate
-    /// is canonicalized and matched first, and weaker levels touch the
-    /// filesystem only when no stronger level hit or tied. The git remote
-    /// subprocess runs only when every path level missed.
+    /// Explicit collection precedence `ZOTERO_COLLECTION > FILE > CWD >
+    /// GIT_ROOT > LOGSEQ_PAGE > GIT_REMOTE`: a bound Zotero reader is
+    /// matched first on its qualified server/library/collection identity
+    /// (descendant-aware); a tie between different projects at the
+    /// collection level is ambiguous with NO fallback to file. When no
+    /// collection matches, path levels resolve LAZILY in order, then the
+    /// focused Logseq page matches exactly against linked registry pages,
+    /// and the git remote subprocess runs only when every stronger level
+    /// missed. A page tie is ambiguous with NO remote fallback (consistent
+    /// with every other level).
     pub fn resolve_resource(
         &mut self,
         resource: &ResourceContext,
@@ -706,6 +842,14 @@ impl ProjectResolver {
         self.ensure_loaded(now_ms);
         if self.entries.is_empty() {
             return None;
+        }
+        // Explicit collection level first (no filesystem, no subprocess).
+        match self.match_zotero_level(resource) {
+            ZoteroMatch::Hit(id, name) => {
+                return Some(ProjectContext::new(&id, &name, "zotero_collection"));
+            }
+            ZoteroMatch::Ambiguous => return None,
+            ZoteroMatch::None => {}
         }
         // Path precedence: FILE > CWD > GIT_ROOT. Each level matches on its
         // own longest folder; a tie between different projects at the same
@@ -734,7 +878,17 @@ impl ProjectResolver {
                 }
             }
         }
-        // Remote fallback (only when no path matched at any level).
+        // Logseq page level (only when no path matched at any level).
+        if let Some(page) = resource.page.as_deref().filter(|p| !p.is_empty()) {
+            match match_page_claims(&self.entries, page) {
+                PageMatch::Hit(id, name) => {
+                    return Some(ProjectContext::new(&id, &name, "logseq_page"));
+                }
+                PageMatch::Ambiguous => return None,
+                PageMatch::None => {}
+            }
+        }
+        // Remote fallback (only when no path or page matched at any level).
         let remotes = self.remote_candidates(resource, root_canonical.as_deref(), now_ms);
         if remotes.is_empty() {
             return None;
@@ -924,6 +1078,84 @@ enum PathMatchOwned {
     Hit(String, String),
 }
 
+/// Explicit collection-match outcome: exactly one DISTINCT registered project
+/// whose qualified server/library/collection claims the bound reader wins.
+/// Zero claims fall through to file matching; claims spanning more than one
+/// distinct project are ambiguous with NO weaker fallback.
+enum ZoteroMatch {
+    None,
+    Ambiguous,
+    Hit(String, String),
+}
+
+impl ProjectResolver {
+    /// Explicit collection match for a bound Zotero reader. Checks the
+    /// qualified server/library identity plus direct membership (and ancestor
+    /// keys when the entry opts into subcollections). `None` resource
+    /// identity or no claiming entry is `None` (caller falls through to
+    /// file); two distinct claiming projects is `Ambiguous` (no fallback).
+    fn match_zotero_level(&self, resource: &ResourceContext) -> ZoteroMatch {
+        let Some(z) = resource.zotero.as_ref().filter(|x| !x.is_empty()) else {
+            return ZoteroMatch::None;
+        };
+        if !is_zotero_server_id(&z.server_id)
+            || !is_zotero_library_id(&z.library_id)
+            || !is_zotero_collection_key_flex(&z.item_key)
+        {
+            return ZoteroMatch::None;
+        }
+        if z.library_type != "user" && z.library_type != "group" {
+            return ZoteroMatch::None;
+        }
+        let mut claimed: Vec<(String, String)> = Vec::new();
+        for e in &self.entries {
+            let Some(reg) = e.zotero.as_ref() else {
+                continue;
+            };
+            if reg.server_id != z.server_id {
+                continue;
+            }
+            if reg.library_type != z.library_type {
+                continue;
+            }
+            // Server-bound user alias: registry `user/"0"` matches any user
+            // library on the same server. All other pairs match exactly.
+            let library_ok = if reg.library_type == "user" && reg.library_id == "0" {
+                true
+            } else {
+                reg.library_id == z.library_id
+            };
+            if !library_ok {
+                continue;
+            }
+            let direct = z.collections.iter().any(|c| c == &reg.collection_key);
+            let via_ancestor = reg.include_subcollections
+                && z.ancestor_collections.iter().any(|c| c == &reg.collection_key);
+            if direct || via_ancestor {
+                if !claimed.iter().any(|(id, _)| id == &e.id) {
+                    claimed.push((e.id.clone(), e.name.clone()));
+                }
+            }
+        }
+        match claimed.len() {
+            0 => ZoteroMatch::None,
+            1 => {
+                let (id, name) = claimed.into_iter().next().expect("one claim");
+                ZoteroMatch::Hit(id, name)
+            }
+            _ => ZoteroMatch::Ambiguous,
+        }
+    }
+}
+
+/// Flexible key check for reader identity (item keys share the collection-key
+/// shape today but must never reject a future valid key shape here: matching
+/// only compares collection keys strictly, so an odd item key simply matches
+/// nothing rather than failing the registry load).
+fn is_zotero_collection_key_flex(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && !s.contains('\0')
+}
+
 /// Remote-claim outcome: exactly one DISTINCT registered project claimed by
 /// any of the repo's normalized remotes wins — even when the repo has other
 /// unregistered remotes (fork with an unmapped upstream). Zero claims, or
@@ -968,6 +1200,107 @@ fn match_remote_claims(entries: &[ProjectEntry], remotes: &[String]) -> RemoteMa
             RemoteMatch::Hit(id, name)
         }
         _ => RemoteMatch::Ambiguous,
+    }
+}
+
+/// Derive the Logseq page label from a registry `logseq_path` string.
+///
+/// Mirrors `scripts/logseq_common.py page_name` for the registry
+/// projection (the registry JSON `page` field is the project NAME, never
+/// page identity, so it is ignored here): trim, require the `pages/`
+/// prefix, strip a case-insensitive `.md` suffix, percent-decode `%XX`
+/// byte sequences (a `%` not followed by two hex digits stays literal;
+/// all other bytes pass through unchanged; the decoded bytes must be
+/// valid UTF-8 or the whole value is `None`), then replace `___` with
+/// `/`. The result must be non-empty, at most 1024 chars, and free of
+/// NUL/control chars.
+fn derive_logseq_page_name(logseq_path: &str) -> Option<String> {
+    let t = logseq_path.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let rest = t.strip_prefix("pages/")?;
+    // Byte-slice comparison: never index a &str at a non-char boundary, so
+    // malformed multibyte paths fail closed instead of panicking.
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes.len() < 3 || !rest_bytes[rest_bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        return None;
+    }
+    let stem = &rest[..rest_bytes.len() - 3];
+    if stem.is_empty() {
+        return None;
+    }
+    let bytes = stem.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) else {
+                // Non-hex `%` stays literal.
+                decoded.push(bytes[i]);
+                i += 1;
+                continue;
+            };
+            decoded.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let s = String::from_utf8(decoded).ok()?;
+    let s = s.replace("___", "/");
+    if s.is_empty() || s.chars().count() > 1024 {
+        return None;
+    }
+    if s.contains('\0') || s.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(s)
+}
+
+/// Page-claim outcome: exactly one DISTINCT linked registry project whose
+/// derived page label or display name equals the focused Logseq page wins.
+/// Zero claims fall through to the remote fallback; claims spanning more
+/// than one distinct project are ambiguous with NO fallback.
+enum PageMatch {
+    None,
+    Ambiguous,
+    Hit(String, String),
+}
+
+/// Compute the distinct linked projects claiming the focused Logseq page.
+///
+/// Only entries with a non-empty derived `page_name` are eligible
+/// (name-only rows never match). A row claims the page on exact,
+/// case-sensitive equality of either its derived page label or its
+/// display name (names mirror page labels, so stale `logseq_path` rows
+/// keep matching after underscore->space renames).
+fn match_page_claims(entries: &[ProjectEntry], page: &str) -> PageMatch {
+    let mut claimed: Vec<(String, String)> = Vec::new();
+    for e in entries {
+        let Some(label) = e.page_name.as_deref() else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        if label == page || e.name == page {
+            if !claimed.iter().any(|(id, _)| id == &e.id) {
+                claimed.push((e.id.clone(), e.name.clone()));
+            }
+        }
+    }
+    match claimed.len() {
+        0 => PageMatch::None,
+        1 => {
+            let (id, name) = claimed.into_iter().next().expect("one claim");
+            PageMatch::Hit(id, name)
+        }
+        _ => PageMatch::Ambiguous,
     }
 }
 
@@ -1100,11 +1433,16 @@ fn parse_registry_output(raw: &[u8]) -> Result<Vec<ProjectEntry>, String> {
         } else {
             normalize_github_remote(url_raw.trim())
         };
+        let zotero = parse_zotero_collection(obj.get("zotero_collection"))?;
+        let logseq_raw = obj.get("logseq_path").and_then(|x| x.as_str()).unwrap_or("");
+        let page_name = derive_logseq_page_name(logseq_raw);
         out.push(ProjectEntry {
             id: id.trim().to_string(),
             name: name.trim().to_string(),
             folder_raw,
             remote,
+            zotero,
+            page_name,
         });
     }
     Ok(out)
@@ -1621,5 +1959,147 @@ mod tests {
             dup.extend(record("origin", "https://github.com/acme/same"));
         }
         assert_eq!(parse_git_null_config(&dup).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn derive_logseq_page_name_mirrors_registry_projection() {
+        // Examples from the registry projection contract.
+        assert_eq!(
+            derive_logseq_page_name("pages/Asset-Prices.md").as_deref(),
+            Some("Asset-Prices")
+        );
+        assert_eq!(
+            derive_logseq_page_name("pages/Person___Grace.md").as_deref(),
+            Some("Person/Grace")
+        );
+        assert_eq!(
+            derive_logseq_page_name("pages/A%3AB.md").as_deref(),
+            Some("A:B")
+        );
+        // Stale legacy path: underscores are NOT spaces.
+        assert_eq!(
+            derive_logseq_page_name("pages/Gender_Norm_ABM.md").as_deref(),
+            Some("Gender_Norm_ABM")
+        );
+        // Case-insensitive `.md` suffix.
+        assert_eq!(
+            derive_logseq_page_name("pages/Asset-Prices.MD").as_deref(),
+            Some("Asset-Prices")
+        );
+        assert_eq!(
+            derive_logseq_page_name("pages/Asset-Prices.Md").as_deref(),
+            Some("Asset-Prices")
+        );
+        // Bad prefix / extension / empty fail closed.
+        assert_eq!(derive_logseq_page_name("journals/Asset-Prices.md"), None);
+        assert_eq!(derive_logseq_page_name("Asset-Prices.md"), None);
+        assert_eq!(derive_logseq_page_name("pages/Asset-Prices.txt"), None);
+        assert_eq!(derive_logseq_page_name("pages/.md"), None);
+        assert_eq!(derive_logseq_page_name(""), None);
+        assert_eq!(derive_logseq_page_name("   "), None);
+        // Control chars fail closed.
+        assert_eq!(derive_logseq_page_name("pages/A\x01B.md"), None);
+        assert_eq!(derive_logseq_page_name("pages/A\nB.md"), None);
+        // Non-hex `%` stays literal.
+        assert_eq!(
+            derive_logseq_page_name("pages/100%.md").as_deref(),
+            Some("100%")
+        );
+        assert_eq!(
+            derive_logseq_page_name("pages/100%ZZ.md").as_deref(),
+            Some("100%ZZ")
+        );
+        // Percent-decoded bytes must be valid UTF-8, else None.
+        assert_eq!(derive_logseq_page_name("pages/%FF.md"), None);
+        assert_eq!(derive_logseq_page_name("pages/%C3%A9.md").as_deref(), Some("é"));
+        // Multibyte endings must fail closed, never panic on a byte index
+        // that is not a char boundary.
+        assert_eq!(derive_logseq_page_name("pages/€a"), None);
+        assert_eq!(derive_logseq_page_name("pages/a€b"), None);
+        assert_eq!(derive_logseq_page_name("pages/é.md").as_deref(), Some("é"));
+    }
+
+    fn page_test_entry(id: &str, name: &str, logseq_path: &str) -> ProjectEntry {
+        ProjectEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            folder_raw: None,
+            remote: None,
+            zotero: None,
+            page_name: derive_logseq_page_name(logseq_path),
+        }
+    }
+
+    #[test]
+    fn page_claims_hit_derived_label() {
+        let entries = vec![page_test_entry("id-a", "Asset-Prices", "pages/Asset-Prices.md")];
+        match match_page_claims(&entries, "Asset-Prices") {
+            PageMatch::Hit(id, name) => {
+                assert_eq!(id, "id-a");
+                assert_eq!(name, "Asset-Prices");
+            }
+            _ => panic!("derived page label must hit"),
+        }
+    }
+
+    #[test]
+    fn page_claims_hit_display_name_despite_stale_path() {
+        // Stale underscore path derives `Gender_Norm_ABM`, but the display
+        // name mirrors the real page label, so it still matches.
+        let entries = vec![page_test_entry(
+            "id-a",
+            "Gender Norm ABM",
+            "pages/Gender_Norm_ABM.md",
+        )];
+        match match_page_claims(&entries, "Gender Norm ABM") {
+            PageMatch::Hit(id, _) => assert_eq!(id, "id-a"),
+            _ => panic!("display-name equality must keep stale paths matching"),
+        }
+    }
+
+    #[test]
+    fn page_claims_exclude_name_only_entries() {
+        // A name-only row (no `logseq_path`) never matches, even when the
+        // display name equals the focused page.
+        let entries = vec![ProjectEntry {
+            id: "id-a".to_string(),
+            name: "Asset-Prices".to_string(),
+            folder_raw: None,
+            remote: None,
+            zotero: None,
+            page_name: None,
+        }];
+        assert!(matches!(
+            match_page_claims(&entries, "Asset-Prices"),
+            PageMatch::None
+        ));
+    }
+
+    #[test]
+    fn page_claims_no_match_and_case_sensitive_miss() {
+        let entries = vec![page_test_entry("id-a", "Asset-Prices", "pages/Asset-Prices.md")];
+        assert!(matches!(
+            match_page_claims(&entries, "Unknown-Page"),
+            PageMatch::None
+        ));
+        assert!(
+            matches!(
+                match_page_claims(&entries, "asset-prices"),
+                PageMatch::None
+            ),
+            "page matching is case-sensitive"
+        );
+    }
+
+    #[test]
+    fn page_claims_tie_is_ambiguous() {
+        let entries = vec![
+            page_test_entry("id-a", "Shared", "pages/Shared.md"),
+            page_test_entry("id-b", "Shared", "pages/Shared.md"),
+        ];
+        assert!(matches!(
+            match_page_claims(&entries, "Shared"),
+            PageMatch::Ambiguous
+        ));
     }
 }

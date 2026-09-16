@@ -36,8 +36,10 @@ ShellRoot {
 
     Connections {
         target: commandPalette
-        function onProjectPlanningRequested() {
-            projectPlanner.open()
+        function onProjectPlanningRequested(projectId, action, message) {
+            let msg = String(message === undefined || message === null ? "" : message).substring(0, 300);
+            if (projectId) projectPlanner.openProject(projectId, action, msg)
+            else projectPlanner.open()
         }
     }
 
@@ -83,6 +85,7 @@ ShellRoot {
             mediaPopout: mediaPopout
             controlCenter: controlCenter
             calendarPopout: calendarPopout
+            projectPlanner: projectPlanner
         }
     }
 }

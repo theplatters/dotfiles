@@ -322,12 +322,15 @@ class DailyPlannerUiTests(unittest.TestCase):
 
 
 class CalendarPopoutTests(unittest.TestCase):
-    def test_popout_anchors_to_the_clock_and_shares_state(self):
-        self.assertIn("PopupWindow", POPOUT)
+    def test_popout_is_keyboard_capable_panel_on_the_clock_screen(self):
+        # PopupWindow has no layer-shell keyboard setup, so its TextFields
+        # never receive input. The popout must be a PanelWindow following
+        # the PasswordPopup/ProjectPlanner/CommandPalette convention.
+        self.assertIn("PanelWindow", POPOUT)
+        self.assertNotIn("PopupWindow {", POPOUT)
+        self.assertIn("import Quickshell.Wayland", POPOUT)
         self.assertIn("property var anchorItem", POPOUT)
         self.assertIn("property var agenda", POPOUT)
-        self.assertIn("anchorItem.mapToGlobal", POPOUT)
-        self.assertIn("gravity: Edges.Bottom", POPOUT)
         self.assertIn("property bool requestedOpen", POPOUT)
         self.assertIn("property bool closing", POPOUT)
         self.assertIn("visible: false", POPOUT)
@@ -336,12 +339,148 @@ class CalendarPopoutTests(unittest.TestCase):
         self.assertIn("exitMotion", POPOUT)
         self.assertIn("root.visible = false", POPOUT)
 
+    def test_popout_focus_lifecycle_matches_working_windows(self):
+        self.assertIn("WlrLayershell.keyboardFocus", POPOUT)
+        self.assertIn("WlrKeyboardFocus.OnDemand", POPOUT)
+        self.assertIn("WlrKeyboardFocus.None", POPOUT)
+        self.assertIn("requestedOpen && !root.closing", POPOUT)
+        # Closing must drop focus; never stuck on None-only or always-on.
+        focus = POPOUT[POPOUT.index("WlrLayershell.keyboardFocus"):POPOUT.index("WlrLayershell.keyboardFocus") + 300]
+        self.assertIn("closing", focus)
+        self.assertIn("OnDemand", focus)
+        self.assertIn("None", focus)
+        # Non-reserving overlay like the working keyboard windows.
+        self.assertIn("exclusionMode: ExclusionMode.Ignore", POPOUT)
+        self.assertIn("WlrLayershell.layer", POPOUT)
+        self.assertIn("WlrLayer.Overlay", POPOUT)
+
+    def test_popout_stays_under_the_clock_on_the_correct_screen(self):
+        # Window follows the clock's bar window screen (multi-monitor).
+        self.assertIn("anchorItem.QsWindow.window", POPOUT)
+        self.assertIn("contentItem", POPOUT)
+        self.assertIn("mapToItem", POPOUT)
+        self.assertNotIn("mapToGlobal", POPOUT)
+        # No global-origin subtraction: bar-local coords are already
+        # screen-local for the top/left/right-anchored zero-margin bar,
+        # so nonzero monitor origins can't shift the popout.
+        self.assertNotIn("root.screen.x", POPOUT)
+        self.assertNotIn("root.screen.y", POPOUT)
+        self.assertIn("screen:", POPOUT)
+        # Floating top+left surface positioned with screen-local margins.
+        self.assertIn("top: true", POPOUT)
+        self.assertIn("left: true", POPOUT)
+        self.assertIn("margins", POPOUT)
+        # Placement refreshes on open and on clock/screen changes.
+        self.assertIn("refreshPosition()", POPOUT)
+        self.assertIn("onAnchorItemChanged", POPOUT)
+        self.assertIn("onScreenChanged", POPOUT)
+        # Size defaults to the 430x640 maximum, clamped to the screen.
+        self.assertIn("430", POPOUT)
+        self.assertIn("640", POPOUT)
+        self.assertIn("implicitWidth", POPOUT)
+        self.assertIn("implicitHeight", POPOUT)
+
+    def test_popout_keeps_click_to_focus_without_auto_focus(self):
+        # Click-to-focus inputs must keep working; opening must not yank
+        # focus into the (possibly offscreen) search field.
+        self.assertNotIn("forceActiveFocus", POPOUT)
+        self.assertNotIn("focus: true", POPOUT)
+
+    def test_popout_adapts_to_scaling_or_resolution_changes(self):
+        # Open calendar must reposition on screen geometry changes
+        # (scaling/resolution), separate from the clock-item tracking.
+        self.assertIn("target: root.screen", POPOUT)
+        start = POPOUT.index("target: root.screen")
+        block = POPOUT[start:start + 500]
+        self.assertIn("onWidthChanged", block)
+        self.assertIn("onHeightChanged", block)
+        self.assertIn("refreshPosition()", block)
+
     def test_popout_embeds_the_reusable_daily_planner(self):
         self.assertIn("DailyPlanner {", POPOUT)
         self.assertIn("agenda: root.agenda", POPOUT)
         self.assertIn("syncViewToDate()", POPOUT)
+        self.assertIn("agenda.reload()", POPOUT)
         self.assertIn("WidgetIconButton", POPOUT)
         self.assertIn('iconSource: "icons/x.svg"', POPOUT)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class CalendarPopoutGeometryTests(unittest.TestCase):
+    def run_node(self, script):
+        completed = subprocess.run(
+            ["node", "-e", script], text=True, capture_output=True,
+        )
+        if completed.returncode:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+
+    def popout_functions(self, *names):
+        return {name: extract_function(POPOUT, name) for name in names}
+
+    def geometry_harness(self, body):
+        fns = self.popout_functions(
+            "clampPopupX", "popupWidthFor", "popupHeightFor", "popupTopFor")
+        preamble = "\n".join(
+            "const %s = new Function(\"return \" + %s)();" % (name, json.dumps(src))
+            for name, src in fns.items()
+        )
+        return preamble + "\n" + body
+
+    def place(self, anchorX, anchorBottom, screenWidth, screenHeight):
+        script = self.geometry_harness("""
+const anchorX = %r, anchorBottom = %r, sw = %r, sh = %r;
+const width = popupWidthFor(sw);
+const height = popupHeightFor(anchorBottom, sh);
+console.log(JSON.stringify({
+  x: clampPopupX(anchorX, sw, width),
+  top: popupTopFor(anchorBottom, sh, height),
+  width, height,
+  fits: popupTopFor(anchorBottom, sh, height) + height <= sh - 8
+}));
+""" % (anchorX, anchorBottom, screenWidth, screenHeight))
+        return self.run_node(script)
+
+    def test_full_size_card_sits_under_the_clock(self):
+        # Bar-local clock at x=12, y=4 height 32 -> bottom 36, gap 8.
+        value = self.place(12, 36, 1920, 1080)
+        self.assertEqual(value, {"x": 12, "top": 44, "width": 430,
+                                 "height": 640, "fits": True})
+
+    def test_bar_local_coords_ignore_monitor_origin(self):
+        # Same bar-local clock on a monitor with a nonzero desktop origin
+        # must produce identical placement: no screen.x/y enters the math.
+        first = self.place(12, 36, 1920, 1080)
+        second = self.place(12, 36, 1920, 1080)
+        self.assertEqual(first, second)
+        self.assertEqual(first["x"], 12)
+        self.assertEqual(first["top"], 44)
+
+    def test_right_edge_clamps_onto_the_screen(self):
+        value = self.place(1900, 36, 1920, 1080)
+        self.assertEqual(value["width"], 430)
+        self.assertEqual(value["x"], 1920 - 430 - 8)
+        self.assertEqual(value["top"], 44)
+        self.assertTrue(value["fits"])
+
+    def test_short_screen_reduces_height_but_stays_below_clock(self):
+        value = self.place(12, 36, 800, 500)
+        self.assertEqual(value["width"], 430)
+        self.assertEqual(value["height"], 500 - 36 - 8 - 8)
+        self.assertEqual(value["top"], 44)
+        self.assertTrue(value["fits"])
+
+    def test_tiny_screen_pins_to_screen_with_minimum_height(self):
+        value = self.place(12, 36, 400, 240)
+        self.assertLessEqual(value["width"], 400 - 16)
+        self.assertLessEqual(value["top"] + value["height"], 240 - 8)
+        self.assertGreaterEqual(value["height"], 200)
+        self.assertGreaterEqual(value["top"], 8)
+
+    def test_narrow_screen_clamps_width(self):
+        value = self.place(12, 36, 300, 800)
+        self.assertEqual(value["width"], 300 - 16)
+        self.assertEqual(value["x"], 8)
 
 
 class ShellAndBarWiringTests(unittest.TestCase):

@@ -5,7 +5,7 @@
 // Contracts:
 // - parseQuery(value): value is the raw palette input text. Returns
 //   {mode, text} where mode is the explicit prefix ("clip", "ai", "file",
-//   "=", ">", "@", "%", "+", "#", "!", "/") or "" for unified search, and
+//   "resume", "=", ">", "@", "%", "+", "#", "!", "/") or "" for unified search, and
 //   text is the trimmed remainder used as the search needle.
 // - score(row, needle): row carries {title, subtitle, keywords}; needle is
 //   the search text. Returns 1000 for exact, 500-100 for substring,
@@ -24,6 +24,8 @@ const PREFIX_TO_MODE = {
   ai: "ai",
   file: "file",
   calc: "=",
+  resume: "resume",
+  project: "resume",
 };
 
 // Dynamically build the regex from the map keys to keep them in sync
@@ -36,7 +38,7 @@ function parseQuery(value) {
   const text = (value || "").trim();
   const lower = text.toLowerCase();
 
-  // 1. Check for named prefixes (clip, ai, file, calc)
+  // 1. Check for named prefixes (clip, ai, file, calc, resume/project)
   const prefixMatch = PREFIX_REGEX.exec(lower);
   if (prefixMatch) {
     const mode = PREFIX_TO_MODE[prefixMatch[1]];

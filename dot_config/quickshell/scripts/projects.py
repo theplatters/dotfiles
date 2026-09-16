@@ -21,6 +21,12 @@ TOML schema (strict; unknown fields are rejected, never silently preserved):
     logseq_path = "pages/X.md"  # optional, omitted when empty
     local_folder = "/abs/path" or "~/path"  # optional, omitted when empty
     github_url = "https://github.com/owner/repo"  # optional, omitted when empty
+    # optional, omitted when unlinked:
+    # zotero_collection = { server_id = "<Zotero-Server-ID>",
+    #   library_type = "user" | "group", library_id = "0" (digit string;
+    #   user "0" is the server-bound user-library alias),
+    #   collection_key = "ABCDEFGH" (8 uppercase alnum),
+    #   include_subcollections = true (default) }
 
 Validation contract:
 
@@ -39,6 +45,19 @@ Validation contract:
   ``www.github.com``, normalized to ``github.com``) repository URL
   ``https://github.com/<owner>/<repo>`` (optional trailing ``/`` or
   ``.git`` stripped). Owner/repo segments match ``[A-Za-z0-9_.-]+``.
+- ``zotero_collection`` is optional and unlinks when absent or ``null``
+  (JSON) / omitted (TOML). When present it must be an object with exactly
+  ``server_id`` (non-blank bounded string, 1..256 chars, no NUL/controls/
+  whitespace), ``library_type`` (``user`` or ``group``), ``library_id``
+  (digit string 1..20 chars; ``user`` libraries may use ``"0"`` as the
+  local personal library pinned by ``server_id``; ``group`` libraries must
+  be non-zero), ``collection_key`` (exactly 8 uppercase alphanumerics
+  ``[A-Z0-9]{8}``), and optional ``include_subcollections`` (strict bool,
+  defaults to ``true`` when omitted). Unknown sub-fields are rejected.
+  TOML stores a linked value as an inline table
+  (``zotero_collection = {server_id=..., ...}``) and omits the key when
+  unlinked; JSON reads back linked values as objects and unlinked values
+  as ``null``.
 - Duplicate ``id`` values are rejected. Duplicate non-empty ``logseq_path``
   values are rejected (two registry entries must not claim the same note).
 - The registry holds at most ``MAX_PROJECTS`` entries. The cap is enforced
@@ -57,7 +76,8 @@ Validation contract:
 JSON responses (all commands)::
 
     {"projects": [{"id":..., "name":..., "logseq_path":"", "local_folder":"",
-                   "github_url":"", "path":<logseq_path>, "page":<name>}],
+                   "github_url":"", "zotero_collection":null|{...},
+                   "path":<logseq_path>, "page":<name>}],
      "revision": "<sha256 of registry file bytes, or sha256(b\"\") when missing>",
      "file": "<absolute registry path>"}
 
@@ -78,10 +98,11 @@ CLI::
 Stdin shapes:
 
 - create: ``{"name":..., "logseq_path"?:..., "local_folder"?:...,
-  "github_url"?:...}`` (unknown keys rejected).
+  "github_url"?:..., "zotero_collection"?:null|{...}}`` (unknown keys rejected).
 - update: ``{"id":..., "revision":..., "name":..., "logseq_path"?:...,
-  "local_folder"?:..., "github_url"?:...}`` (full replacement; missing
-  optionals clear to ``""``; stale ``revision`` rejected).
+  "local_folder"?:..., "github_url"?:..., "zotero_collection"?:null|{...}}``
+  (full replacement; missing optionals clear to ``""`` and a missing/null
+  ``zotero_collection`` unlinks; stale ``revision`` rejected).
 - remove: ``{"id":..., "revision":...}`` (stale ``revision`` rejected).
 - import-logseq: no stdin; scans the graph for new project notes only,
   never updates existing entries and never writes to the graph.
@@ -147,10 +168,14 @@ INPUT_LIMIT = 256 * 1024
 PATH_LIMIT = 4096
 NAME_LIMIT = 512
 GITHUB_LIMIT = 2048
+SERVER_ID_LIMIT = 256
+LIBRARY_ID_LIMIT = 20
 MAX_PROJECTS = 5000
 LOCK_TIMEOUT = 2.0
 _HEX_REVISION = re.compile(r"^[0-9a-f]{64}$")
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_COLLECTION_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
+_LIBRARY_ID_RE = re.compile(r"^[0-9]{1,20}$")
 _MARKDOWN_LINK_RE = re.compile(r"\[.*?\]\(\s*(?P<target>.+?)\s*\)\s*$")
 _PROPERTY_RE = re.compile(
     r"^(?P<key>[A-Za-z][A-Za-z0-9_-]*)\s*::\s*(?P<value>.*)$")
@@ -158,11 +183,14 @@ _PROPERTY_RE = re.compile(
 MISSING_REVISION = hashlib.sha256(b"").hexdigest()
 
 _ALLOWED_PROJECT_KEYS = {"id", "name", "logseq_path", "local_folder",
-                         "github_url"}
-_ALLOWED_CREATE_KEYS = {"name", "logseq_path", "local_folder", "github_url"}
+                         "github_url", "zotero_collection"}
+_ALLOWED_CREATE_KEYS = {"name", "logseq_path", "local_folder", "github_url",
+                        "zotero_collection"}
 _ALLOWED_UPDATE_KEYS = {"id", "revision", "name", "logseq_path",
-                        "local_folder", "github_url"}
+                        "local_folder", "github_url", "zotero_collection"}
 _ALLOWED_REMOVE_KEYS = {"id", "revision"}
+_ALLOWED_ZOTERO_KEYS = {"server_id", "library_type", "library_id",
+                        "collection_key", "include_subcollections"}
 
 
 def _error(message: str) -> NoReturn:
@@ -547,13 +575,71 @@ def _validate_revision(value: object) -> str:
     return value
 
 
+def _validate_zotero_collection(value: object) -> dict | None:
+    """Validate the optional ``zotero_collection`` registry field.
+
+    ``None``/missing reads as unlinked (``None``). Otherwise the value must
+    be a table with exactly ``server_id``, ``library_type``, ``library_id``,
+    ``collection_key`` and optional ``include_subcollections`` (default
+    ``True``). Unknown keys are rejected. ``server_id`` is a non-blank
+    bounded string (1..256 chars, no NUL/controls/whitespace);
+    ``library_type`` is ``'user'`` or ``'group'``; ``library_id`` is a digit
+    string (1..20 chars; ``'0'`` is allowed only for ``user`` libraries as
+    the server-bound local personal library alias pinned by ``server_id``);
+    ``collection_key`` is 8 uppercase alphanumerics ``[A-Z0-9]{8}``;
+    ``include_subcollections`` must be a strict bool. Returns the
+    normalized dict (always with ``include_subcollections``).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        _error("zotero_collection must be an object or null")
+    for key in value:
+        if key not in _ALLOWED_ZOTERO_KEYS:
+            _error(f"zotero_collection has unsupported field: {key}")
+    for req in ("server_id", "library_type", "library_id", "collection_key"):
+        if req not in value:
+            _error(f"zotero_collection is missing required field: {req}")
+    server = value.get("server_id")
+    if not isinstance(server, str):
+        _error("zotero_collection server_id must be a string")
+    server = server.strip()
+    if not server or len(server) > SERVER_ID_LIMIT or "\x00" in server:
+        _error("zotero_collection server_id is unsafe")
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in server):
+        _error("zotero_collection server_id is unsafe")
+    libtype = value.get("library_type")
+    if libtype not in ("user", "group"):
+        _error("zotero_collection library_type must be 'user' or 'group'")
+    libid = value.get("library_id")
+    if not isinstance(libid, str) or not _LIBRARY_ID_RE.fullmatch(libid):
+        _error("zotero_collection library_id must be a digit string")
+    if libtype == "group" and int(libid) == 0:
+        _error("zotero_collection library_id '0' is allowed only for user libraries")
+    ckey = value.get("collection_key")
+    if not isinstance(ckey, str) or not _COLLECTION_KEY_RE.fullmatch(ckey):
+        _error("zotero_collection collection_key must be 8 uppercase alphanumerics")
+    inc = value.get("include_subcollections", True)
+    if type(inc) is not bool:
+        _error("zotero_collection include_subcollections must be a bool")
+    return {
+        "server_id": server,
+        "library_type": libtype,
+        "library_id": libid,
+        "collection_key": ckey,
+        "include_subcollections": inc,
+    }
+
+
 def _public_record(item: dict) -> dict:
+    zc = item.get("zotero_collection")
     return {
         "id": item["id"],
         "name": item["name"],
         "logseq_path": item.get("logseq_path", ""),
         "local_folder": item.get("local_folder", ""),
         "github_url": item.get("github_url", ""),
+        "zotero_collection": dict(zc) if isinstance(zc, dict) else None,
         "path": item.get("logseq_path", ""),
         "page": item.get("name", ""),
     }
@@ -608,6 +694,7 @@ def _parse_registry(raw: bytes | None) -> list[dict]:
         logseq_path = _validate_logseq_path(entry.get("logseq_path", ""))
         local_folder = _normalize_local_folder(entry.get("local_folder", ""))
         github_url = _validate_github_url(entry.get("github_url", ""))
+        zotero_collection = _validate_zotero_collection(entry.get("zotero_collection"))
         if logseq_path:
             if logseq_path in seen_notes:
                 _error("registry has a duplicate project note")
@@ -618,6 +705,7 @@ def _parse_registry(raw: bytes | None) -> list[dict]:
             "logseq_path": logseq_path,
             "local_folder": local_folder,
             "github_url": github_url,
+            "zotero_collection": zotero_collection,
         })
     normalized.sort(key=lambda item: (item["name"].casefold(), item["id"]))
     return normalized
@@ -662,6 +750,16 @@ def _serialize_registry(items: list[dict]) -> bytes:
             lines.append(f'local_folder = "{_toml_escape(item["local_folder"])}"')
         if item.get("github_url"):
             lines.append(f'github_url = "{_toml_escape(item["github_url"])}"')
+        zc = item.get("zotero_collection")
+        if isinstance(zc, dict):
+            inc = "true" if zc.get("include_subcollections", True) else "false"
+            lines.append(
+                "zotero_collection = { "
+                f'server_id = "{_toml_escape(zc["server_id"])}", '
+                f'library_type = "{_toml_escape(zc["library_type"])}", '
+                f'library_id = "{_toml_escape(zc["library_id"])}", '
+                f'collection_key = "{_toml_escape(zc["collection_key"])}", '
+                f"include_subcollections = {inc} }}")
         lines.append("")
     text = "\n".join(lines)
     return text.encode("utf-8")
@@ -700,6 +798,7 @@ def create_project(payload: dict, registry_file=None) -> dict:
     logseq_path = _validate_logseq_path(payload.get("logseq_path", ""))
     local_folder = _normalize_local_folder(payload.get("local_folder", ""))
     github_url = _validate_github_url(payload.get("github_url", ""))
+    zotero_collection = _validate_zotero_collection(payload.get("zotero_collection"))
     registry = resolve_registry_file(registry_file)
     with _RegistryLock(registry):
         raw = _read_registry_bytes(registry)
@@ -710,7 +809,8 @@ def create_project(payload: dict, registry_file=None) -> dict:
         while any(e["id"] == new_id for e in items):
             new_id = str(uuid.uuid4())
         record = {"id": new_id, "name": name, "logseq_path": logseq_path,
-                  "local_folder": local_folder, "github_url": github_url}
+                  "local_folder": local_folder, "github_url": github_url,
+                  "zotero_collection": zotero_collection}
         items.append(record)
         items.sort(key=lambda e: (e["name"].casefold(), e["id"]))
         encoded = _serialize_registry(items)
@@ -731,6 +831,7 @@ def update_project(payload: dict, registry_file=None) -> dict:
     logseq_path = _validate_logseq_path(payload.get("logseq_path", ""))
     local_folder = _normalize_local_folder(payload.get("local_folder", ""))
     github_url = _validate_github_url(payload.get("github_url", ""))
+    zotero_collection = _validate_zotero_collection(payload.get("zotero_collection"))
     registry = resolve_registry_file(registry_file)
     with _RegistryLock(registry):
         raw = _read_registry_bytes(registry)
@@ -749,7 +850,8 @@ def update_project(payload: dict, registry_file=None) -> dict:
                                for e in items):
             _error("another project already uses this note")
         target.update({"name": name, "logseq_path": logseq_path,
-                       "local_folder": local_folder, "github_url": github_url})
+                       "local_folder": local_folder, "github_url": github_url,
+                       "zotero_collection": zotero_collection})
         items.sort(key=lambda e: (e["name"].casefold(), e["id"]))
         encoded = _serialize_registry(items)
         _atomic_write_registry(registry, encoded)

@@ -84,7 +84,7 @@ class PaletteAgentUiTests(unittest.TestCase):
     def test_palette_uses_bridge_mode_without_project(self):
         self.assertIn("property bool paletteMode: false", SCOPED)
         # scopedMode remains actual scope only; paletteMode is excluded.
-        self.assertIn("readonly property bool scopedMode: !!projectPath || journalMode", SCOPED)
+        self.assertIn("readonly property bool scopedMode: !!projectId || !!projectPath || journalMode", SCOPED)
         self.assertNotIn("paletteMode", SCOPED.split("readonly property bool scopedMode")[1].split("\n")[0])
         bridge_src = extract_function(SCOPED, "bridgeArgs")
         self.assertIn('"palette"', bridge_src)

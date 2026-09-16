@@ -17,6 +17,7 @@ Rectangle {
     property var batteryPopup: null
     property var controlCenter: null
     property var calendarPopout: null
+    property var projectPlanner: null
     property alias trayAnchor: unifiedTray
     property alias clockAnchor: clockContainer
 
@@ -179,6 +180,22 @@ Rectangle {
                             compact: bar.compactBattery
                             batteryPopup: bar.batteryPopup
                             controlCenter: bar.controlCenter
+                        }
+
+                        Rectangle { width: 1; height: 16; color: Theme.border; anchors.verticalCenter: parent.verticalCenter }
+
+                        // Current working project (authoritative desktop_projects
+                        // helper, polled). Compactness follows a plain bar.width
+                        // threshold (compactNetwork), never tightSides: the
+                        // measured sideReserve already includes this module, so
+                        // reading tightSides here would feed back into layout.
+                        CurrentProjectModule {
+                            id: currentProjectModule
+                            objectName: "currentProjectModule"
+                            height: 32
+                            anchors.verticalCenter: parent.verticalCenter
+                            projectPlanner: bar.projectPlanner
+                            compact: bar.compactNetwork
                         }
 
                         Rectangle {

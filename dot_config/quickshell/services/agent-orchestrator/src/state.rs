@@ -61,6 +61,7 @@ pub struct AgentState {
     pub session_file: String,
     pub session_name: String,
     pub fresh_session: bool,
+    pub project_id: String,
     pub project_path: String,
     pub journal_mode: bool,
     pub model: Value,
@@ -116,11 +117,23 @@ impl AgentState {
         pending_name: String,
         fresh: bool,
     ) -> Self {
+        Self::new_with_id(String::new(), project_path, journal_mode, session, pending_name, fresh)
+    }
+
+    pub fn new_with_id(
+        project_id: String,
+        project_path: String,
+        journal_mode: bool,
+        session: String,
+        pending_name: String,
+        fresh: bool,
+    ) -> Self {
         let session_name = pending_name;
         Self {
             session_file: session,
             session_name,
             fresh_session: fresh,
+            project_id,
             project_path,
             journal_mode,
             model: Value::Null,
@@ -173,7 +186,7 @@ impl AgentState {
     /// (separate from this property) so palette New/Restore cannot release
     /// its gate before the matching ACK + authoritative state.
     pub fn scoped_mode(&self) -> bool {
-        !self.project_path.is_empty() || self.journal_mode
+        !self.project_id.is_empty() || !self.project_path.is_empty() || self.journal_mode
     }
 
     pub fn ready(&self) -> bool {
@@ -611,6 +624,7 @@ impl AgentState {
             "sessionFile": self.session_file,
             "sessionName": self.session_name,
             "freshSession": self.fresh_session,
+            "projectId": self.project_id,
             "projectPath": self.project_path,
             "journalMode": self.journal_mode,
             "scopedMode": self.scoped_mode(),
@@ -950,7 +964,7 @@ impl AgentState {
                 let msg = error_msg();
                 let label = if self.journal_mode {
                     "Authoritative journal session refresh failed"
-                } else if !self.project_path.is_empty() {
+                } else if !self.project_id.is_empty() || !self.project_path.is_empty() {
                     "Authoritative project session refresh failed"
                 } else {
                     "Authoritative session refresh failed"

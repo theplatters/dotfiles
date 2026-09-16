@@ -15,6 +15,9 @@ logseq_path = "pages/Advent of Code.md"
 id = "f82ffe50-435d-4479-bc46-935606867be3"
 name = "Agent Based Modeling with ECS"
 logseq_path = "pages/Agent Based Modeling with ECS.md"
+local_folder = "~/Schreibtisch/Arbeit/EBM"
+github_url = "https://github.com/theplatters/EBM"
+zotero_collection = { server_id = "KAsPG68eyqZT", library_type = "user", library_id = "0", collection_key = "KV4CK3X3", include_subcollections = true }
 
 [[projects]]
 id = "57cc6994-5c3a-4e11-ae72-82a64665baca"
@@ -27,6 +30,7 @@ name = "Asset-Prices"
 logseq_path = "pages/Asset-Prices.md"
 local_folder = "/home/franzs/Schreibtisch/Arbeit/PKAssetPrices"
 github_url = "https://github.com/theplatters/PKAssetPrices"
+zotero_collection = { server_id = "KAsPG68eyqZT", library_type = "group", library_id = "5935249", collection_key = "UNZGHLEU", include_subcollections = true }
 
 [[projects]]
 id = "c1fd3151-de27-4d54-8ab7-5d518bf3b1ce"
@@ -49,6 +53,7 @@ name = "Beyond Hulten"
 logseq_path = "pages/Beyond Hulten.md"
 local_folder = "/home/franzs/Schreibtisch/Arbeit/BeyondHulten"
 github_url = "https://github.com/theplatters/CGEandLeontief"
+zotero_collection = { server_id = "KAsPG68eyqZT", library_type = "group", library_id = "5935249", collection_key = "2L26MM4G", include_subcollections = true }
 
 [[projects]]
 id = "f1064813-ba69-40ce-9a9a-9095b36e14a2"
@@ -75,6 +80,13 @@ github_url = "https://github.com/ecoclassical/ECO-ECO-NETWORK"
 id = "420d8fab-964d-42a2-a03b-b8fab96b3bde"
 name = "Entwicklung der Sanktionierung in der Arbeitslosenversicherung in Österreich"
 logseq_path = "pages/Entwicklung der Sanktionierung in der Arbeitslosenversicherung in Österreich.md"
+
+[[projects]]
+id = "51b2a763-cd73-4aa7-bebb-f7d44376d0d9"
+name = "Gender Norm ABM"
+logseq_path = "pages/Gender_Norm_ABM.md"
+local_folder = "~/Schreibtisch/Arbeit/gendernorms"
+github_url = "https://github.com/patrickmellacher/gendernorms"
 
 [[projects]]
 id = "a0de2304-917d-465f-9637-40d2ad47ebd6"

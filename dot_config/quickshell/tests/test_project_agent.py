@@ -72,7 +72,7 @@ class ProjectHelperTests(unittest.TestCase):
 
 class ProjectPolicyContractTests(unittest.TestCase):
     def test_scope_gate_allows_only_project_tools(self):
-        self.assertIn('if (projectMode() && !["logseq_project_read", "logseq_project_update", "logseq_project_files", "logseq_project_read_file", "logseq_project_git"].includes(event.toolName))', EXTENSION)
+        self.assertIn('if (projectMode() && !["logseq_project_read", "logseq_project_update", "logseq_project_files", "logseq_project_read_file", "logseq_project_git", "zotero_search", "zotero_item", "zotero_read_pdf", "zotero_collections", "zotero_prepare", "zotero_apply"].includes(event.toolName))', EXTENSION)
         self.assertIn('return { block: true, reason: "Project mode permits only the constrained project tools" }', EXTENSION)
 
     def test_approval_denial_and_exact_preview_happen_before_write(self):
@@ -129,6 +129,42 @@ class ProjectPolicyContractTests(unittest.TestCase):
         self.assertIn('return { cancel: true }', EXTENSION)
         self.assertIn('SessionManager.list(ctx.cwd, directory)', EXTENSION)
         self.assertIn('String(s.firstMessage ?? "").trim() || "Untitled"', EXTENSION)
+
+    def test_coherent_desktop_history_surface(self):
+        for name in ("desktop_current_context", "desktop_project_todos",
+                     "desktop_project_logseq_context", "desktop_project_activity",
+                     "desktop_current_session", "desktop_search_activity",
+                     "desktop_get_session", "desktop_resume_plan"):
+            self.assertIn(f'name: "{name}"', EXTENSION)
+        for name in ("desktop_current_project", "desktop_project_resources",
+                     "desktop_work_sessions", "desktop_session_resources",
+                     "desktop_session_events"):
+            self.assertNotIn(f'name: "{name}"', EXTENSION)
+        self.assertIn("Intl.DateTimeFormat().resolvedOptions().timeZone", EXTENSION)
+        self.assertIn("DESKTOP_LOCAL_TZ", EXTENSION)
+        self.assertIn("start-inclusive/end-exclusive", EXTENSION)
+        self.assertIn("never pass natural-language ranges", EXTENSION)
+        self.assertIn('"current-context"', EXTENSION)
+        self.assertIn('"search-activity"', EXTENSION)
+        self.assertIn('"get-session"', EXTENSION)
+        self.assertIn('"project-activity"', EXTENSION)
+        system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
+        self.assertIn("Prefer session search", system)
+        self.assertIn("desktop_get_session", system)
+        self.assertIn("not file edits", system)
+        self.assertIn("matched_at_ms", system)
+
+    def test_scope_allowlists_state_desktop_exception(self):
+        system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            system.count("eight read-only desktop tools"), 2)
+        self.assertIn("eight-tool desktop read-only exception", system)
+        self.assertIn("desktop exception never permits writes", system)
+        skill = (ROOT / ".pi" / "skills" / "logseq-graph" / "SKILL.md"
+                 ).read_text(encoding="utf-8")
+        self.assertIn("exception in every scope", skill)
+        self.assertIn("not file edits", EXTENSION)
+        self.assertIn("qualify the claim", EXTENSION)
 
     @unittest.skipUnless(BUN, "bun is required for executable extension tests")
     def test_extension_runtime_scope_approval_abort_stale_and_utf8_transport(self):
@@ -250,7 +286,7 @@ const update = () => tools.logseq_project_update.execute("id", {
 
 const gate = await hooks.tool_call({ toolName: "bash", input: { command: "cat escape" } }, ctx);
 assert(gate?.block === true, "scoped shell was not blocked");
-assert(Object.keys(tools).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,desktop_current_project,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_project_resources",
+assert(Object.keys(tools).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan",
        "scoped registration exposed unrelated tools");
 const read = await tools.logseq_project_read.execute("id", {}, undefined, undefined, ctx);
 assert(read.content[0].text.includes("before € after"), "split UTF-8 stdout was corrupted");

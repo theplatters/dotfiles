@@ -1392,18 +1392,23 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // Palette carries no graph scope: empty project path, journalMode false,
+    // Palette carries no graph scope: empty project id/path, journalMode false,
     // so `scopedMode` stays false while session fencing still applies.
-    let project_path = if cfg.mode == "project" {
-        cfg.project.clone().unwrap_or_default()
+    // Project workers are pinned by UUID (QS_PROJECT_ID) with an optional
+    // legacy page for explicit migration restores.
+    let (project_id, project_path) = if cfg.mode == "project" {
+        (
+            cfg.project_id.clone().unwrap_or_default(),
+            cfg.project.clone().unwrap_or_default(),
+        )
     } else {
-        String::new()
+        (String::new(), String::new())
     };
     let journal_mode = cfg.mode == "journal";
     let session = cfg.session.clone().unwrap_or_default();
     let pending = cfg.pending_name.clone().unwrap_or_default();
     let fresh = cfg.new_session;
-    let state = AgentState::new(project_path, journal_mode, session, pending, fresh);
+    let state = AgentState::new_with_id(project_id, project_path, journal_mode, session, pending, fresh);
 
     // UI stdout must be nonblocking so a stalled QML reader fails closed via
     // deadline instead of wedging the state loop.
@@ -1612,6 +1617,7 @@ mod tests {
                 root: std::path::PathBuf::from("/tmp"),
                 mode: "journal".to_string(),
                 project: None,
+                project_id: None,
                 session: None,
                 pending_name: None,
                 new_session: false,
@@ -1824,6 +1830,7 @@ mod tests {
                 root: std::path::PathBuf::from("/tmp"),
                 mode: "palette".to_string(),
                 project: None,
+                project_id: None,
                 session: None,
                 pending_name: None,
                 new_session: false,

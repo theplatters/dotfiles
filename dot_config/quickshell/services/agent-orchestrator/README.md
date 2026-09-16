@@ -279,18 +279,24 @@ are unaffected by this bridge:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-## Desktop-activity collector (`qs-desktop-context`): Phase 1 base + Phase 2 enrichment
+## Desktop-activity collector (`qs-desktop-context`): Phase 1 base + Phase 2 enrichment + Phase 3 attribution + Phase 4 sessions + Phase 5 retrieval
 
 Standalone same-crate binary recording Hyprland focus/title/workspace
 activity to a private local SQLite DB, plus implemented Phase 2
 application-aware enrichment (optional typed `resource` per snapshot;
-new `context` kind). Still collect + local query only: no QML wiring,
-no `ScopedAgent`/Pi bridge changes, no Pi protocol changes. Per-scope
+new `context` kind), implemented Phase 4 deterministic work sessions,
+and implemented Phase 5 session-centric retrieval (schema v4 with
+`activity_fts` + `search`/`session-detail`; full contract:
+`docs/desktop-history-search.md`). Still
+collect + local query only: no QML wiring, no `ScopedAgent` bridge or Pi
+protocol changes. The existing Pi extension gains additive read-only query
+tools. Per-scope
 Pi bridges keep their idle/`stopIdle` behavior; nothing auto-starts or
-auto-installs this collector, and no worker/search/session consumer
-reads the DB yet (library API in `src/lib.rs`, or read-only `history`
-below). Phase 3 (future search/session use) must handle the freshness
-notes under Phase 2 below; nothing here promises it.
+auto-installs this collector, and no worker/search consumer reads the
+  DB yet — sessions are served read-only via the CLI/Python/Pi tools
+  below (library API in `src/lib.rs`). Phase 5 retrieval is implemented
+  (see `docs/desktop-history-search.md`); consumers must handle the freshness
+  notes under Phase 2 below; nothing here promises beyond it.
 
 ### Build
 
@@ -327,19 +333,60 @@ set `HYPRLAND_INSTANCE_SIGNATURE` explicitly.
 Deadlines: connect 2 s (`connect_bounded`); requests 4 s total, each
 wait capped by the remaining budget; idle read 1 s; coalesce ~50 ms.
 
-CLI (diagnostics to stderr; stdout carries ONLY history JSON in
-`history` mode):
+CLI (diagnostics to stderr; stdout carries ONLY JSON in query
+modes; `current`/`current-project` print fresh snapshots, never history):
 
 ```text
-usage: qs-desktop-context [--db PATH] [collect] | history [--limit N] [--from START_MS --to END_MS [--limit N]]
+usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-interruption-ms MS]]
+       qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS [--limit N]]
+       qs-desktop-context current
+       qs-desktop-context current-project
+       qs-desktop-context [--db PATH] last-activity --project UUID
+       qs-desktop-context [--db PATH] resources --project UUID [--limit N]
+       qs-desktop-context [--db PATH] current-session
+       qs-desktop-context [--db PATH] sessions [--project UUID] [--limit N] [--from START_MS --to END_MS]
+       qs-desktop-context [--db PATH] last-session --project UUID
+       qs-desktop-context [--db PATH] session-resources --session SESSION_ID [--limit N]
+       qs-desktop-context [--db PATH] session-events --session SESSION_ID [--limit N]
+       qs-desktop-context [--db PATH] search [--project UUID] [--application TEXT] [--resource TEXT] [--device 32HEX] [--query TEXT] [--from START_MS --to END_MS] [--limit N]
+       qs-desktop-context [--db PATH] session-detail --session SESSION_ID [--resource-limit N] [--include-events [--event-limit N]]
 ```
 
 - `collect` (default) holds the per-DB lock for life; exit 1 when the
   lock is held or the DB cannot be prepared/opened, exit 2 on usage errors.
-- `history` is strictly read-only, never live `current`; missing DB →
-  `[]` (exit 0) with a not-run-yet note, bad limit/range → exit 1.
-- Only `--db`, `--limit`, `--from`/`--to`, `collect`, `history`,
-  `--help`/`-h` exist — no redaction/retention/follow/format flags.
+  `--session-gap-ms`/`--session-interruption-ms` are collect-only
+  overrides (CLI > `QS_DESKTOP_SESSION_GAP_MS`/
+  `QS_DESKTOP_SESSION_INTERRUPTION_MS` env > 30 min / 2 min defaults;
+  validated before any mutation).
+- Query modes are strictly read-only, never live `current`; missing DB →
+  `[]`/`null`/`{query,sessions,count}` empty (exit 0) with a not-run-yet note,
+  bad limit/range → exit 1.
+  `--session` is only for `session-resources`/`session-events`/`session-detail`
+  (32-hex session id); `--from`/`--to` must pair and are only for
+  `history`/`sessions`/`search`; `--application`/`--resource`/`--device`/
+  `--query` are only for `search`; `--resource-limit`/`--event-limit`/
+  `--include-events` are only for `session-detail` (`--event-limit` requires
+  `--include-events`); `current`/`current-project` ignore `--db`
+  (warn) and take no query flags.
+- Only `--db`, `--limit`, `--from`/`--to`, `--project`, `--session`,
+  `--application`, `--resource`, `--device`, `--query`, `--resource-limit`,
+  `--event-limit`, `--include-events`,
+  `--session-gap-ms`/`--session-interruption-ms` (collect only),
+  subcommands, `--help`/`-h` exist — no redaction/retention/follow/format flags.
+- `search` prints a compact `{query:{project,application,resource,device,
+  query,from_ms,to_ms,range_semantics,limit},sessions:[compact session
+  summaries with resources],count:N}` object. FTS/range hits carry
+  `matched_at_ms` (newest matching observation) and order newest matching
+  observation first (then session end/start/id), so `limit=1` answers “last
+  matching observation” across devices; project/device-only and no-filter
+  searches carry `matched_at_ms:null` with session-recency order.
+  Discovery traverses FTS matches once (single grouped scan); per-session
+  resources favor actually-matched keys ranked by newest matching activity
+  (deterministic, capped at 8); summaries keep stable session/device/project
+  IDs, start/end, event count/status/effective status/apps and omit
+  thresholds/bound IDs.
+  `session-detail` prints `{session:full|null,resources:[],events_included:bool,
+  events?:[]}` and never fetches/outputs events unless `--include-events`.
 
 ### Database location, strict permissions, per-DB lock
 
@@ -373,21 +420,62 @@ install -d -m 0700 /tmp/qs-test
 "$BIN" --db /tmp/qs-test/activity.db
 "$BIN" --db /tmp/qs-test/activity.db history --limit 5
 "$BIN" --db /tmp/qs-test/activity.db history --from 1700000000000 --to 1700003600000 --limit 20
+"$BIN" --db /tmp/qs-test/activity.db current-session
+"$BIN" --db /tmp/qs-test/activity.db sessions --limit 5
 ```
 
 ### Schema and truly read-only history
 
-Current store is schema v2 (`SCHEMA_VERSION = 2`): singleton
-`schema_version(version INTEGER PRIMARY KEY)` + `activity(id
-AUTOINCREMENT, observed_at_ms, kind, source, snapshot_json,
-project_id TEXT NULL)` + `idx_activity_time(observed_at_ms, id)` +
-`idx_activity_project(project_id, observed_at_ms, id)`.
-Phase 1 base was schema v1 (same table without `project_id` and only
-the time index); v1 files migrate transactionally on writable open and
-stay readable read-only (see project attribution below). Opens validate authoritatively
-before any mutation (transactional setup): foreign tables, newer
-versions, and multi-row `schema_version` are rejected
-(`IncompatibleSchema`) without modification.
+Current store is schema v4 (`SCHEMA_VERSION = 4`): all v3 tables/columns
+unchanged (singleton `schema_version`, `activity` with
+`project_id`/`event_id`/`device_id`/`session_id`, `sessions`,
+`session_resources`, singleton `device_info`) plus the
+application-maintained content-bearing FTS5 table `activity_fts` (one row
+per activity, `rowid=activity.id`: `session_id UNINDEXED, resource_key
+UNINDEXED, project, application, window_title, workspace, resource,
+metadata` with `tokenize='unicode61 remove_diacritics 2'`, no embeddings,
+no triggers) and the normal index
+`idx_sessions_device_time(device_id,end_ms,start_ms,session_id)`.
+Fresh databases are created at v4. An exact coherent v3 database migrates
+to v4 in one `BEGIN IMMEDIATE` transaction (strict v3 prevalidation inside
+the same transaction so no writer can race validation/backfill/version
+bump, every stored `DesktopContext` parsed/backfilled into FTS, version
+bumped to 4; any malformed snapshot/FTS failure rolls back untouched) —
+but ONLY through the lock-capability open that proves ownership of the
+per-DB `DesktopLock` (`open_with_session_config_and_lock`, with the guard
+for exactly `lock_path_for(db)`). Ordinary writable opens reject v3 with a
+clear collector lock/restart error, so an old v3 collector can never append
+past a migration and desynchronize FTS. Operational rule: stop the old
+collector and let its bounded (~2 s) final drain finish, then restart; the
+restarting collector holds the per-DB lock for life and passes it to the
+store, which migrates once and continues appending at v4.
+Read-only opens accept exact coherent v4 only and report a clear
+migration-required error for v3. Any other schema version or shape —
+including pre-v3 (v1/v2) layouts, future versions, foreign objects, or
+multi-row `schema_version` content — is rejected (`IncompatibleSchema`)
+without modification. There is no v1/v2 migration and no read-only
+compatibility for older schemas (beyond the single lock-gated transactional
+v3→v4 migration).
+Full session contract:
+`docs/desktop-work-sessions.md`. Writable opens validate authoritatively
+(transactional setup/migration, deep exact data coherence): foreign tables
+(including unexpected FTS/shadow objects on the wrong version, and any
+`sqlitex_…` object — SQLite-owned names match the literal `sqlite_*`
+prefix via `GLOB`, never `LIKE 'sqlite_%'`), wrong shapes (including the
+exact FTS declaration: precisely which columns are `UNINDEXED`, exactly
+`unicode61 remove_diacritics 2`, no extra options; exact shadow DDL),
+wrong versions, newer versions, multi-row `schema_version`, missing v4
+tables (base + FTS + shadows), the missing UNIQUE `idx_activity_event_id`,
+inexact session projections/provenance, inexact FTS rowid one-to-one, and
+marker-only layouts with extra tables/objects are rejected
+(`IncompatibleSchema`) without modification (missing non-unique indexes are
+the only completion; FTS itself is never recreated). Read-only opens use an
+intentional lightweight contract for query performance: strict
+object/table/shape/FTS/index validation inside a single read snapshot
+(`BEGIN`/`COMMIT`, so a concurrent atomic append cannot produce
+mixed-statement false corruption) plus cheap singleton/version/device
+metadata checks only — never full-history scans. Rows actually touched
+still validate through the row parsers.
 
 `history` uses `open_read_only`: creates nothing, takes no lock,
 `PRAGMA query_only=ON`. Missing DB → `[]` (exit 0); permission,
@@ -548,14 +636,21 @@ Per-app (all bounded, no shell, no file-content reads; details in
   (matching kitty window id when both present). Relative `file` is
   resolved against `cwd`. The collector (not Lua) attaches
   `git_root`/`git_branch`.
-- Kitty (opt-in remote control): `allow_remote_control socket-only`
+- Kitty (remote control): `allow_remote_control socket-only`
   only (never `yes`; `socket-only` is a transport restriction — only
   local-socket peers may issue remote commands at all — not a
   read-only flag, so keep the socket private regardless), socket at an
   absolute path under a private runtime parent with a per-instance PID
   suffix, addressed as the exact `unix:` address `kitty @ --to`
   requires (bare paths and `unix:` addresses both normalize; see kitty
-  README; no `/tmp` public-parent example). Identity is `SO_PEERCRED`
+  README; no `/tmp` public-parent example). The env socket
+  (`QS_KITTY_SOCKET` / `KITTY_LISTEN_ON`) is honored as a preference;
+  when it is absent or belongs to a foreign instance, the focused
+  instance's default socket (`/tmp/kitty-<focused_pid>`, plus
+  `$TMPDIR/kitty-<pid>` when different) is discovered and still
+  validated by peer PID — no other opt-in is required for cwd-based
+  project resolution (the nvim Lua publisher remains optional for
+  per-file context). Identity is `SO_PEERCRED`
   peer PID == focused Hyprland client PID over the same bounded
   connector (a present but unequal peer is a confirmed mismatch:
   evicted, never last-good-served), then unique-`is_focused` OS
@@ -577,9 +672,12 @@ Per-app (all bounded, no shell, no file-content reads; details in
   per-window binding (a configured window id cannot prove the global
   value belongs to the focused window without polling), so any
   attributed page would be deceptive. `logseq-title` always carries the
-  full window title plus `page` only via the explicit rule `<page> -
-  Logseq` suffix-strip (anything else: `page` stays `null`, never a
-  guess, never a URL).
+  full window title plus `page` extracted from the window title: the
+  `<page> - Logseq` suffix form when present, otherwise the bare
+  trimmed title (Electron app). Structural validation only
+  (empty/app-name/loading-ellipsis/control rejected, never a guess,
+  never a URL); project matching is exact registry matching done by
+  the resolver.
 - Git (collector-side, neovim/kitty paths only): bounded
   `git -C <dir> rev-parse` (1 s each, 8 KiB stdout, 2 KiB stderr,
   `LC_ALL=C`) from the file parent else `cwd`. Explicit non-repos
@@ -601,9 +699,11 @@ bounds; over-permissive/foreign/malformed inputs ignored).
 Setup prerequisites (manual; nothing auto-installs or auto-starts):
 Rust/Cargo locked release build, a Hyprland session with
 `XDG_RUNTIME_DIR`/`HYPRLAND_INSTANCE_SIGNATURE`, one opt-in at a time
-(`QS_KITTY_SOCKET` or `KITTY_LISTEN_ON`; Lua `qs-context.lua` with
-`vim.g.qs_nvim_context_enable = true`; `QS_ZEN_CONTEXT_FILE`;
-Logseq needs no config — title-only), and
+(`QS_KITTY_SOCKET` or `KITTY_LISTEN_ON` as a preferred kitty socket —
+kitty cwd resolution itself needs no opt-in: the focused instance's
+default socket is discovered automatically; Lua `qs-context.lua` with
+`vim.g.qs_nvim_context_enable = true` for per-file context;
+`QS_ZEN_CONTEXT_FILE`; Logseq needs no config — title-only), and
 an optional manual `exec-once` for the collector. Phase 3 note: future
 search/session consumers must treat `resource` as best-effort and
 stale-tolerant (5 s refresh cadence, 30 s record freshness, 60 s
@@ -619,10 +719,10 @@ inference, no writes. Full contract, CLI/Python usage, and limits:
 `docs/desktop-project-context.md`.
 
 - `DesktopContext.project` is `{id, name, matched_by}` only
-  (`file`/`cwd`/`git_root`/`git_remote`); missing in old JSON reads as
-  `None`. Unknown/ambiguous stays unassociated — no UI-selected
-  fallback.
-- Precedence `file > cwd > git_root > git_remote`, longest
+  (`file`/`cwd`/`git_root`/`logseq_page`/`git_remote`); missing in old
+  JSON reads as `None`. Unknown/ambiguous stays unassociated — no
+  UI-selected fallback.
+- Precedence `file > cwd > git_root > logseq_page > git_remote`, longest
   component-boundary folder wins per level; ties across projects at one
   level mean no association. Remotes are canonical GitHub
   HTTPS/SSH/scp (`https://github.com/owner/repo`, credentials stripped,
@@ -633,27 +733,50 @@ inference, no writes. Full contract, CLI/Python usage, and limits:
 - Caches: registry subprocess only on metadata change (no repeat Python
   when unchanged); folder projection TTL 5 s; remotes 30 s TTL plus
   git-config invalidation.
-- Store is schema v2 with indexed `project_id` (append-time,
-  backfilled transactionally from v1 on writable open, read-only v1
-  supported, no retroactive reassignment).
+- Store is schema v4 (schema v3 is migratable to v4 only; v1/v2 remain
+  unsupported) with indexed append-time `project_id` (no retroactive
+  reassignment) plus materialized work
+  sessions (`sessions`/`session_resources`/`device_info` plus FTS
+  retrieval; full contracts:
+  `docs/desktop-work-sessions.md`, `docs/desktop-history-search.md`).
 - CLI: `current`, `current-project`, `history --project UUID`,
-  `last-activity --project UUID`, `resources --project UUID [--limit]`.
+  `last-activity --project UUID`, `resources --project UUID [--limit]`,
+  plus work-session queries `current-session`, `sessions [--project
+  UUID] [--limit] [--from/--to]`, `last-session --project UUID`,
+  `session-resources --session ID [--limit]`, `session-events --session
+  ID [--limit]`.
   `current` is a fresh on-demand snapshot plus focus recheck — not
   collector IPC/history. Python `scripts/desktop_projects.py` serves
   `current-project` / `todos` / `logseq-context` / `recent-activity` /
-  `last-activity` / `resources` (overrides `--projects-file` `--graph`
+  `last-activity` / `resources` / `current-session` / `sessions` /
+  `last-session` / `session-resources` / `session-events` (overrides `--projects-file` `--graph`
   `--db` `--desktop-bin`; reuses the `read_page` task parser;
-  name-only projects have history but no Logseq). Five additive Pi
-  tools only; existing scopes unaffected. Same locked release build as
+  name-only projects have history but no Logseq) plus the Phase 5
+  coherent retrieval surface (`current-context` / `search-activity` /
+  `get-session` / `project-activity`, backed by Rust `search` /
+  `session-detail`; full contract: `docs/desktop-history-search.md`).
+  Seven coherent Pi history tools (`desktop_current_context`,
+  `desktop_current_session`, `desktop_search_activity`,
+  `desktop_get_session`, `desktop_project_activity` plus the separate
+  Logseq views `desktop_project_todos`,
+  `desktop_project_logseq_context`, serving deterministic work sessions — never
+  Pi chat sessions); existing scopes unaffected. Same locked release build as
   above; nothing auto-installs or auto-starts. No
-  LLM/embeddings/screenshots/sessions/Resume.
+  LLM/embeddings/screenshots/Resume/sync (work sessions are query-only
+  activity clusters, not Pi chat-session management).
 - Limits: async initial base is bare, then a `context` row; fresh-query
   helper caches are process-local; latest-resource streaming is bounded
   but can scan long duplicate runs; historical ids persist across
   remove/rename; graph context follows the current mapping; hung mounts
   are not hard-bounded; the binary's helper path is compile-time (move
-  the checkout → rebuild). Next-phase consumers must keep resource-id
-  identity/ordering and retention with no new semantic layer.
+  the   checkout → rebuild). Retrieval consumers must keep resource-id
+  identity/ordering and retention with no new semantic layer, consume
+  sessions as the primary unit with raw events only via explicit
+  drill-down for audit,
+  resolve portable resource identity against the current registry before
+  acting (never trust stale absolute paths/window IDs/PIDs/workspace
+  IDs), and treat any later LLM summaries as derived/versioned artifacts
+  — never session boundaries.
 
 ### Manual checks and tests
 

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Launch a Pi RPC worker in the session directory for one project page.
+"""Launch a Pi RPC worker in the session directory for one project.
 
-Project workers must not share the palette's session pool.  This wrapper is
-intentionally small: it owns the directory policy and then replaces itself
-with ``pi`` so signals and exit status retain their normal meaning.
+Project workers are pinned by stable registry UUID
+(``--project-id`` → ``.../projects/by-id/<uuid>``) and work without a Logseq
+note, including Zotero-only projects. The current optional note/folder/
+collection is resolved per operation by the extension/backend from a fresh
+registry read, never from a frozen path. Legacy page scopes
+(``--project pages/X.md`` → ``.../projects/<sha256>``) remain for
+compatibility; a legacy session is restored only when its page is explicitly
+declared alongside ``--project-id``, never by scanning another project's
+directory. No cross-project scope mixing occurs.
 """
 
 from __future__ import annotations
@@ -14,14 +20,22 @@ import json
 import os
 import stat
 import sys
+import uuid as _uuid
 from pathlib import Path
 
 
 SESSION_SUBTREE = ("quickshell", "project-sessions")
 PROJECT_SUBTREE = "projects"
+BY_ID_SUBTREE = "by-id"
 MAX_SESSION_SCAN = 2048
 MAX_SESSION_HEADER_BYTES = 64 * 1024
 MAX_SESSION_NAME = 120
+# UUID-scoped sessions live under <base>/by-id/<uuid>; legacy page scopes are
+# the direct <base>/<sha256(graph\0page)> children. The subtrees never mix:
+# latest_session() only scans the active scope, and a legacy file is honored
+# only when its page is explicitly declared alongside --project-id.
+PROJECT_ID_ENV = "QS_PROJECT_ID"
+LEGACY_PATH_ENV = "QS_PROJECT_PATH"
 
 
 class SessionPathError(ValueError):
@@ -158,6 +172,35 @@ def scope_for(graph: Path, project: Path, base: Path | None = None) -> Path:
     return _private_dir(root / digest)
 
 
+def validate_project_id(value: object) -> str:
+    """Validate a registry UUID, returning its canonical lowercase form."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise SessionPathError("project id must be a UUID string")
+    try:
+        return str(_uuid.UUID(value.strip()))
+    except ValueError as error:
+        raise SessionPathError("project id must be a UUID string") from error
+
+
+def is_uuid(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        _uuid.UUID(value.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def scope_for_id(base: Path | None, project_id: str) -> Path:
+    """Compute the deterministic private directory for a registry UUID."""
+
+    pid = validate_project_id(project_id)
+    root = _private_dir(base if base is not None else session_base())
+    return _private_dir(root / BY_ID_SUBTREE / pid)
+
+
 def _contained_session(scope: Path, value: str) -> Path | None:
     """Return a valid existing JSONL file, or None for a not-yet-flushed file."""
 
@@ -260,12 +303,30 @@ def bounded_name(value: str | None) -> str:
 
 
 def command_for(scope: Path, cached: str | None = None, new_session: bool = False,
-                pending_name: str | None = None) -> list[str]:
-    """Build the exact child command after scope and candidate validation."""
+                pending_name: str | None = None,
+                legacy_scope: Path | None = None) -> list[str]:
+    """Build the exact child command after scope and candidate validation.
+
+    ``legacy_scope`` is only honored for an explicitly declared legacy page
+    (UUID + ``--project`` migration). The automatic ``latest_session`` scan
+    never leaves ``scope``; a legacy file is used only when ``cached``
+    explicitly names a valid session inside ``legacy_scope``. This keeps
+    migration explicit and prevents cross-project scope mixing.
+    """
 
     command = ["pi", "--mode", "rpc", "--approve", "--session-dir", str(scope)]
     if cached:
-        existing = _contained_session(scope, cached)
+        existing = None
+        try:
+            existing = _contained_session(scope, cached)
+        except SessionPathError:
+            existing = None
+            if legacy_scope is None:
+                raise
+        if existing is None and legacy_scope is not None:
+            # Explicit migration only: the cached file must be a valid
+            # session inside the declared legacy page scope.
+            existing = _contained_session(legacy_scope, cached)
         if existing is not None:
             command.extend(["--session", str(existing)])
         # A newly-created empty session has a path before Pi has flushed its
@@ -291,7 +352,10 @@ def command_for(scope: Path, cached: str | None = None, new_session: bool = Fals
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", required=True, help="normalized page path relative to LOGSEQ_GRAPH")
+    parser.add_argument("--project-id", default=None,
+                        help="stable registry UUID; when present the session scope is by-id/<uuid>")
+    parser.add_argument("--project", default=None,
+                        help="normalized page path relative to LOGSEQ_GRAPH (legacy scope, or explicit migration source when combined with --project-id)")
     parser.add_argument("--session", help="cached session path from the worker's last RPC state")
     parser.add_argument("--pending-name", help="name for a cached but not-yet-flushed empty session")
     parser.add_argument(
@@ -304,10 +368,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     try:
-        graph = resolved_graph()
-        project = project_relative_page(graph, args.project)
-        scope = scope_for(graph, project)
-        command = command_for(scope, args.session, args.new_session, args.pending_name)
+        project_id = (args.project_id or "").strip() if isinstance(args.project_id, str) else ""
+        legacy_page_raw = (args.project or "").strip() if isinstance(args.project, str) else ""
+        if project_id:
+            pid = validate_project_id(project_id)
+            base = session_base()
+            scope = scope_for_id(base, pid)
+            legacy_scope: Path | None = None
+            legacy_page: Path | None = None
+            if legacy_page_raw:
+                # Explicit migration source only: requires a graph and a
+                # valid existing page; never scanned automatically.
+                graph = resolved_graph()
+                legacy_page = project_relative_page(graph, legacy_page_raw)
+                legacy_scope = scope_for(graph, legacy_page, base)
+            command = command_for(scope, args.session, args.new_session,
+                                  args.pending_name, legacy_scope)
+        else:
+            if not legacy_page_raw:
+                raise SessionPathError("--project-id or --project is required")
+            graph = resolved_graph()
+            project = project_relative_page(graph, legacy_page_raw)
+            scope = scope_for(graph, project)
+            legacy_page = project
+            pid = ""
+            command = command_for(scope, args.session, args.new_session, args.pending_name)
     except (OSError, SessionPathError, ValueError) as error:
         print(f"project session launch refused: {error}", file=sys.stderr)
         return 2
@@ -315,6 +400,19 @@ def main(argv: list[str] | None = None) -> int:
     environment = os.environ.copy()
     environment["PI_CODING_AGENT_SESSION_DIR"] = str(scope)
     environment["QS_PROJECT_SESSION_SCOPE"] = str(scope)
+    if pid:
+        environment[PROJECT_ID_ENV] = pid
+    # Preserve the legacy pinned path only when an explicit page was given.
+    # Zotero-only workers run with QS_PROJECT_ID alone and an empty path.
+    if legacy_page is not None:
+        environment[LEGACY_PATH_ENV] = legacy_page.as_posix()
+    elif not pid:
+        environment[LEGACY_PATH_ENV] = legacy_page_raw
+    else:
+        environment[LEGACY_PATH_ENV] = ""
+    # Journal vars must never leak into a project worker.
+    environment.pop("QS_JOURNAL_MODE", None)
+    environment.pop("QS_JOURNAL_SESSION_SCOPE", None)
     os.execvpe(command[0], command, environment)
     return 127  # pragma: no cover - execvpe either replaces or raises
 

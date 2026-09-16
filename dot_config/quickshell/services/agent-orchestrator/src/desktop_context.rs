@@ -63,8 +63,8 @@ impl FocusedWindow {
 ///
 /// Generic and additive: Phase 1 JSON without `resource` deserializes to
 /// `None`. `adapter` records provenance (e.g. `neovim`, `kitty`,
-/// `zen-title`, `logseq`, `logseq-title`) so fallbacks stay honest and
-/// labeled. Only meaningful location fields participate in semantic
+/// `zen-title`, `logseq`, `logseq-title`, `zotero`) so fallbacks stay honest
+/// and labeled. Only meaningful location fields participate in semantic
 /// equality; provider timestamps/diagnostics must never live here (they
 /// would defeat dedup).
 ///
@@ -73,6 +73,14 @@ impl FocusedWindow {
 /// when already known by a provider. Phase 2 JSON without `git_remote`
 /// reads as `None`. The project resolver may also discover the remote from
 /// the local git config when this is absent; it never stores credentials.
+///
+/// `zotero` is the additive typed Zotero active-reader identity (Phase 6):
+/// server/library/item/attachment plus current parent memberships and
+/// ancestor collection keys, version, and a stable `zotero://` URI. Older
+/// JSON without `zotero` reads as `None`. Only the stable document identity
+/// (server+library+item/attachment+collections) participates in matching;
+/// page turns, titles, and versions never affect identity or project
+/// resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ResourceContext {
     #[serde(default)]
@@ -93,6 +101,56 @@ pub struct ResourceContext {
     pub page: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub zotero: Option<ZoteroContext>,
+}
+
+/// Typed Zotero active-reader identity (metadata only, never content).
+///
+/// - `server_id`: the `Zotero-Server-ID` header value (Zotero 10+ local API;
+///   earlier servers report `""` and never match a pinned registry entry).
+/// - `library_type`/`library_id`: `user`|`group` plus a digit string. The
+///   registry alias `user/"0"` is server-bound (matches any user library on
+///   the same server); all other values match exactly.
+/// - `item_key`: stable parent (regular-item) key; `attachment_key` is the
+///   opened attachment key when it differs (`None` when the reader opened
+///   the parent directly).
+/// - `collections`/`ancestor_collections`: current direct parent memberships
+///   plus ancestor collection keys (each 8 uppercase alnum). Subcollection
+///   matching checks ancestors only when the registry entry opts in.
+/// - `version`: local object version (freshness/diagnostics only, never
+///   identity or matching).
+/// - `uri`: stable `zotero://select/...` URI for display/search only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ZoteroContext {
+    #[serde(default)]
+    pub server_id: String,
+    #[serde(default)]
+    pub library_type: String,
+    #[serde(default)]
+    pub library_id: String,
+    #[serde(default)]
+    pub item_key: String,
+    #[serde(default)]
+    pub attachment_key: Option<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
+    #[serde(default)]
+    pub ancestor_collections: Vec<String>,
+    #[serde(default)]
+    pub version: Option<i64>,
+    #[serde(default)]
+    pub uri: Option<String>,
+}
+
+impl ZoteroContext {
+    /// True when no stable identity is present (nothing to match or dedup).
+    pub fn is_empty(&self) -> bool {
+        self.server_id.is_empty()
+            || self.item_key.is_empty()
+            || self.library_type.is_empty()
+            || self.library_id.is_empty()
+    }
 }
 
 impl ResourceContext {
@@ -117,6 +175,7 @@ impl ResourceContext {
             url: opt_bound(url, MAX_RESOURCE_URL_CHARS),
             page: opt_bound(page, MAX_RESOURCE_PAGE_CHARS),
             title: opt_bound(title, MAX_TITLE_CHARS),
+            zotero: None,
         }
     }
 
@@ -131,8 +190,17 @@ impl ResourceContext {
         self
     }
 
+    /// Attach a validated typed Zotero identity. `None` or empty identities
+    /// clear to `None` so explicit struct literals keep compiling.
+    pub fn with_zotero(mut self, zotero: Option<ZoteroContext>) -> Self {
+        self.zotero = zotero.filter(|z| !z.is_empty());
+        self
+    }
+
     /// True when every meaningful location field is empty. Adapter-only
     /// resources carry no signal and are treated as absent by callers.
+    /// A present non-empty typed Zotero identity counts as meaningful even
+    /// when all path/URL fields are absent.
     pub fn is_empty(&self) -> bool {
         self.file.is_none()
             && self.cwd.is_none()
@@ -142,6 +210,7 @@ impl ResourceContext {
             && self.url.is_none()
             && self.page.is_none()
             && self.title.is_none()
+            && self.zotero.as_ref().map(|z| z.is_empty()).unwrap_or(true)
     }
 }
 
@@ -197,8 +266,9 @@ pub enum Availability {
 /// Deterministic project association for a desktop snapshot.
 ///
 /// Additive and explainable: only the stable project identity (`id`, `name`)
-/// plus the match strength (`matched_by`: `file`/`cwd`/`git_root`/`git_remote`
-/// ONLY) participate in semantic equality. The registry `revision` is
+/// plus the match strength (`matched_by`: `zotero_collection`/`file`/`cwd`/
+/// `git_root`/`logseq_page`/`git_remote` ONLY) participate in semantic
+/// equality. The registry `revision` is
 /// deliberately excluded so identical mappings at different revisions do not
 /// flap history. Old JSON without `project` reads as `None`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

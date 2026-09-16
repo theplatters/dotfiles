@@ -122,13 +122,14 @@ class AgendaPolicyContractTests(unittest.TestCase):
         self.assertIn("agendaHelper(ctx, \"list\"", EXTENSION)
         self.assertIn("agendaHelper(ctx, \"select\"", EXTENSION)
         # Palette-only registration lives with the other palette tools.
-        palette_block = EXTENSION[EXTENSION.index("if (!projectMode() && !journalMode())"):EXTENSION.index("if (journalMode())")]
+        palette_start = EXTENSION.index("if (!projectMode() && !journalMode())")
+        palette_block = EXTENSION[palette_start:EXTENSION.index("if (journalMode())", palette_start)]
         self.assertIn("logseq_agenda_list", palette_block)
         self.assertIn("logseq_agenda_add", palette_block)
 
     def test_scope_gates_keep_existing_allowlists_isolated(self):
         self.assertIn('if (journalMode() && !["logseq_journal_context", "logseq_journal_append"].includes(event.toolName))', EXTENSION)
-        self.assertIn('if (projectMode() && !["logseq_project_read", "logseq_project_update", "logseq_project_files", "logseq_project_read_file", "logseq_project_git"].includes(event.toolName))', EXTENSION)
+        self.assertIn('if (projectMode() && !["logseq_project_read", "logseq_project_update", "logseq_project_files", "logseq_project_read_file", "logseq_project_git", "zotero_search", "zotero_item", "zotero_read_pdf", "zotero_collections", "zotero_prepare", "zotero_apply"].includes(event.toolName))', EXTENSION)
         # Agenda tools fail closed outside the palette.
         self.assertIn("agenda list is palette-only; wrong scope", EXTENSION)
         self.assertIn("agenda add is palette-only; wrong scope", EXTENSION)
@@ -182,6 +183,57 @@ class AgendaPolicyContractTests(unittest.TestCase):
         # Scoped allowlists stay isolated in prompts.
         self.assertIn("Agenda tools stay palette-only", skill)
         self.assertIn("agenda tools stay palette-only", system.lower() if "agenda tools stay palette-only" in system.lower() else system)
+
+
+class DesktopHistoryCoherenceTests(unittest.TestCase):
+    def test_eight_desktop_tools_no_legacy_history_surface(self):
+        for name in ("desktop_current_context", "desktop_project_todos",
+                     "desktop_project_logseq_context", "desktop_project_activity",
+                     "desktop_current_session", "desktop_search_activity",
+                     "desktop_get_session", "desktop_resume_plan"):
+            self.assertIn(f'name: "{name}"', EXTENSION)
+        for name in ("desktop_current_project", "desktop_project_resources",
+                     "desktop_work_sessions", "desktop_session_resources",
+                     "desktop_session_events"):
+            self.assertNotIn(f'name: "{name}"', EXTENSION)
+
+    def test_search_descriptions_carry_dynamic_timezone(self):
+        self.assertIn("Intl.DateTimeFormat().resolvedOptions().timeZone", EXTENSION)
+        self.assertIn("DESKTOP_LOCAL_TZ", EXTENSION)
+        self.assertIn("start-inclusive/end-exclusive", EXTENSION)
+        self.assertIn("never pass natural-language ranges", EXTENSION)
+        self.assertIn("request events only when necessary", EXTENSION)
+
+    def test_system_workflow_prefers_search_then_detail(self):
+        system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
+        self.assertIn("Prefer session search", system)
+        self.assertIn("desktop_search_activity", system)
+        self.assertIn("desktop_project_activity", system)
+        self.assertIn("desktop_get_session", system)
+        self.assertIn("untrusted evidence", system)
+        self.assertIn("start-inclusive/end-exclusive", system)
+        # Observation evidence, not edits; matched_at_ms is the latest match.
+        self.assertIn("not file edits", system)
+        self.assertIn("matched_at_ms", system)
+        self.assertIn("edits are not recorded", system)
+
+    def test_scope_allowlists_state_desktop_exception(self):
+        # Policy coherence: every scope allowlist explicitly permits the
+        # eight read-only desktop tools without weakening mutations.
+        system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            system.count("eight read-only desktop tools"), 2)
+        self.assertIn("eight-tool desktop read-only exception", system)
+        self.assertIn("desktop exception never permits writes", system)
+        skill = (ROOT / ".pi" / "skills" / "logseq-graph" / "SKILL.md"
+                 ).read_text(encoding="utf-8")
+        self.assertIn("exception in every scope", skill)
+        self.assertIn("same list as above", skill)
+
+    def test_tool_claims_observation_not_edits(self):
+        self.assertIn("not file edits", EXTENSION)
+        self.assertIn("matched_at_ms", EXTENSION)
+        self.assertIn("qualify the claim", EXTENSION)
 
 
 @unittest.skipUnless(BUN, "bun is required for executable extension tests")
@@ -313,7 +365,7 @@ const pi = { on(name, cb) { hooks[name] = cb; }, registerTool(tool) { tools[tool
 process.env.LOGSEQ_GRAPH = "/graph"; process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "";
 desktopAgent(pi);
 const assert = (v, m) => { if (!v) throw new Error(m); };
-assert(Object.keys(tools).join(",") === "logseq_search,logseq_todos,logseq_append_journal,logseq_agenda_list,logseq_agenda_add,desktop_current_project,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_project_resources", "palette registration wrong: " + Object.keys(tools).join(","));
+assert(Object.keys(tools).join(",") === "logseq_search,logseq_todos,logseq_append_journal,logseq_agenda_list,logseq_agenda_add,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "palette registration wrong: " + Object.keys(tools).join(","));
 const ctx = { cwd: "/work", hasUI: true, ui: { confirm: async () => true } };
 const listedDefault = await tools.logseq_agenda_list.execute("id", {}, undefined, undefined, ctx);
 const firstPayload = calls.at(-1).child.payload;
@@ -329,12 +381,12 @@ const pi2 = { on(n, cb) { hooks2[n] = cb; }, registerTool(t) { tools2[t.name] = 
 process.env.QS_PROJECT_PATH = "pages/Work.md";
 desktopAgent(pi2);
 assert(!("logseq_agenda_list" in tools2) && !("logseq_agenda_add" in tools2), "agenda leaked into project mode");
-assert(Object.keys(tools2).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,desktop_current_project,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_project_resources", "project allowlist changed");
+assert(Object.keys(tools2).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "project allowlist changed");
 const tools3 = {};
 process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "1";
 const pi3 = { on(n, cb) {}, registerTool(t) { tools3[t.name] = t; }, registerCommand() {} };
 desktopAgent(pi3);
-assert(Object.keys(tools3).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_project,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_project_resources", "journal allowlist changed");
+assert(Object.keys(tools3).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "journal allowlist changed");
 console.log(JSON.stringify({ ok: true }));
 '''
         self.assertEqual(self.run_bun(script), {"ok": True})
