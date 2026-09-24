@@ -34,19 +34,20 @@ pub mod desktop_session;
 pub mod desktop_store;
 pub mod hyprland;
 pub mod project_context;
+pub mod session_changes;
 
 pub use app_context::{
     enrich_desktop_context, enrich_with_env, EnrichmentEnv, ResourceProvider, APP_REFRESH_INTERVAL,
 };
 pub use collector::{
-    enrich_workers_live, final_drain, flush_pending, run_collector_forever,
-    run_collector_forever_with_enrich, run_collector_once, run_collector_once_with_enrich,
-    AppRefreshConfig, CollectorConfig, SessionOutcome, BACKOFF_INITIAL, BACKOFF_MAX,
-    SHUTDOWN_DRAIN_DEADLINE,
+    apply_focusless_retention, enrich_workers_live, final_drain, flush_pending,
+    run_collector_forever, run_collector_forever_with_enrich, run_collector_once,
+    run_collector_once_with_enrich, AppRefreshConfig, CollectorConfig, SessionOutcome,
+    BACKOFF_INITIAL, BACKOFF_MAX, SHUTDOWN_DRAIN_DEADLINE,
 };
 pub use desktop_context::{
-    now_ms, ActivityKind, Availability, DesktopContext, FocusedWindow, ProjectContext,
-    ResourceContext, Source, Tracker,
+    now_ms, retain_focusless, retain_focusless_with_anchor, ActivityKind, Availability,
+    DesktopContext, FocusedWindow, ProjectContext, ResourceContext, Source, Tracker,
 };
 pub use desktop_lock::{acquire_lock, DesktopLock, LockError};
 pub use desktop_paths::{default_db_path, ensure_parent_dir, lock_path_for};
@@ -57,15 +58,16 @@ pub use desktop_session::{
     SESSION_INTERRUPTION_ENV,
 };
 pub use desktop_store::{
-    normalize_session_id, ActivityRecord, ActivityStore, ProjectResource, SessionDetail,
-    SessionRecord, SessionResourceRecord, SessionSearchQuery, SessionSearchResult, StoreError,
-    MAX_QUERY_LIMIT, MAX_SEARCH_RESOURCES_PER_SESSION, MAX_SEARCH_TEXT_CHARS, SCHEMA_VERSION,
+    normalize_project_id, normalize_session_id, ActivityRecord, ActivityStore, AppendOutcome,
+    ProjectResource, SessionDetail, SessionRecord, SessionResourceRecord, SessionSearchQuery,
+    SessionSearchResult, StoreError, MAX_QUERY_LIMIT, MAX_SEARCH_RESOURCES_PER_SESSION,
+    MAX_SEARCH_TEXT_CHARS, SCHEMA_VERSION,
 };
 pub use hyprland::{
     discover_sockets, discover_sockets_with, is_meaningful_event, parse_event_line, HyprError,
     HyprEvent, SocketPaths,
 };
 pub use project_context::{
-    clear_project_cache, enrich_desktop_with_project, resolve_project_for_resource,
-    resolve_registry_file, ProjectResolver, PROJECTS_FILE_ENV,
+    clear_project_cache, enrich_desktop_with_project, folder_for_project_id,
+    resolve_project_for_resource, resolve_registry_file, ProjectResolver, PROJECTS_FILE_ENV,
 };

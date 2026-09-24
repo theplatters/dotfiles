@@ -123,6 +123,11 @@ Backend commands (all read-only, JSON to stdout):
 
 - ``current-project``: ``{project,registry,logseq_path,has_logseq_linkage,
   status,reason,context}``.
+- ``watch``: resident bridge over ``qs-desktop-context watch``. Same
+  ``current-project`` shape per line plus ``"type": "current-project"``;
+  one line at startup, then one per state change (consecutive identical
+  states not re-emitted). Child exit/stream end => non-zero exit so the
+  supervisor restarts the pair.
 - ``todos [--project UUID]``: ``{project,registry,requested_project_id,
   logseq_path,has_logseq_linkage,status,reason,page,path,graphName,
   revision,todos}``. ``todos`` comes verbatim from ``read_page``.
@@ -177,6 +182,22 @@ Backend commands (all read-only, JSON to stdout):
   compositor. Registry is resolved for display only (unknown explicit UUIDs
   still query). All non-project filters/range/limit thread through. The
   default-current two-call path shares one ``REQUEST_TIMEOUT`` deadline.
+- ``seen [--query TEXT] [--project UUID] [--limit N]``:
+  ``{rows,truncated,total}`` flat resource rows for the palette ``seen:``
+  source. With ``--query`` the per-session resources of one Rust ``search``
+  (explicit ``--project`` scopes, otherwise global), sessions ranked by
+  match (``matched_at_ms``), flattened newest-first. Bare (no ``--query``)
+  maps ``resources --project`` output (current project unless ``--project``).
+  Rows carry ``{kind,label,identity,project_id,project_name,session_id,
+  last_seen_ms,occurrence_count}`` with kinds ``file``/``url``/``zotero``/
+  ``page``; labels are capped at 160 chars; rows are capped at 20
+  (``--limit`` clamps). No new store, no collector change.
+- ``unmapped-folders [--days N] [--limit N]``:
+  ``{rows,truncated}`` distinct ``git_root``/``cwd`` values from recent
+  sessions (one Rust ``search``, ``--days`` lookback default 30) with no
+  registry ``local_folder`` mapping, ranked by observation count
+  (``{git_root_or_cwd,observation_count,last_seen_ms}``), capped at 10
+  rows (``--limit`` clamps). No inference, read-only.
 
 Subprocess safety: list-form argv (no shell), one request deadline
 (``REQUEST_TIMEOUT`` 8s shared by the at-most-two Rust calls per request,
@@ -195,12 +216,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import NoReturn
@@ -213,6 +237,8 @@ try:
     import projects as _projects
 except ImportError:  # pragma: no cover - tests always have scripts on path
     _projects = None  # type: ignore
+
+import qscli
 
 
 class DesktopError(ValueError):
@@ -247,6 +273,17 @@ DEFAULT_LIMIT = 20
 DEFAULT_RESOURCE_LIMIT = 20
 DEFAULT_EVENT_LIMIT = 20
 MAX_SEARCH_TEXT_CHARS = 256
+# Palette `seen:` mapper bounds: flat resource rows, label cap, and the
+# bounded session fetch behind a `--query` call (one Rust `search`).
+SEEN_MAX_ROWS = 20
+SEEN_MAX_LABEL_CHARS = 160
+SEEN_FETCH_SESSIONS = 20
+# Attribution-hygiene bounds: unmapped folder rows, the bounded session
+# fetch behind them (one Rust `search`), and the days lookback window.
+UNMAPPED_MAX_ROWS = 10
+UNMAPPED_FETCH_SESSIONS = 200
+UNMAPPED_DEFAULT_DAYS = 30
+UNMAPPED_MAX_DAYS = 365
 # Grace between TERM and KILL when reaping a runaway Rust child.
 _KILL_GRACE = 0.5
 
@@ -1126,16 +1163,37 @@ def _resolve_current_identity(
 ) -> tuple[dict, dict | None, dict | None, str, str]:
     """Return (context, reported_project|None, registry_entry|None, status, reason).
 
-    Statuses: ``associated`` (linked), ``name-only-no-linkage``,
-    ``unassociated`` (no current project), ``stale-removed`` (id absent).
-    Identity (registry entry present) and Logseq linkage are separate:
-    history/last-activity/resources need only identity, while todos and
-    logseq-context additionally need a non-empty ``logseq_path``.
+    Fetch (``current``) plus the pure shared mapping
+    (:func:`_map_context_to_current_identity`). See that function for the
+    status contract.
     """
     # Same registry for detection and lookup: the explicit override (if
     # any) is forwarded child-only to the Rust detector; otherwise the
     # child inherits the parent environment unchanged.
     context = _fetch_current(binary, db, timeout=timeout, registry_file=registry_file)
+    return _map_context_to_current_identity(context, registry_file)
+
+
+def _map_context_to_current_identity(
+    context: dict, registry_file=None
+) -> tuple[dict, dict | None, dict | None, str, str]:
+    """Map one ``DesktopContext`` dict to its registry identity (pure, no fork).
+
+    Single owner of the registry/status mapping: both the one-shot
+    ``current-project`` path (via :func:`_resolve_current_identity`) and the
+    resident ``watch`` bridge map raw ``current``-shaped dicts through this
+    function, so the mapping is never reimplemented per call site.
+
+    Returns (context, reported_project|None, registry_entry|None, status,
+    reason). Statuses: ``associated`` (linked),
+    ``name-only-no-linkage``, ``unassociated`` (no current project),
+    ``stale-removed`` (id absent). Identity (registry entry present) and
+    Logseq linkage are separate: history/last-activity/resources need only
+    identity, while todos and logseq-context additionally need a non-empty
+    ``logseq_path``.
+    """
+    if not isinstance(context, dict):
+        _error("desktop helper current must be an object")
     reported = _extract_reported_project(context)
     by_id, _response = _load_registry(registry_file)
     if reported is None:
@@ -1237,15 +1295,20 @@ def _default_history_target(
 # Public operations
 # ---------------------------------------------------------------------------
 
-def current_project(
-    registry_file=None, desktop_bin=None, db=None
+def _present_current_project(
+    context: dict,
+    reported: dict | None,
+    entry: dict | None,
+    status: str,
+    reason: str,
 ) -> dict:
-    """Return the current desktop project resolved against the registry."""
-    binary = resolve_desktop_bin(desktop_bin)
-    db_path = resolve_db_path(db)
-    context, reported, entry, status, reason = _resolve_current_identity(
-        binary, db_path, registry_file
-    )
+    """Present a resolved identity as the ``current-project`` output shape.
+
+    Single owner of the output shape: both the one-shot ``current_project``
+    and the resident ``watch`` bridge build their payload through this
+    function, so the shapes can never drift (``watch`` only adds the
+    first-class ``"type": "current-project"`` tag on top).
+    """
     project = _display_for_entry(reported, entry)
     # Stale stays reported for debugging but counts as unknown for linkage.
     if status == "stale-removed":
@@ -1267,6 +1330,254 @@ def current_project(
         "reason": reason,
         "context": context,
     }
+
+
+def current_project(
+    registry_file=None, desktop_bin=None, db=None
+) -> dict:
+    """Return the current desktop project resolved against the registry."""
+    binary = resolve_desktop_bin(desktop_bin)
+    db_path = resolve_db_path(db)
+    context, reported, entry, status, reason = _resolve_current_identity(
+        binary, db_path, registry_file
+    )
+    return _present_current_project(context, reported, entry, status, reason)
+
+
+# Volatile per-observation keys inside the raw ``context`` payload: they
+# advance on every compositor recheck without changing the projected
+# project state, so the watch dedup key ignores them (the emitted payload
+# keeps them verbatim). Mirrors the Rust exclusion of timestamps and
+# focusless-retention markers from ``DesktopContext::semantic_eq``.
+_WATCH_VOLATILE_CONTEXT_KEYS = frozenset({
+    "observed_at_ms", "retained_since_ms", "focusless_since_ms",
+})
+
+
+def _watch_dedup_key(shaped: dict) -> bytes:
+    """Canonical dedup key for one mapped watch payload (state minus time).
+
+    Everything except the volatile context timestamps participates, so a
+    registry rename, status/reason flip, or project change always emits
+    while timestamp-only churn never re-renders downstream. Sorted keys keep
+    the comparison independent of dict insertion order.
+    """
+    key_view = {key: value for key, value in shaped.items() if key != "context"}
+    context = shaped.get("context")
+    if isinstance(context, dict):
+        key_view["context"] = {
+            key: value for key, value in context.items()
+            if key not in _WATCH_VOLATILE_CONTEXT_KEYS
+        }
+    return json.dumps(key_view, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _stdin_is_fifo() -> bool:
+    """True when our own stdin (fd 0) is a pipe/FIFO.
+
+    A pipe means a supervisor (quickshell ``watchProcess`` with its stdin
+    held open) owns the write end, so EOF means the supervisor died without
+    SIGTERM. /dev/null, TTYs, and closed fds return False so manual runs
+    and DEVNULL-spawned tests never arm the cascade.
+    """
+    try:
+        return stat.S_ISFIFO(os.fstat(0).st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def _spawn_watch_child(
+    binary: Path, db: str | None, extra_env: dict | None = None,
+):
+    """Spawn ``qs-desktop-context [--db DB] watch`` as a streaming raw source.
+
+    Streaming variant of :func:`_run_desktop_cli` with the same argv/env
+    validation and the same binary/DB safety bounds, but the child stays
+    alive and its stdout is consumed line by line by the caller (one
+    ``current``-shaped JSON object per line). The child shares our process
+    group (no new session) and inherits our stderr, so its diagnostics land
+    on the bridge's stderr, never on stdout. The child's stdin is a pipe
+    whose write end the bridge holds for life (never written): ANY bridge
+    death — including SIGKILL, which no handler can catch — closes it, the
+    Rust child's stdin-EOF watchdog fires, and the orphan exits on its own.
+    SIGTERM forwarding (via :func:`_register_child`) stays the fast path.
+    The caller owns the returned process: it is registered for direct-CLI
+    SIGTERM forwarding and must be unregistered, killed, reaped, and closed
+    (including stdin) when the stream ends.
+    """
+    if len(str(binary)) > PATH_LIMIT or "\x00" in str(binary):
+        _error("desktop helper path is unsafe")
+    if db is not None and (len(db) > PATH_LIMIT or "\x00" in db):
+        _error("desktop db path is unsafe")
+    argv = [str(binary)]
+    if db:
+        argv += ["--db", db]
+    argv += ["watch"]
+    if extra_env:
+        for key, value in extra_env.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                _error("desktop helper environment override is invalid")
+            if len(key) > 4096 or len(value) > PATH_LIMIT or "\x00" in key or "\x00" in value:
+                _error("desktop helper environment override is unsafe")
+        child_env: dict | None = dict(os.environ)
+        child_env.update(extra_env)
+    else:
+        child_env = None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            shell=False,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            start_new_session=False,
+            env=child_env,
+        )
+    except FileNotFoundError as exc:
+        raise _missing_binary_error(binary) from exc
+    except OSError as exc:
+        raise DesktopError(f"desktop context helper failed: {exc}") from exc
+    assert proc.stdout is not None
+    assert proc.stdin is not None
+    _register_child(proc)
+    return proc
+
+
+def watch_current_project(
+    registry_file=None, desktop_bin=None, db=None
+) -> int:
+    """Resident ``current-project`` bridge over ``qs-desktop-context watch``.
+
+    Spawns the raw-source child once (binary resolved exactly like the
+    one-shot path: ``--desktop-bin`` > ``QS_DESKTOP_CONTEXT_BIN`` > repo
+    default, with the child-only registry override), maps each of its JSON
+    lines in-process through the shared single-owner mapping
+    (:func:`_map_context_to_current_identity` +
+    :func:`_present_current_project` — no fork per line), and prints one
+    LF-delimited JSON object per state change to stdout (explicit flush per
+    line). Each line is the exact ``current-project`` output shape plus a
+    first-class ``"type": "current-project"`` field (payload keys flattened
+    alongside it). One line is emitted at startup (including the
+    ``unassociated``/null-project case); consecutive identical states are
+    not re-emitted — the dedup key is the mapped state minus the volatile
+    per-observation context timestamps (``observed_at_ms`` and the
+    focusless-retention markers, mirroring the Rust ``semantic_eq``
+    exclusion), so timestamp-only churn never re-renders downstream while
+    the emitted payload keeps them verbatim. Nothing else ever lands on
+    stdout (blank source lines are skipped, undecodable lines are noted on
+    stderr and skipped, mapping failures stay fail-closed like the one-shot
+    path). When the raw-source child exits or its stream ends, this raises
+    (the caller reports ``error: ...`` on stderr with a non-zero exit) so
+    the QML supervisor restarts the pair with backoff. No DB writes here
+    (read-only mapping, like the one-shot path).
+    """
+    binary = resolve_desktop_bin(desktop_bin)
+    db_path = resolve_db_path(db)
+    proc = _spawn_watch_child(
+        binary, db_path, _child_env_for_registry(registry_file)
+    )
+    # Cascade: when our own stdin is a pipe, the supervisor (quickshell
+    # ``watchProcess`` with its stdin held open) owns the write end — EOF
+    # means it died without SIGTERM, so SIGTERM the Rust child at once; the
+    # readline loop below then sees stream end and exits non-zero, and the
+    # pair restarts together. Non-pipe stdin (/dev/null, TTY,
+    # DEVNULL-spawned tests) never arms this. A SIGKILLed bridge needs no
+    # thread: the kernel closes the child stdin pipe the bridge held, and
+    # the Rust EOF watchdog exits the orphan on its own.
+    if _stdin_is_fifo():
+        def _bridge_stdin_eof_kill() -> None:
+            try:
+                while True:
+                    chunk = os.read(0, 4096)
+                    if not chunk:
+                        break
+            except OSError:
+                return
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+        _eof_thread = threading.Thread(
+            target=_bridge_stdin_eof_kill, daemon=True)
+        _eof_thread.start()
+    out = sys.stdout.buffer
+    last_key: bytes | None = None
+    try:
+        assert proc.stdout is not None
+        while True:
+            raw = proc.stdout.readline(MAX_OUTPUT + 2)
+            if not raw:
+                break
+            if len(raw) > MAX_OUTPUT + 1:
+                _error(
+                    "desktop watch source line exceeded "
+                    f"{MAX_OUTPUT} bytes"
+                )
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                text = stripped.decode("utf-8")
+            except UnicodeDecodeError:
+                print(
+                    "warning: desktop watch source line is not valid UTF-8",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                print(
+                    "warning: desktop watch source line is not valid JSON",
+                    file=sys.stderr,
+                )
+                continue
+            if not isinstance(value, dict):
+                print(
+                    "warning: desktop watch source line must be an object",
+                    file=sys.stderr,
+                )
+                continue
+            context, reported, entry, status, reason = (
+                _map_context_to_current_identity(value, registry_file)
+            )
+            shaped = _present_current_project(
+                context, reported, entry, status, reason
+            )
+            shaped["type"] = "current-project"
+            try:
+                encoded = (
+                    json.dumps(shaped, ensure_ascii=False,
+                               separators=(",", ":")).encode("utf-8") + b"\n"
+                )
+            except (TypeError, ValueError):
+                print(
+                    "warning: desktop watch payload is not serializable",
+                    file=sys.stderr,
+                )
+                continue
+            key = _watch_dedup_key(shaped)
+            if key != last_key:
+                out.write(encoded)
+                out.flush()
+                last_key = key
+        _error("desktop watch source ended")
+        raise AssertionError("unreachable")
+    finally:
+        _unregister_child(proc)
+        try:
+            if proc.poll() is None:
+                _kill_and_reap(proc)
+        except Exception:
+            pass
+        for stream in (proc.stdout, proc.stderr, getattr(proc, "stdin", None)):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
 
 def _logseq_view(
@@ -1948,37 +2259,463 @@ def project_activity(
     }
 
 
+def _validate_days(value: object, default: int = UNMAPPED_DEFAULT_DAYS) -> int:
+    """Validate the ``--days`` lookback (1..365, default 30)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        _error(f"days must be an integer 1..{UNMAPPED_MAX_DAYS}")
+    if isinstance(value, int):
+        days = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            days = int(value.strip(), 10)
+        except ValueError as exc:
+            raise DesktopError(
+                f"days must be an integer 1..{UNMAPPED_MAX_DAYS}"
+            ) from exc
+    else:
+        _error(f"days must be an integer 1..{UNMAPPED_MAX_DAYS}")
+        raise AssertionError("unreachable")
+    if days < 1 or days > UNMAPPED_MAX_DAYS:
+        _error(f"days must be 1..{UNMAPPED_MAX_DAYS}")
+    return days
+
+
+def _nonempty_text(value: object) -> str | None:
+    """Return the stripped string, or None when absent/blank/non-string."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _truncate_label(text: str) -> str:
+    """Cap a display label at ``SEEN_MAX_LABEL_CHARS`` chars."""
+    if len(text) <= SEEN_MAX_LABEL_CHARS:
+        return text
+    return text[:SEEN_MAX_LABEL_CHARS - 3] + "..."
+
+
+def _rel_under(path: str, root: str) -> str | None:
+    """Relative path of ``path`` under ``root`` (component boundaries).
+
+    Mirrors the Rust collector rule: the root itself maps to ``"."``.
+    """
+    cleaned = root.rstrip("/") or "/"
+    if cleaned == "/":
+        if not path.startswith("/"):
+            return None
+        rest = path.lstrip("/").rstrip("/")
+        return rest or "."
+    if path == cleaned:
+        return "."
+    prefix = cleaned + "/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):].rstrip("/")
+    return rest or "."
+
+
+def _host_of(url: str) -> str:
+    """Return the hostname of ``url`` ("" when unparseable)."""
+    try:
+        return urllib.parse.urlparse(url).hostname or ""
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def _seen_kind_label(res: dict) -> tuple[str, str] | None:
+    """Map a ``ResourceContext`` dict to (kind, label); None when unmappable.
+
+    Kind priority mirrors the collector identity order: zotero, file, url,
+    page, then bare cwd (surfaced as a ``file`` row). Adapter-only
+    resources carry no location and are skipped.
+    """
+    raw_zotero = res.get("zotero")
+    zotero = raw_zotero if isinstance(raw_zotero, dict) else {}
+    has_zotero = all(
+        isinstance(zotero.get(key), str) and zotero[key]
+        for key in ("server_id", "library_type", "library_id", "item_key")
+    )
+    file_path = _nonempty_text(res.get("file"))
+    url_value = _nonempty_text(res.get("url"))
+    page_value = _nonempty_text(res.get("page"))
+    cwd_value = _nonempty_text(res.get("cwd"))
+    title = _nonempty_text(res.get("title"))
+    git_root = _nonempty_text(res.get("git_root"))
+    if has_zotero:
+        item_key = zotero["item_key"]
+        assert isinstance(item_key, str)
+        label_title = title or item_key
+        uri = _nonempty_text(zotero.get("uri")) or ""
+        label = f"{label_title} ({uri})" if uri else label_title
+        return ("zotero", _truncate_label(label))
+    if file_path:
+        rel = _rel_under(file_path, git_root) if git_root else None
+        return ("file", _truncate_label(rel or file_path))
+    if url_value:
+        host = _host_of(url_value)
+        if title and host:
+            label = f"{title} ({host})"
+        elif host:
+            label = host
+        elif title:
+            label = title
+        else:
+            label = url_value
+        return ("url", _truncate_label(label))
+    if page_value:
+        return ("page", _truncate_label(page_value))
+    if cwd_value:
+        rel = _rel_under(cwd_value, git_root) if git_root else None
+        return ("file", _truncate_label(rel or cwd_value))
+    return None
+
+
+def _seen_identity_from_context(res: dict) -> str:
+    """Best-effort stable identity for a bare ``resources`` row.
+
+    Query-path rows reuse the Rust ``portable_identity``/``local_identity``;
+    bare ``resources`` rows carry no identity, so one is derived from the
+    same fields (relative file path when under a git root, canonical
+    Zotero form otherwise). Callers only invoke this for mappable rows.
+    """
+    raw_zotero = res.get("zotero")
+    zotero = raw_zotero if isinstance(raw_zotero, dict) else {}
+    item_key = _nonempty_text(zotero.get("item_key"))
+    server = _nonempty_text(zotero.get("server_id"))
+    library_type = _nonempty_text(zotero.get("library_type"))
+    library_id = _nonempty_text(zotero.get("library_id"))
+    if item_key and server and library_type and library_id:
+        attachment = _nonempty_text(zotero.get("attachment_key")) or "-"
+        return (f"zotero:{server}:{library_type}/{library_id}"
+                f":item:{item_key}:att:{attachment}")
+    if item_key:
+        return f"zotero:{item_key}"
+    file_path = _nonempty_text(res.get("file"))
+    git_root = _nonempty_text(res.get("git_root"))
+    if file_path:
+        rel = _rel_under(file_path, git_root) if git_root else None
+        return f"file:{rel or file_path}"
+    url_value = _nonempty_text(res.get("url"))
+    if url_value:
+        return f"url:{url_value}"
+    page_value = _nonempty_text(res.get("page"))
+    if page_value:
+        return f"page:{page_value}"
+    cwd_value = _nonempty_text(res.get("cwd"))
+    if cwd_value:
+        return f"cwd:{cwd_value}"
+    return ""
+
+
+def _coerce_ms(value: object, default: int = 0) -> int:
+    """Coerce a timestamp to int; non-integers fall back to ``default``."""
+    if isinstance(value, bool):
+        return default
+    return value if isinstance(value, int) else default
+
+
+def _match_rank(session: object) -> int:
+    """Sort key for query-path sessions: ``matched_at_ms`` desc, None last."""
+    if not isinstance(session, dict):
+        return -1
+    matched = session.get("matched_at_ms")
+    if isinstance(matched, bool):
+        return -1
+    return matched if isinstance(matched, int) else -1
+
+
+def _resource_recency(item: object) -> int:
+    """Sort key for flattened resources: ``last_seen_ms`` desc."""
+    if not isinstance(item, dict):
+        return -1
+    last = item.get("last_seen_ms")
+    if isinstance(last, bool):
+        return -1
+    return last if isinstance(last, int) else -1
+
+
+def seen(
+    query=None,
+    project_id=None,
+    limit: object = None,
+    registry_file=None,
+    desktop_bin=None,
+    db=None,
+) -> dict:
+    """Return flat newest-first resource rows for the palette ``seen:`` source.
+
+    With ``query`` (trimmed ``1..256`` chars; empty rejects like
+    ``search-activity``) the per-session resources of one Rust ``search``
+    are flattened: sessions ranked by match (``matched_at_ms``), resources
+    within a session newest-first. An explicit project UUID scopes the
+    search; otherwise the search is global. Bare (``query`` None) maps
+    ``resources --project`` output: the current project unless ``--project``
+    is given, newest-first with a one-row truncation probe. Rows carry
+    ``{kind,label,identity,project_id,project_name,session_id,last_seen_ms,
+    occurrence_count}`` (kinds ``file``/``url``/``zotero``/``page``);
+    labels are capped at 160 chars and rows at 20 (``--limit`` clamps
+    ``1..1000``). No new store, no collector change.
+    """
+    bound = _validate_limit(limit, DEFAULT_LIMIT)
+    row_cap = min(bound, SEEN_MAX_ROWS)
+    binary = resolve_desktop_bin(desktop_bin)
+    db_path = resolve_db_path(db)
+    if query is None:
+        fetch_limit = row_cap + 1
+        if project_id is not None and str(project_id).strip():
+            canonical = _validate_project_id(project_id)
+            display, _entry, _status, _reason = _resolve_explicit_identity(
+                canonical, registry_file
+            )
+            items = _fetch_resources(binary, db_path, canonical, fetch_limit)
+            pid: str | None = canonical
+            pname = display.get("name", "") if isinstance(display, dict) else ""
+            if not isinstance(pname, str):
+                pname = ""
+        else:
+            deadline = time.monotonic() + REQUEST_TIMEOUT
+            context, reported, entry, status, _reason = (
+                _resolve_current_identity(
+                    binary, db_path, registry_file, timeout=REQUEST_TIMEOUT
+                )
+            )
+            _ = context
+            project_out, should_query = _default_history_target(
+                reported, entry, status
+            )
+            if not should_query:
+                return {"rows": [], "truncated": False, "total": 0}
+            assert entry is not None
+            items = _fetch_resources(
+                binary, db_path, entry["id"], fetch_limit,
+                timeout=_remaining(deadline),
+            )
+            resolved = _display_for_entry(reported, entry)
+            pid = entry["id"]
+            raw_name = resolved.get("name", "") if isinstance(resolved, dict) else ""
+            pname = raw_name if isinstance(raw_name, str) else ""
+        rows = []
+        for item in items[:row_cap]:
+            if not isinstance(item, dict):
+                continue
+            res = item.get("resource")
+            if not isinstance(res, dict):
+                continue
+            mapped = _seen_kind_label(res)
+            if mapped is None:
+                continue
+            kind, label = mapped
+            rows.append({
+                "kind": kind,
+                "label": label,
+                "identity": _seen_identity_from_context(res),
+                "project_id": pid,
+                "project_name": pname,
+                "session_id": None,
+                "last_seen_ms": _coerce_ms(item.get("observed_at_ms")),
+                "occurrence_count": 1,
+            })
+        return {
+            "rows": rows,
+            "truncated": len(items) > row_cap,
+            "total": len(rows),
+        }
+    qtext = _validate_search_text("query", query)
+    canonical_project = _optional_project_filter(project_id)
+    found = _fetch_search(
+        binary, db_path, canonical_project, None, None, None, qtext,
+        None, None, SEEN_FETCH_SESSIONS,
+    )
+    sessions = found.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    candidates = []
+    ordered = sorted(
+        (item for item in sessions if isinstance(item, dict)),
+        key=_match_rank, reverse=True,
+    )
+    for session in ordered:
+        project = session.get("project")
+        project = project if isinstance(project, dict) else {}
+        raw_pid = project.get("id")
+        raw_pname = project.get("name", "")
+        row_pid = raw_pid if isinstance(raw_pid, str) and raw_pid else None
+        row_pname = raw_pname if isinstance(raw_pname, str) else ""
+        raw_sid = session.get("session_id")
+        row_sid = raw_sid if isinstance(raw_sid, str) and raw_sid else None
+        resources = session.get("resources")
+        if not isinstance(resources, list):
+            continue
+        freshest = sorted(
+            (item for item in resources if isinstance(item, dict)),
+            key=_resource_recency, reverse=True,
+        )
+        for record in freshest:
+            res = record.get("resource")
+            if not isinstance(res, dict):
+                continue
+            mapped = _seen_kind_label(res)
+            if mapped is None:
+                continue
+            kind, label = mapped
+            identity = record.get("portable_identity") or \
+                record.get("local_identity") or \
+                record.get("resource_key") or ""
+            if not isinstance(identity, str):
+                identity = ""
+            occurrence = record.get("occurrence_count")
+            if not isinstance(occurrence, int) or isinstance(occurrence, bool):
+                occurrence = 1
+            candidates.append({
+                "kind": kind,
+                "label": label,
+                "identity": identity,
+                "project_id": row_pid,
+                "project_name": row_pname,
+                "session_id": row_sid,
+                "last_seen_ms": _coerce_ms(record.get("last_seen_ms")),
+                "occurrence_count": occurrence,
+            })
+    total = len(candidates)
+    rows = candidates[:row_cap]
+    return {"rows": rows, "truncated": total > len(rows), "total": total}
+
+
+def _normalize_folder(value: object) -> str:
+    """Normalize a folder path for registry comparison ("" when empty).
+
+    ``~`` expands on both sides (the registry stores ``~/...`` literally
+    while the collector reports absolute paths); trailing slashes collapse
+    via normpath. No existence check: pure string normalization, no
+    inference.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    return posixpath.normpath(os.path.expanduser(text))
+
+
+def unmapped_folders(
+    days: object = None,
+    limit: object = None,
+    registry_file=None,
+    desktop_bin=None,
+    db=None,
+) -> dict:
+    """Return distinct unclaimed folders from recent sessions.
+
+    One Rust ``search`` (recent sessions, newest-first) supplies per-session
+    resources; distinct ``git_root`` (preferred) / ``cwd`` values within the
+    ``--days`` lookback (default 30, ``1..365``) with no registry
+    ``local_folder`` mapping are ranked by observation count (ties break by
+    recency, then path), capped at 10 rows (``--limit`` clamps
+    ``1..1000``). Rows carry
+    ``{git_root_or_cwd,observation_count,last_seen_ms}`` plus ``truncated``.
+    No inference, read-only.
+    """
+    bound_days = _validate_days(days, UNMAPPED_DEFAULT_DAYS)
+    bound = _validate_limit(limit, UNMAPPED_MAX_ROWS)
+    row_cap = min(bound, UNMAPPED_MAX_ROWS)
+    binary = resolve_desktop_bin(desktop_bin)
+    db_path = resolve_db_path(db)
+    by_id, _response = _load_registry(registry_file)
+    claimed: set[str] = set()
+    for entry in by_id.values():
+        if not isinstance(entry, dict):
+            continue
+        normalized = _normalize_folder(entry.get("local_folder", ""))
+        if normalized:
+            claimed.add(normalized)
+    found = _fetch_search(
+        binary, db_path, None, None, None, None, None,
+        None, None, UNMAPPED_FETCH_SESSIONS,
+    )
+    sessions = found.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - bound_days * 86400_000
+    aggregate: dict[str, dict[str, int]] = {}
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        end_ms = session.get("end_ms")
+        if not isinstance(end_ms, int) or isinstance(end_ms, bool):
+            end_ms = 0
+        if end_ms < cutoff:
+            continue
+        resources = session.get("resources")
+        if not isinstance(resources, list):
+            continue
+        for record in resources:
+            if not isinstance(record, dict):
+                continue
+            res = record.get("resource")
+            if not isinstance(res, dict):
+                continue
+            folder = _normalize_folder(
+                _nonempty_text(res.get("git_root"))
+                or _nonempty_text(res.get("cwd"))
+                or ""
+            )
+            if not folder or folder in claimed:
+                continue
+            occurrence = record.get("occurrence_count")
+            if (not isinstance(occurrence, int)
+                    or isinstance(occurrence, bool)
+                    or occurrence < 1):
+                occurrence = 1
+            last_seen = _coerce_ms(record.get("last_seen_ms"))
+            slot = aggregate.get(folder)
+            if slot is None:
+                aggregate[folder] = {
+                    "observation_count": occurrence,
+                    "last_seen_ms": last_seen,
+                }
+            else:
+                slot["observation_count"] += occurrence
+                slot["last_seen_ms"] = max(slot["last_seen_ms"], last_seen)
+    ranked = sorted(
+        aggregate.items(),
+        key=lambda pair: (-pair[1]["observation_count"],
+                          -pair[1]["last_seen_ms"], pair[0]),
+    )
+    rows = [
+        {
+            "git_root_or_cwd": folder,
+            "observation_count": counts["observation_count"],
+            "last_seen_ms": counts["last_seen_ms"],
+        }
+        for folder, counts in ranked[:row_cap]
+    ]
+    return {"rows": rows, "truncated": len(ranked) > len(rows)}
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = qscli.SafeParser(
         description="Read-only desktop-project views (current desktop project via "
         "qs-desktop-context + canonical registry + Logseq read_page)."
     )
-    parser.add_argument("--desktop-bin", default=None,
-                        help="qs-desktop-context binary; defaults to "
-                        "QS_DESKTOP_CONTEXT_BIN or "
-                        "<repo>/services/agent-orchestrator/target/release/"
-                        "qs-desktop-context")
-    parser.add_argument("--db", default=None,
-                        help="activity DB path; defaults to QS_DESKTOP_DB / "
-                        "QS_DESKTOP_CONTEXT_DB or the binary default")
-    parser.add_argument("--projects-file", default=None,
-                        help="registry TOML file; defaults to "
-                        "QUICKSHELL_PROJECTS_FILE or <repo>/projects.toml")
-    parser.add_argument("--graph", default=None,
-                        help="graph directory for todos/logseq-context only; "
-                        "defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
-    parser.add_argument("command", choices=("current-project", "todos",
+    qscli.add_global_flags(parser, db=True, graph=True, desktop_bin=True,
+                            projects_file=True)
+    parser.add_argument("command", choices=("current-project", "watch", "todos",
                                             "logseq-context", "recent-activity",
                                             "last-activity", "resources",
                                             "current-session", "sessions",
                                             "last-session", "session-resources",
                                             "session-events", "current-context",
                                             "search-activity", "get-session",
-                                            "project-activity", "device-id"))
+                                            "project-activity", "device-id",
+                                            "seen", "unmapped-folders"))
     parser.add_argument("--project", default=None,
                         help="explicit project UUID (historical queries); "
                         "defaults to the current desktop project")
@@ -1986,7 +2723,8 @@ def main(argv=None):
                         help="bounded history/resources limit 1..1000 "
                         "(default 20; recent-activity/resources/sessions/"
                         "session-resources/session-events/search-activity/"
-                        "project-activity only)")
+                        "project-activity/seen/unmapped-folders only; "
+                        "seen clamps rows to 20, unmapped-folders to 10)")
     parser.add_argument("--session", default=None,
                         help="explicit work session id (32 hex chars) for "
                         "session-resources/session-events/get-session only")
@@ -2010,176 +2748,232 @@ def main(argv=None):
                         "project-activity only (32 hex chars)")
     parser.add_argument("--query", default=None,
                         help="free-text filter for search-activity/"
-                        "project-activity only (trimmed 1..256 chars)")
+                        "project-activity/seen only "
+                        "(trimmed 1..256 chars; use --query=<value> for "
+                        "leading-hyphen text)")
     parser.add_argument("--resource-limit", default=None,
                         help="bounded resource limit 1..1000 (default 20; "
                         "get-session only)")
     parser.add_argument("--include-events", action="store_true", default=False,
                         help="include raw events (get-session only)")
+    parser.add_argument("--days", default=None,
+                        help="days lookback 1..365 (default 30; "
+                        "unmapped-folders only)")
     parser.add_argument("--event-limit", default=None,
                         help="bounded event limit 1..1000 (default 20; "
                         "get-session only with --include-events)")
-    try:
-        args = parser.parse_args(argv)
-        raw_commands = ("current-project", "todos", "logseq-context",
-                        "recent-activity", "last-activity", "resources")
-        session_commands = ("current-session", "sessions", "last-session",
-                            "session-resources", "session-events")
-        legacy_commands = raw_commands + session_commands + ("device-id",)
-        search_commands = ("search-activity", "project-activity")
-        if args.command == "current-project" and args.project:
-            _error("current-project does not accept --project")
-        if args.command == "current-project" and args.limit is not None:
-            _error("current-project does not accept --limit")
-        if args.command in ("todos", "logseq-context") and args.limit is not None:
-            _error(f"{args.command} does not accept --limit")
-        if args.command == "last-activity" and args.limit is not None:
-            _error("last-activity does not accept --limit")
-        # Raw operations keep their contract: new session flags are rejected.
-        if args.command in raw_commands and args.session:
-            _error(f"{args.command} does not accept --session")
-        if args.command in ("current-project", "todos", "logseq-context",
-                            "recent-activity", "last-activity", "resources") and (
-                args.from_ms is not None or args.to_ms is not None):
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args: argparse.Namespace) -> int:
+    raw_commands = ("current-project", "todos", "logseq-context",
+                    "recent-activity", "last-activity", "resources")
+    session_commands = ("current-session", "sessions", "last-session",
+                        "session-resources", "session-events")
+    legacy_commands = raw_commands + session_commands + ("device-id",)
+    search_commands = ("search-activity", "project-activity")
+    # Only unmapped-folders takes --days; every other command rejects it.
+    if args.command != "unmapped-folders" and args.days is not None:
+        _error(f"{args.command} does not accept --days")
+    if args.command == "current-project" and args.project:
+        _error("current-project does not accept --project")
+    if args.command == "current-project" and args.limit is not None:
+        _error("current-project does not accept --limit")
+    if args.command == "watch" and (
+            args.project or args.limit is not None or args.session
+            or args.from_ms is not None or args.to_ms is not None
+            or args.application is not None or args.resource is not None
+            or args.device is not None or args.query is not None
+            or args.resource_limit is not None
+            or args.event_limit is not None or args.include_events):
+        _error("watch does not accept "
+               "--project/--limit/--session/--from/--to/"
+               "--application/--resource/--device/--query/"
+               "--resource-limit/--event-limit/--include-events")
+    if args.command in ("todos", "logseq-context") and args.limit is not None:
+        _error(f"{args.command} does not accept --limit")
+    if args.command == "last-activity" and args.limit is not None:
+        _error("last-activity does not accept --limit")
+    # Raw operations keep their contract: new session flags are rejected.
+    if args.command in raw_commands and args.session:
+        _error(f"{args.command} does not accept --session")
+    if args.command in ("current-project", "todos", "logseq-context",
+                        "recent-activity", "last-activity", "resources") and (
+            args.from_ms is not None or args.to_ms is not None):
+        _error(f"{args.command} does not accept --from/--to")
+    # New work-session gates (mirrors the Rust CLI usage).
+    if args.command == "current-session" and (
+            args.project or args.limit is not None
+            or args.session or args.from_ms is not None
+            or args.to_ms is not None):
+        _error("current-session does not accept "
+               "--project/--limit/--session/--from/--to")
+    if args.command == "sessions" and args.session:
+        _error("sessions does not accept --session")
+    if args.command == "last-session" and not args.project:
+        _error("last-session requires an explicit --project UUID")
+    if args.command == "last-session" and (
+            args.limit is not None or args.session
+            or args.from_ms is not None or args.to_ms is not None):
+        _error("last-session does not accept "
+               "--limit/--session/--from/--to")
+    if args.command in ("session-resources", "session-events"):
+        if not args.session:
+            _error(f"{args.command} requires --session SESSION_ID")
+        if args.project:
+            _error(f"{args.command} does not accept --project")
+        if args.from_ms is not None or args.to_ms is not None:
             _error(f"{args.command} does not accept --from/--to")
-        # New work-session gates (mirrors the Rust CLI usage).
-        if args.command == "current-session" and (
-                args.project or args.limit is not None
-                or args.session or args.from_ms is not None
-                or args.to_ms is not None):
-            _error("current-session does not accept "
-                   "--project/--limit/--session/--from/--to")
-        if args.command == "sessions" and args.session:
-            _error("sessions does not accept --session")
-        if args.command == "last-session" and not args.project:
-            _error("last-session requires an explicit --project UUID")
-        if args.command == "last-session" and (
-                args.limit is not None or args.session
-                or args.from_ms is not None or args.to_ms is not None):
-            _error("last-session does not accept "
-                   "--limit/--session/--from/--to")
-        if args.command in ("session-resources", "session-events"):
-            if not args.session:
-                _error(f"{args.command} requires --session SESSION_ID")
-            if args.project:
-                _error(f"{args.command} does not accept --project")
-            if args.from_ms is not None or args.to_ms is not None:
-                _error(f"{args.command} does not accept --from/--to")
-        # Legacy commands never accept Phase 5 search/detail flags.
-        if args.command in legacy_commands and (
-                args.application is not None or args.resource is not None
+    # Legacy commands never accept Phase 5 search/detail flags.
+    if args.command in legacy_commands and (
+            args.application is not None or args.resource is not None
+            or args.device is not None or args.query is not None):
+        _error(f"{args.command} does not accept "
+               "--application/--resource/--device/--query")
+    if args.command in legacy_commands and (
+            args.resource_limit is not None or args.event_limit is not None
+            or args.include_events):
+        _error(f"{args.command} does not accept "
+               "--resource-limit/--event-limit/--include-events")
+    # Phase 5 coherent surface gates.
+    if args.command == "current-context" and (
+            args.project or args.limit is not None or args.session
+            or args.from_ms is not None or args.to_ms is not None
+            or args.application is not None or args.resource is not None
+            or args.device is not None or args.query is not None
+            or args.resource_limit is not None
+            or args.event_limit is not None or args.include_events):
+        _error("current-context does not accept "
+               "--project/--limit/--session/--from/--to/"
+               "--application/--resource/--device/--query/"
+               "--resource-limit/--event-limit/--include-events")
+    if args.command in search_commands and args.session:
+        _error(f"{args.command} does not accept --session")
+    if args.command in search_commands and (
+            args.resource_limit is not None or args.event_limit is not None
+            or args.include_events):
+        _error(f"{args.command} does not accept "
+               "--resource-limit/--event-limit/--include-events")
+    # Palette `seen:` mapper: query/project/limit only.
+    if args.command == "seen" and (
+            args.session or args.from_ms is not None
+            or args.to_ms is not None or args.application is not None
+            or args.resource is not None or args.device is not None
+            or args.resource_limit is not None
+            or args.event_limit is not None or args.include_events):
+        _error("seen does not accept --session/--from/--to/"
+               "--application/--resource/--device/"
+               "--resource-limit/--event-limit/--include-events")
+    # Attribution hygiene: days/limit only.
+    if args.command == "unmapped-folders" and (
+            args.project or args.session
+            or args.from_ms is not None or args.to_ms is not None
+            or args.application is not None or args.resource is not None
+            or args.device is not None or args.query is not None
+            or args.resource_limit is not None
+            or args.event_limit is not None or args.include_events):
+        _error("unmapped-folders does not accept "
+               "--project/--session/--from/--to/"
+               "--application/--resource/--device/--query/"
+               "--resource-limit/--event-limit/--include-events")
+    if args.command == "get-session":
+        if not args.session:
+            _error("get-session requires --session SESSION_ID")
+        if args.project:
+            _error("get-session does not accept --project")
+        if args.limit is not None:
+            _error("get-session does not accept --limit")
+        if args.from_ms is not None or args.to_ms is not None:
+            _error("get-session does not accept --from/--to")
+        if (args.application is not None or args.resource is not None
                 or args.device is not None or args.query is not None):
-            _error(f"{args.command} does not accept "
+            _error("get-session does not accept "
                    "--application/--resource/--device/--query")
-        if args.command in legacy_commands and (
-                args.resource_limit is not None or args.event_limit is not None
-                or args.include_events):
-            _error(f"{args.command} does not accept "
-                   "--resource-limit/--event-limit/--include-events")
-        # Phase 5 coherent surface gates.
-        if args.command == "current-context" and (
-                args.project or args.limit is not None or args.session
+        if args.event_limit is not None and not args.include_events:
+            _error("--event-limit requires --include-events")
+    if args.command == "current-context":
+        value = current_context(args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "device-id":
+        if (args.project or args.limit is not None or args.session
                 or args.from_ms is not None or args.to_ms is not None
                 or args.application is not None or args.resource is not None
                 or args.device is not None or args.query is not None
                 or args.resource_limit is not None
                 or args.event_limit is not None or args.include_events):
-            _error("current-context does not accept "
+            _error("device-id does not accept "
                    "--project/--limit/--session/--from/--to/"
                    "--application/--resource/--device/--query/"
                    "--resource-limit/--event-limit/--include-events")
-        if args.command in search_commands and args.session:
-            _error(f"{args.command} does not accept --session")
-        if args.command in search_commands and (
-                args.resource_limit is not None or args.event_limit is not None
-                or args.include_events):
-            _error(f"{args.command} does not accept "
-                   "--resource-limit/--event-limit/--include-events")
-        if args.command == "get-session":
-            if not args.session:
-                _error("get-session requires --session SESSION_ID")
-            if args.project:
-                _error("get-session does not accept --project")
-            if args.limit is not None:
-                _error("get-session does not accept --limit")
-            if args.from_ms is not None or args.to_ms is not None:
-                _error("get-session does not accept --from/--to")
-            if (args.application is not None or args.resource is not None
-                    or args.device is not None or args.query is not None):
-                _error("get-session does not accept "
-                       "--application/--resource/--device/--query")
-            if args.event_limit is not None and not args.include_events:
-                _error("--event-limit requires --include-events")
-        if args.command == "current-context":
-            value = current_context(args.projects_file, args.desktop_bin, args.db)
-        elif args.command == "device-id":
-            if (args.project or args.limit is not None or args.session
-                    or args.from_ms is not None or args.to_ms is not None
-                    or args.application is not None or args.resource is not None
-                    or args.device is not None or args.query is not None
-                    or args.resource_limit is not None
-                    or args.event_limit is not None or args.include_events):
-                _error("device-id does not accept "
-                       "--project/--limit/--session/--from/--to/"
-                       "--application/--resource/--device/--query/"
-                       "--resource-limit/--event-limit/--include-events")
-            value = device_id(args.desktop_bin, args.db)
-        elif args.command == "search-activity":
-            value = search_activity(args.project, args.application,
-                                    args.resource, args.device, args.query,
-                                    args.from_ms, args.to_ms, args.limit,
-                                    args.desktop_bin, args.db)
-        elif args.command == "get-session":
-            value = get_session(args.session, args.resource_limit,
-                                args.include_events, args.event_limit,
+        value = device_id(args.desktop_bin, args.db)
+    elif args.command == "search-activity":
+        value = search_activity(args.project, args.application,
+                                args.resource, args.device, args.query,
+                                args.from_ms, args.to_ms, args.limit,
                                 args.desktop_bin, args.db)
-        elif args.command == "project-activity":
-            value = project_activity(args.project, args.application,
-                                     args.resource, args.device, args.query,
-                                     args.from_ms, args.to_ms, args.limit,
-                                     args.projects_file, args.desktop_bin,
-                                     args.db)
-        elif args.command == "current-project":
-            value = current_project(args.projects_file, args.desktop_bin, args.db)
-        elif args.command == "todos":
-            value = project_todos(args.graph, args.project,
-                                  args.projects_file, args.desktop_bin, args.db)
-        elif args.command == "logseq-context":
-            value = project_logseq_context(args.graph, args.project,
-                                           args.projects_file, args.desktop_bin,
-                                           args.db)
-        elif args.command == "recent-activity":
-            value = recent_activity(args.project, args.limit,
-                                    args.projects_file, args.desktop_bin, args.db)
-        elif args.command == "last-activity":
-            value = last_activity(args.project, args.projects_file,
+    elif args.command == "get-session":
+        value = get_session(args.session, args.resource_limit,
+                            args.include_events, args.event_limit,
+                            args.desktop_bin, args.db)
+    elif args.command == "project-activity":
+        value = project_activity(args.project, args.application,
+                                 args.resource, args.device, args.query,
+                                 args.from_ms, args.to_ms, args.limit,
+                                 args.projects_file, args.desktop_bin,
+                                 args.db)
+    elif args.command == "current-project":
+        value = current_project(args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "watch":
+        return watch_current_project(
+            args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "todos":
+        value = project_todos(args.graph, args.project,
+                              args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "logseq-context":
+        value = project_logseq_context(args.graph, args.project,
+                                       args.projects_file, args.desktop_bin,
+                                       args.db)
+    elif args.command == "recent-activity":
+        value = recent_activity(args.project, args.limit,
+                                args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "last-activity":
+        value = last_activity(args.project, args.projects_file,
+                              args.desktop_bin, args.db)
+    elif args.command == "current-session":
+        value = current_session(args.desktop_bin, args.db)
+    elif args.command == "sessions":
+        value = work_sessions(args.project, args.limit,
+                              args.from_ms, args.to_ms,
+                              args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "last-session":
+        value = last_session(args.project,
+                             args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "session-resources":
+        value = session_resources(args.session, args.limit,
                                   args.desktop_bin, args.db)
-        elif args.command == "current-session":
-            value = current_session(args.desktop_bin, args.db)
-        elif args.command == "sessions":
-            value = work_sessions(args.project, args.limit,
-                                  args.from_ms, args.to_ms,
+    elif args.command in session_commands:
+        value = session_events(args.session, args.limit,
+                               args.desktop_bin, args.db)
+    elif args.command == "seen":
+        value = seen(args.query, args.project, args.limit,
+                     args.projects_file, args.desktop_bin, args.db)
+    elif args.command == "unmapped-folders":
+        value = unmapped_folders(args.days, args.limit,
+                                 args.projects_file, args.desktop_bin,
+                                 args.db)
+    else:
+        value = project_resources(args.project, args.limit,
                                   args.projects_file, args.desktop_bin, args.db)
-        elif args.command == "last-session":
-            value = last_session(args.project,
-                                 args.projects_file, args.desktop_bin, args.db)
-        elif args.command == "session-resources":
-            value = session_resources(args.session, args.limit,
-                                      args.desktop_bin, args.db)
-        elif args.command in session_commands:
-            value = session_events(args.session, args.limit,
-                                   args.desktop_bin, args.db)
-        else:
-            value = project_resources(args.project, args.limit,
-                                      args.projects_file, args.desktop_bin, args.db)
-        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-        return 0
-    except SystemExit as exc:
-        return 0 if exc.code == 0 else 1
-    except (DesktopError, OSError, TypeError, ValueError,
-            UnicodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+_BOUNDED_EXCEPTIONS = (DesktopError, OSError, TypeError, ValueError,
+                       UnicodeError)
+
+
+def main(argv=None):
+    return qscli.run_main(_parse_args, _dispatch, "desktop projects",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

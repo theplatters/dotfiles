@@ -33,9 +33,10 @@
  * Generation/staleness: every snapshot pins captureProcessGeneration to the
  * live captureGeneration; onExited drops stale generations without touching
  * the draft. cancelPendingCapture() bumps captureGeneration, stops the
- * delay/process, and clears geometry/selection (prompt preserved).
- * Screenshot flow (scheduleScreenshot/screenshotDelay/actionProcess) stays
- * in CommandPalette.
+ * delay/process, and clears geometry/selection (prompt and action label
+ * preserved).
+ * Screenshot flow (ScreenshotAction delay/hyprshot process) is
+ * separate; this component only handles region selection for Pi.
  *
  * No new controls were added; the overlay keeps its Theme label/hint.
  */
@@ -56,6 +57,7 @@ Item {
     z: 50
 
     property string capturePrompt: ""
+    property string captureActionLabel: ""
     property int captureGeneration: 0
     property int captureProcessGeneration: 0
     property string captureProcessPrompt: ""
@@ -130,8 +132,11 @@ Item {
         }
     }
 
-    function beginRegionSelection(prompt) {
+    function beginRegionSelection(prompt, actionLabel) {
         root.capturePrompt = prompt;
+        // The armed action label names the overlay header (S-023);
+        // optional so older callers keep the generic header.
+        if (actionLabel !== undefined) root.captureActionLabel = String(actionLabel || "");
         root.captureGeometry = "";
         root.selectionStartX = 0;
         root.selectionStartY = 0;
@@ -201,7 +206,7 @@ Item {
 
         Rectangle {
             anchors.fill: parent
-            color: "#B0070707"
+            color: Theme.scrim
         }
 
         Rectangle {
@@ -218,7 +223,7 @@ Item {
             y: selectionFill.y
             width: selectionFill.width
             height: selectionFill.height
-            color: "transparent"
+            color: Theme.transparent
             border.color: Theme.focusBorder
             border.width: 2
         }
@@ -235,7 +240,9 @@ Item {
             Text {
                 id: selectionInstruction
                 anchors.centerIn: parent
-                text: "Drag to select · Esc cancel"
+                text: root.captureActionLabel
+                    ? ("Drag to select · " + root.captureActionLabel + " · Esc cancel")
+                    : "Drag to select · Esc cancel"
                 color: Theme.text
                 font.family: Theme.fontFamily
                 font.pixelSize: 14

@@ -70,11 +70,49 @@ only the authoritative backend response mutates the list. A write is never
 cancelled on timeout or planner close — closing is blocked while a write is
 busy.
 
+### Agent creation tools
+
+Palette `ai:` agents (denied in project and journal scopes) can create
+registry entries and graph pages through two approved tools; update/toggle
+still never create pages — `create_logseq_page` is the sole creation path:
+
+- `create_project(name, logseq_page?, project_folder?, github_url?,
+  create_folder?)` creates one registry entry via the sanctioned
+  `scripts/projects.py create` CLI (server-assigned UUID; duplicate
+  non-empty notes and invalid values are rejected). `logseq_page` accepts
+  a bare page name or `pages/<name>.md`. With `create_folder: true` the
+  project folder is created first (home directories only, `mkdir -p`
+  with no-symlink checks); order is folder first, then registry. A single
+  exact preview covering the exact registry fields and the folder action
+  requires one Confirm approval; denial, timeout, or no UI writes nothing.
+- `create_logseq_page(name, template?, template_page?, properties?)`
+  creates one new `pages/<name>.md` and errors without writing when it
+  already exists. Prepare renders the exact full content: when `template`
+  is given, the named block is instantiated from the graph's Templates
+  page (`template::<name>` block; `template-including-parent:: false|true`
+  controls parent inclusion; `<% today %>` expands to the Logseq
+  page-title date), and `properties` merges extra leading `key:: value`
+  page properties (e.g. `project-type:: Arbeit`). The exact full-content
+  preview requires Confirm; commit rechecks the content hash, so stale or
+  re-rendered content and an already-existing page write nothing. The
+  leading-property hoist applies when the first instantiated block has
+  empty content (a property block with nested children renders as blocks),
+  and templates use tab indentation (one tab per nesting level).
+
+`create_project` (plus the planner UI) is the only registry write path:
+the active registry file plus its lock stays protected from folder/file
+tools. Linked-folder creation keeps its approval-bound preflight with
+canonical-root + dev/inode binding rechecked on write, so a registry
+switch between preview and commit fails instead of writing elsewhere.
+
 Projects without a linked note are fully selectable with metadata visible,
-but note-based chat and tasks are disabled (`No linked note for this
-project…`); selecting one never launches an agent or reads the graph. Chat,
-tasks, the per-note Pi session, and the folder/GitHub tools require a linked
-`logseq_path`.
+but show no note-based TODOs (`No linked note for this project…`); no page
+is read for them. The project agent still works without a note
+(UUID-scoped, including Zotero-only projects). Note-based tasks and the
+per-note session behavior still require a linked `logseq_path`; the scoped
+linked-folder file tools described below work with or without a linked
+note (see the active-project tray popup and linked-folder file tools
+sections).
 
 `import-logseq` is the only explicit graph import. It is idempotent: it
 scans graph pages via the existing `project_planner` safe readers, adds only
@@ -128,7 +166,10 @@ change (folder projection TTL 5 s, remotes 30 s + config
   `session-resources --session ID [--limit]`, `session-events --session
   ID [--limit]`, plus session-centric retrieval `search` and
   `session-detail` (full contract: `docs/desktop-history-search.md`)
-  (`current` is a fresh snapshot + focus recheck, not collector IPC).
+  (`current` is a fresh snapshot + focus recheck, not collector IPC;
+  a focusless snapshot retains the newest persisted row that carries a
+  project inside the session interruption grace, so planner/topbar
+  focus gaps do not blank the current project).
 - Python: `scripts/desktop_projects.py current-project | todos |
   logseq-context | recent-activity | last-activity | resources |
   current-session | sessions | last-session | session-resources |
@@ -156,6 +197,111 @@ change (folder projection TTL 5 s, remotes 30 s + config
   identity against the current registry before acting (never stale absolute
   paths/window IDs/PIDs/workspace IDs), and treats any later LLM summaries
   as derived/versioned — never boundaries — with no new semantic layer.
+
+## Active-project tray popup
+
+The tray shows the currently active project using the same deterministic
+desktop attribution as above — no manual pick, no inference, no extra
+model. When an active project is known, the popup is project-focused;
+when no current project is known, it keeps a plain project-list fallback
+for picking a project.
+
+With an active project, the popup shows:
+
+- Open TODOs from the linked note when one is linked; a project without
+  a linked note states that explicitly instead of showing tasks.
+- Tracked desktop work-session time for that project as a bounded total
+  over recent deterministic work sessions. It is an approximate recent
+  activity total, not a precise live timer and not billable time.
+- A change recap of the last work session for that project. It
+  appears automatically once session data is ready, cached per
+  project/work-session keyed on the captured change evidence. It tracks
+  repository changes only — never app/window switching. For a linked
+  `local_folder` repository, the baseline HEAD recorded at work-session
+  start plus the latest captured changes (including dirty state) are the
+  evidence; the recap reflects that latest observed state, not an exact
+  end-of-session snapshot. Old sessions without a baseline, projects with
+  no repository, and non-repository folders honestly show unavailable
+  instead of guessing; a past commit is never inferred from the present
+  checkout. Generation uses a separate ephemeral tool-disabled model call
+  with no project conversation history (`pi --no-session --no-tools
+  --no-extensions --no-context-files`, etc.), so recap turns never pollute
+  the persistent project chat. The recap always runs on the helper
+  default model: the popup is view-only and borrows no worker model
+  override, so recap quality changes are attributable to the helper
+  default. Collector-side capture for new sessions
+  needs the usual manual rebuild and collector restart (`cargo build
+  --locked --release --manifest-path
+  services/agent-orchestrator/Cargo.toml`, then restart the collector;
+  nothing auto-installs or auto-starts).
+- The popup has no composer: there is no agent textbox and no unsent
+  draft in the tray view. **Open planner** is the entry point for asking
+  Pi about the project.
+- A link that opens the full planner on the same project. Tool and file
+  approvals use the shared approval flow and can be completed from the
+  full planner; nothing is auto-approved from the compact view.
+
+## Agent capability matrix
+
+One agent context across the palette, project, and journal surfaces
+(Phase 1): every chat surface sees the same deterministic ambient
+context and can do the same core jobs.
+
+| Tool family | palette `ai:` | project | journal |
+| --- | --- | --- | --- |
+| `desktop_*` read (context/session/search/get/project-activity/resume_plan) | yes | yes | yes |
+| `logseq_agenda_list` / `logseq_agenda_add` | yes | yes | no |
+| `logseq_journal_context` / `logseq_journal_append` | no | no | yes |
+| `logseq_project_read` / `logseq_project_update` / `logseq_project_files*` / `logseq_project_git` | no | yes | no |
+| `project_folder_*` (registry `local_folder`) | no | yes | no |
+| `zotero_*` | explicit project id | yes (pinned) | denied |
+| `session_search` | yes | yes | yes |
+| `create_project` / `create_logseq_page` | yes | no | no |
+
+Ambient context is attached visibly to the first user message only
+(`DESKTOP_AMBIENT_CONTEXT_JSON_BEGIN`/`END`, untrusted data): the
+palette `ai:` prepends the full block (project, session, day, recent
+resources); project prompts carry it alongside the page context (the
+transcript keeps the full raw prompt, user rows show the decoded
+request, **Inspect prompt** shows exactly what was sent);
+the journal carries the day only. Follow-ups send the raw request.
+The journal recomputes and attaches its day line on every send (cheap,
+deterministic, defensible journal exception to first-only); the palette
+falls back to the day-only line when the ladder has not resolved yet
+(fail-soft, never blocks Send). Planner workers pinned to a project
+attach that pinned project (resources scoped via
+`project-activity --project <pinned>`); an unresolvable pin omits
+project/resources (day + session only) rather than misattributing.
+Backend identity-family kinds (`portable`/`local`) normalize to the
+display enum (`file` when the resource carries a path, `url`/`zotero`
+when those locators exist, else `page`); Zotero labels use the
+window/resource title with the `zotero://select` URI as fallback (the
+backend never emits a zotero title).
+Enforced in `.pi/extensions/desktop-agent.ts`; project agenda access
+reuses the palette list/select flow with preview + UI confirm
+unchanged, and journal filing uses the explicit "file to project X"
+handoff instead of a silent cross-write.
+
+## Linked-folder project file tools (registry `local_folder`)
+
+When the registry entry has a linked `local_folder`, the project agent
+offers scoped text-file work inside that folder only: listing files,
+reading a text file, creating a text file, and updating a text file.
+This works with or without a linked Logseq note, including note-less
+projects; the folder stays the scope in both cases.
+
+Behavior and safety, in user terms:
+
+- Folder-relative text files only, with bounded listings and bounded
+  reads. There is no arbitrary shell and no command execution; the agent
+  cannot run programs in the folder, only list/read/create/update text
+  through the scoped tools.
+- Every create/update goes through approval checks with revision safety
+  (a stale revision is rejected — reload and retry — instead of silently
+  merged). The exact approval presentation follows once the folder
+  implementation completes.
+- Sensitive/protected locations and unsafe paths are refused. Failures
+  leave existing files untouched.
 
 ## Journal tab
 
@@ -201,7 +347,9 @@ that session without sending a prompt. A prompt is sent only after the user
 presses **Send**; the planner fetches a fresh page first. That fresh page
 context is included only with the first user message of the conversation or
 session and is JSON-delimited from the explicit request as untrusted data.
-Follow-up sends submit only the typed request. The decision derives from the
+The deterministic ambient block (current project, current work session,
+local day, recent resources) rides alongside the page context on that same
+first message only; follow-ups send the raw request. The decision derives from the
 authoritative current `worker.messages` user history (any `user` role counts,
 including older wrapped prompts) once a correlated successful history load
 for the current `(sessionFile, messagesGeneration)` is known
@@ -478,3 +626,185 @@ Project workers are pinned by stable registry UUID (`QS_PROJECT_ID`), not by a f
 - Sessions: `scripts/project_sessions.py --project-id UUID [--project pages/X.md]` scopes to `.../projects/by-id/<uuid>`; `--project` alone keeps legacy `.../projects/<sha256>` compatibility. `latest_session` never scans another scope; legacy restores only when the page is explicitly declared. Agent cache is UUID-keyed; no-note prompt/send works without a page read; note tools fail clearly without a note; the generic scope block is preserved. New scope vars are cleared across palette/journal.
 
 Integration assumptions/limits (until the backend exists): `scripts/zotero.py` is absent, so the extension fails closed with `zotero helper exited`; tests cover UUID/no-note sessions, migration, scoped access/approval denial, and QML contracts against a fake helper. Final schema alignment will inspect the backend once available.
+
+## Project overview popup — Session log card
+
+Phase 2a note: the Session log card and the "Sessions · last 5" card,
+the label chips, and the Confirm/Dismiss suggestion row are removed
+(recap + Resume stay); the tray popup already has no composer, with
+**Open planner** as the entry point.
+
+The project overview popup shows a **Session log** card
+(`objectName: "sessionLogCard"`) under the recap card. It renders the
+deterministic work-log draft for the open project
+(`scripts/work_log.py draft --project <id> [--session <sid>]`,
+per-project cached, generation-guarded so stale results never paint
+onto a switched project), with labels as chips and a bounded status
+line (`objectName: "sessionLogStatus"`).
+
+Actions: **Save to journal**, **Save to project page**, **Polish**
+(visible only when the draft payload reports `polish_enabled`
+strictly `true`, i.e. `memory.workLogPolish`), and **Copy**
+(`wl-copy` of the visible markdown, polished text first when
+present). Save calls `prepare --draft-id … --target …`, then shows
+an inline exact-preview panel (`objectName: "sessionLogPreview"`,
+destination + revision + exact addition/block) with
+**Confirm**/**Cancel**; Confirm calls `apply --prepared <token>`.
+Nothing auto-applies, and a second save of the same target is
+refused (DB saved flag + `quickshell-worklog::` marker). Page writes
+nest under the project page's `Session log(s)` heading (`- ## Session logs`
+is created at the page end when missing). "Saved to
+…" status derives from the draft's `saved` flags.
+
+The card follows the recap subprocess pattern (isolated `Process` +
+`StdioCollector`, `running` guard, launch identity, 75 s watchdog
+with 3 s SIGKILL escalation per operation). It refreshes on project
+open/switch like the recap, never blocks the popup, and never shows
+modal errors — failures land in the bounded status text. Full save
+flow, draft JSON shape, caching, and privacy: `docs/work-memory.md`
+(Workstream B section).
+
+## Daily planner — Session card, attribution card, Open-session handoff (Phase 2b)
+
+The reusable daily planner embeds a **Sessions** card
+(`widgets/SessionCard.qml`, bound to the shared `DailyAgenda` state).
+It lists **every** session for the selected day — pending first, then
+time descending; `attended` drives the row marker only, never
+visibility. The header always reads `Sessions · day (N)` with the
+count over the rendered rows, plus header **Resume** (selected entry
+first, else first entry with a resolved project — navigation only,
+never a write) and **Refresh**. A row shows time range · project ·
+pending TODO count · done marker and expands to the same editor even
+with no captures and no thought. Six actions total: **Accept TODO**,
+**Dismiss TODO** (stage through the capture ladder with an exact
+preview + Confirm; the file Confirm reads **Save to project**),
+**Save thought** (stages through the journal ladder with an exact
+preview + Confirm), **Organise** (the one isolated Pi rewrite with its
+own preview + Confirm before the text ever replaces the editor),
+**Dismiss session** (marks `attended`, revision-checked, stays
+visible), **Open project**. Expanding a row never triggers a write or
+a model call. The planner Daily tab hosts the card (`compact: false`);
+the CalendarPopout (`compact: true`) never renders it — see
+`docs/daily-agenda.md` (card set per host). A `showing X of Y` line
+appears when the day list was capped (backend `agenda.ledgerTotal`,
+client cap 50; S-041, closed Phase 3). The planner Daily tab hosts
+the card; the planner owns no session writes itself. The card renders
+no generated markdown (user-authored rows stay `PlainText` per the
+untrusted-input rule — pinned in `tests/test_visual_style.py`); the
+Review card's generated body is the `MarkdownBody.qml` consumer.
+
+The Projects tab hosts the attribution-hygiene card
+(`widgets/UnmappedFoldersCard.qml`, `desktop_projects.py
+unmapped-folders` ladder): "You worked in these folders but no project
+claims them", ranked by observation count, bounded at 10 rows, hidden
+when there is nothing to fix. Per-row **Add to project…** opens the
+existing `projects.py` create form prefilled with `local_folder`
+(`openNewProjectWithFolder`; writes still go through the
+revision-checked registry update, nothing auto-created) and **Ignore**
+hides the folder ephemerally for the shell run (sidecar `state` key,
+never durable content). No inference anywhere. (The **Add to
+project…** / **Ignore** wording is a deliberate carve-out from the
+Phase-3 verb set — pinned in `tests/test_widget_controls.py`.)
+
+**Open-session handoff:** the palette `session:` row action hands
+`(project_id, "session", session_id)` to `openProject`, which switches
+to the Daily tab and focuses that day/session through the shared
+agenda (`focusDailySession` → `agenda.selectLedgerEntry`). An
+unknown, unloaded, or malformed session id degrades to the Daily tab
+with no selection and never an error; the session id is an opaque key
+and never surfaces as a notice.
+
+## Daily planner — Captured card
+
+The reusable daily planner (`widgets/DailyPlanner.qml`, shown in both
+the CalendarPopout and the ProjectPlanner Daily tab) embeds a
+**Captured** card (`widgets/CaptureInbox.qml`, bound to the shared
+`DailyAgenda` state). It lists new session captures for the selected
+day (at most 20, kind label + elided text) with **Accept** /
+**Dismiss** per row (`objectNames`
+`captureAddPage`/`captureDismiss`) and a **Scan now**
+button (`objectName: "captureScanButton"`, disabled while the inbox or
+the scheduler scan is busy). Accept shows the exact block +
+destination (project page name/path) in a monospace read-only preview with **Confirm**
+(`objectName: "captureConfirm"`, gated on the stored preview token) /
+**Cancel** (`objectName: "captureCancel"`); Confirm applies, clears the
+preview, and reloads the list. Page writes nest under the project
+page's `Session log(s)` heading (`- ## Session logs` is created at the
+page end when missing). The list refreshes on selected-date
+change, on `MemoryScheduler.dataChanged`, and on card show. Failures
+stay in bounded inline text; there is no Pi involvement and no direct
+file access.
+
+## Daily planner — Review card
+
+The reusable daily planner embeds a **Review** card
+(`widgets/ReviewCard.qml`, bound to the shared `DailyAgenda` state,
+after the Captured card). It shows the evening review / morning plan
+for the selected day (`scripts/daily_review.py get --kind
+evening|morning --date …`, per-kind cached, generation-guarded so
+stale results never paint onto a switched day), with **Evening** /
+**Morning** tabs (`objectNames` `reviewTabEvening`/`reviewTabMorning`,
+active tab highlighted via `agenda.reviewKind`) and a **Refresh**
+button (`objectName: "reviewRefreshButton"`, regenerates via
+`--refresh`). Sections render as bounded summary lines (projects,
+changes, captures, TODOs, journal) plus the bounded generated markdown
+body — rendered as markdown through shared `widgets/MarkdownBody.qml`,
+never raw JSON — and the top-3 list (`objectName: "reviewTopList"`)
+offers per-row **Add to tomorrow** / **Add to today**
+(`objectName: "reviewAddButton"`, label from the item's
+`target_date`) through the existing agenda select operation
+(`agenda.scheduleReviewItem`, same revision guards; a stale page
+suggests Refresh). A `showing X of Y` line appears when the candidate
+list was capped (pre-slice `top_total`; S-041, closed Phase 3).
+**Save to journal**
+(`objectName: "reviewSaveButton"`, hidden once `saved_ms` is set)
+shows the exact journal addition + destination (date, path, revision)
+in a monospace read-only preview with **Confirm**
+(`objectName: "reviewConfirm"`, gated on the stored preview token) /
+**Cancel** (`objectName: "reviewCancel"`); Confirm applies, clears the
+preview, and reloads. **Polish**
+(`objectName: "reviewPolishButton"`) was deleted in Phase 2a along
+with review prioritization (unify-agent-slim-sessions L2); the card
+renders deterministic content only. Before
+its time the card shows "Not due yet" (evening after `reviewTime`,
+morning after `morningTime`). The payload refreshes on
+selected-date change, on kind switch, on `MemoryScheduler.dataChanged`,
+and on card show. Failures stay in bounded inline text; nothing
+auto-applies and there is no direct file access.
+## Latest-session labels and project suggestions
+The project overview reads cached session labels locally; opening it does
+not request enrichment. With `associationSuggestions` enabled, an
+unattributed session may show a suggested registry project and confidence.
+Confirm/Dismiss are explicit actions through `annotations.py`; confirmation
+records a sidecar override, never changes the deterministic overview header,
+and never approves a journal/page write. Dismissed suggestions stay hidden.
+Work-log helpers use a confirmed override only when there is no stored
+project attribution. Network enrichment itself requires the separate
+`sessionEnrichment` opt-in and the existing gates and call budgets; see
+`docs/work-memory.md`.
+
+## Project overview popup — Resume button
+
+The project overview popup header has an explicit **Resume** button
+(`objectName: "resumeButton"`, next to **Full planner**) for the open
+project. It is explicit click only: opening or refreshing the popup
+never fetches a plan and never executes anything.
+
+Pressing **Resume** runs `scripts/desktop_resume.py plan --project <id>`
+and shows a **Resume preview** card (`objectName: "resumeCard"`) with
+the available operations (bounded names, at most 5), the unavailable
+operations (at most 3 `<id>: <reason>` lines plus a `+N more` count),
+and the first plan warning when one exists. Operation parameters and
+page content never render in the preview.
+
+**Resume** (`objectName: "resumeConfirm"`) in the preview runs
+`scripts/desktop_resume.py execute --project <id>` with the same
+generation/staleness guards as the command palette; **Cancel**
+(`objectName: "resumeCancel"`) discards the preview. On success the
+preview clears and the popup hands off to the full planner exactly
+like the palette (`projectPlanningRequested` /
+`openProject(id, "resume", msg)`) with a bounded restoration notice;
+partial failures still hand off, while failures never hand off and
+surface only a bounded inline notice. Timeouts, stale completions
+after a project switch or close, and result/project id mismatches are
+dropped without painting or handing off.

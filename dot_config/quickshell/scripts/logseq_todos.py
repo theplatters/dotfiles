@@ -5,6 +5,8 @@ import sys
 
 from logseq_common import GraphError, TASK, markdown_files, page_name, read_lines, MAX_RESULTS, resolve_graph
 
+import qscli
+
 
 def todos(graph, query=None):
     query = query.casefold() if query else None
@@ -29,19 +31,27 @@ def todos(graph, query=None):
     return sorted(found, key=lambda item: (item["path"].casefold(), item["line"], item["task"].casefold()))
 
 
-def main(argv=None):
-    import argparse
-    parser = argparse.ArgumentParser()
+def _parse_args(argv):
+    parser = qscli.SafeParser()
     parser.add_argument("graph", nargs="?", default=None,
                         help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
     parser.add_argument("--query")
-    args = parser.parse_args(argv)
-    try:
-        print(json.dumps(todos(resolve_graph(args.graph), args.query), ensure_ascii=False))
-        return 0
-    except GraphError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args):
+    value = todos(resolve_graph(args.graph), args.query)
+    print(json.dumps(value, ensure_ascii=False))
+    return 0
+
+
+_BOUNDED_EXCEPTIONS = (GraphError, OSError, TypeError, ValueError,
+                       UnicodeError)
+
+
+def main(argv=None):
+    return qscli.run_main(_parse_args, _dispatch, "logseq todos",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

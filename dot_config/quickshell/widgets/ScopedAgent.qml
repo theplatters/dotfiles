@@ -97,6 +97,10 @@ Item {
     property string status: "Press Retry to start the agent…"
     property var pendingApproval: null
     property var pendingRequests: ({})
+    // S-048: parked (deferred) approval count from the bridge snapshot.
+    // Truthful extra so UIs can indicate queued requests waiting for the
+    // next round. Projected from snapshots only; cleared on bridge death.
+    property int deferredCount: 0
     // Authoritative history signal: get_state clears
     // messagesAwaitingSessionState/sessionRefreshPending BEFORE the queued
     // get_messages responds, so an empty messages cache after stateUpdated
@@ -341,10 +345,39 @@ Item {
     }
 
     function respond(requestId, fields) {
-        if (!requestId || !pendingApproval || pendingApproval.id !== requestId) return false;
+        // Queue-membership guard mirroring the bridge's op_respond (which
+        // checks pending_requests, not just the displayed slot): accept
+        // when the id is the displayed approval OR still queued. Under
+        // deferral the bridge can advance pendingApproval while a dialog
+        // still shows an older request; gating on the displayed slot
+        // alone would silently no-op a response the bridge would accept.
+        if (!requestId) return false;
+        let shown = !!pendingApproval && pendingApproval.id === requestId;
+        let queued = !!pendingRequests && !!pendingRequests[requestId];
+        if (!shown && !queued) return false;
         let out = {};
         for (let key of Object.keys(fields || {})) out[key] = fields[key];
         let id = sendOp("respond", { requestId: requestId, fields: out });
+        if (!id) return false;
+        return id;
+    }
+
+    // S-048: mark a queued request as surfaced (a dialog opened for it).
+    // A surfaced request never expires silently. Local-only bridge op.
+    function surfaceRequest(requestId) {
+        if (!requestId || !pendingRequests || !pendingRequests[requestId]) return false;
+        let id = sendOp("surfaceRequest", { requestId: requestId });
+        if (!id) return false;
+        return id;
+    }
+
+    // S-048: park a queued request round-robin (explicit Defer or hiding
+    // the surface while it is visible). A deferred request never expires;
+    // it is skipped while non-deferred requests remain and re-surfaces
+    // when the round reaches it. Local-only bridge op.
+    function deferRequest(requestId) {
+        if (!requestId || !pendingRequests || !pendingRequests[requestId]) return false;
+        let id = sendOp("deferRequest", { requestId: requestId });
         if (!id) return false;
         return id;
     }
@@ -442,6 +475,7 @@ Item {
         pendingApproval = state.pendingApproval === null || state.pendingApproval === undefined
             ? null : state.pendingApproval;
         pendingRequests = state.pendingRequests || ({});
+        deferredCount = state.deferredCount || 0;
         serial = state.serial || 0;
         generation = state.generation || 0;
         lastRequestId = state.lastRequestId || "";
@@ -484,6 +518,7 @@ Item {
         _bRefresh = false;
         pendingApproval = null;
         pendingRequests = ({});
+        deferredCount = 0;
         dropPendingNoReplay();
         processStarted = false;
         desiredRunning = false;
@@ -540,6 +575,7 @@ Item {
         _bRefresh = false;
         pendingApproval = null;
         pendingRequests = ({});
+        deferredCount = 0;
         dropPendingNoReplay();
         processStarted = false;
         desiredRunning = false;

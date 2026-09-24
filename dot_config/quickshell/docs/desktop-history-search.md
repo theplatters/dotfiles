@@ -227,6 +227,18 @@ python3 scripts/desktop_projects.py project-activity [--project UUID] [--applica
   sessions, count, reason}`. Unassociated current identity returns empty
   with no DB query. The default-current two-call path shares one
   `REQUEST_TIMEOUT` (8 s) deadline.
+- `seen [--query TEXT] [--project UUID] [--limit N]`: thin palette
+  mapper for the `seen:` source (Phase 2b §4.1). With `--query` it
+  flattens the per-session resources of one Rust `search` (sessions
+  ranked by match, resources newest-first); bare it maps `resources`
+  output (current project unless `--project`). Returns flat
+  `{rows, truncated, total}` with
+  `{kind, label, identity, project_id, project_name, session_id,
+  last_seen_ms, occurrence_count}` (kinds `file`/`url`/`zotero`/`page`,
+  labels capped at 160 chars, rows capped at 20). No new store, no
+  collector change. Replaces the palette `hist:` prefix outright (L6);
+  the Pi tool rename from `session_ledger_list` to `session_search`
+  lives in `docs/sessions.md`.
 - Legacy APIs (`current-project`, `todos`, `logseq-context`,
   `recent-activity`, `last-activity`, `resources`, `current-session`,
   `sessions`, `last-session`, `session-resources`, `session-events`)
@@ -258,6 +270,17 @@ retrieval. There is no separate chatbot or QML protocol: the existing
 command palette AI path (resident bridge via `widgets/ScopedAgent.qml`,
 `--mode palette`) is reused — Pi calls these tools through the same
 extension, and no new QML wiring was added.
+
+Phase 2a note: the sessions Pi tool is now `session_search` (see
+`docs/sessions.md`); it stays available in every scope (palette,
+project, journal). Phase 2c note: it is union-backed — thought and
+TODO full text from the derived `content_index` FTS5 table in
+`annotations.db` (same tokenizer/declaration discipline as
+`activity_fts`, populated per successful write plus `content_index.py
+rebuild`, dropping it costs only a rescan) ∪ collector
+`search-activity`, deduped by `session_id` with content matches
+ranked first. Omitting the text query browses via `sessions.py
+list`.
 
 ## Natural-language time handling
 

@@ -173,6 +173,123 @@ console.log(JSON.stringify({counts, routes, copied: root.copied, history: root.h
         self.assertEqual(result["history"], "needle")
         self.assertEqual(result["routes"][2]["mode"], "+")
 
+    def test_source_caps_bound_per_keystroke_work(self):
+        # S-056: named bounds exist and ingest/scoring respects them —
+        # only the most recent maxSourceRows clipboard lines and agent
+        # messages are considered, with bounded match text per row.
+        palette_text = PALETTE.read_text(encoding="utf-8")
+        query_text = QUERY.read_text(encoding="utf-8")
+        datasources_text = DATASOURCES.read_text(encoding="utf-8")
+        self.assertIn("property int maxSourceRows: 200", palette_text)
+        self.assertIn("property int maxMatchSnippet: 240", palette_text)
+        self.assertIn("property int maxSourceRows: 200", datasources_text)
+        self.assertIn("MAX_SOURCE_ROWS", query_text)
+        self.assertIn("MAX_MATCH_SNIPPET", query_text)
+        self.assertIn("function boundedKeywords(", query_text)
+        self.assertIn("function prepareRow(", query_text)
+        self.assertIn("_matchText", query_text)
+        self.assertIn("_matchText", palette_text)
+        script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const querySource = fs.readFileSync(process.argv[2], "utf8");
+const textSource = fs.readFileSync(process.argv[3], "utf8");
+const modelSource = fs.readFileSync(process.argv[4], "utf8");
+function extract(name) {
+  const start = source.indexOf("function " + name + "(");
+  const open = source.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    if (source[i] === "}" && --depth === 0) return source.slice(start, i + 1);
+  }
+  throw new Error("missing " + name);
+}
+const resultModel = {
+  items: [], clear() { this.items = []; },
+  append(item) { this.items.push(item); },
+  get count() { return this.items.length; },
+  get(index) { return this.items[index]; }
+};
+const clipLines = Array.from({length: 250},
+  (_, i) => (i + 1) + "\t" + "x".repeat(500) + " filler " + (i + 1));
+clipLines[149] = "150\t" + "x".repeat(500) + " early-needle-zzz";
+clipLines[249] = "250\t" + "x".repeat(500) + " late-needle-zzz";
+const messages = Array.from({length: 250},
+  (_, i) => ({role: "user", text: "y".repeat(500) + " msg " + (i + 1)}));
+messages[10] = {role: "user", text: "y".repeat(500) + " hist-old-zzz"};
+messages[240] = {role: "user", text: "y".repeat(500) + " hist-early-zzz"};
+const root = {
+  mode: "", modeQuery: "early-needle-zzz", query: "early-needle-zzz", rows: [],
+  calculatorResult: {matched: false, value: "", error: ""},
+  selectedIndex: 0, requestedOpen: true,
+  maxSourceRows: 200, maxMatchSnippet: 240,
+  searchText() { return this.modeQuery; },
+};
+const dataSources = {clipboardText: clipLines.join("\n"), fileRows: [], todos: []};
+const Query = {};
+const PaletteText = {};
+const PaletteModel = {};
+const context = {
+  root, resultModel, dataSources,
+  Hyprland: {toplevels: {values: []}, workspaces: {values: []}},
+  DesktopEntries: {applications: {values: []}},
+  agent: {commands: [], messages},
+  selectedIndex: 0,
+  Query, PaletteText, PaletteModel,
+  selector() { return root.mode.length === 1 && ">@%+#!/".includes(root.mode) ? root.mode : ""; },
+  searchText() { return root.modeQuery; },
+};
+vm.createContext(context);
+vm.runInContext(querySource, context);
+Query.score = context.score;
+Query.boundedKeywords = context.boundedKeywords;
+Query.prepareRow = context.prepareRow;
+vm.runInContext(textSource, context);
+PaletteText.plainSnippet = context.plainSnippet;
+vm.runInContext(modelSource, context);
+PaletteModel.compareRows = context.compareRows;
+for (const name of ["addRow", "rebuildModel"])
+  vm.runInContext(extract(name), context);
+function clipRows() { return root.rows.filter(row => row.kind === "clipboard"); }
+function histRows() { return root.rows.filter(row => row.kind === "history"); }
+root.modeQuery = "early-needle-zzz";
+context.rebuildModel();
+const earlyClip = clipRows();
+if (earlyClip.length !== 1) throw new Error("early clipboard line was not searchable");
+if (earlyClip[0].keywords.length > 240) throw new Error("clipboard keywords are not bounded");
+if (earlyClip[0].keywords.indexOf("early-needle-zzz") >= 0)
+  throw new Error("full clip value is still matched as a keyword");
+if (typeof earlyClip[0]._matchText !== "string" || !earlyClip[0]._matchText)
+  throw new Error("row match text is not precomputed");
+if (earlyClip[0].payload !== "150") throw new Error("clipboard copy payload lost its id");
+root.rows = []; resultModel.items = [];
+root.modeQuery = "late-needle-zzz";
+context.rebuildModel();
+if (clipRows().length !== 0) throw new Error("clipboard line past the cap was searched");
+root.rows = []; resultModel.items = [];
+root.modeQuery = "hist-early-zzz";
+context.rebuildModel();
+const earlyHist = histRows();
+if (earlyHist.length !== 1) throw new Error("recent agent message was not searchable");
+if (earlyHist[0].keywords.length > 240) throw new Error("history keywords are not bounded");
+if (earlyHist[0].payload.message.text.indexOf("hist-early-zzz") < 0)
+  throw new Error("history open payload lost its full text");
+root.rows = []; resultModel.items = [];
+root.modeQuery = "hist-old-zzz";
+context.rebuildModel();
+if (histRows().length !== 0) throw new Error("agent message past the cap was searched");
+console.log("ok");
+'''
+        completed = subprocess.run(
+            ["node", "-e", script, str(PALETTE), str(QUERY), str(TEXT), str(MODEL)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "ok")
+
     def test_async_sources_are_once_per_open_and_not_restarted_by_filtering(self):
         script = r'''
 const fs = require("fs");
@@ -285,7 +402,8 @@ const root = {
   loadModeData() { this.reloads = (this.reloads || 0) + 1; }
 };
 const fileDelay = {restarts: 0, restart() { this.restarts++; }};
-const context = {root, fileDelay};
+const fileTimeout = {restarts: 0, stops: 0, restart() { this.restarts++; }, stop() { this.stops++; }};
+const context = {root, fileDelay, fileTimeout};
 vm.createContext(context);
 for (const name of ["isUnifiedSearch", "shouldSearchFiles", "finishTodoLoad", "finishClipboardLoad", "finishFileSearch"])
   vm.runInContext(extract(name), context);
@@ -294,7 +412,9 @@ root.isUnifiedSearch = context.isUnifiedSearch;
 root.shouldSearchFiles = context.shouldSearchFiles;
 if (!root.shouldSearchFiles()) throw new Error("unified search should be file-eligible");
 root.calculatorOnly = true;
-if (root.shouldSearchFiles()) throw new Error("calculator-only unified search must be file-ineligible");
+// S-025: an arithmetic-looking unified query ranks the calculator first
+// but never suppresses files.
+if (!root.shouldSearchFiles()) throw new Error("calculator query must stay file-eligible");
 root.calculatorOnly = false;
 if (root.shouldSearchFiles() !== true) throw new Error("reset calculatorOnly broke eligibility");
 
@@ -322,24 +442,161 @@ root.requestedOpen = true; root.fileGeneration = 3; root.pendingFileQuery = "new
 context.finishFileSearch(0, '{"results":[{"name":"fresh","path":"/fresh","uri":"file:///fresh"}]}', 3, "new");
 if (root.fileRows[0].title !== "fresh") throw new Error("reopened palette rejected current completion");
 
-// A stale file completion arriving after the unified query became a
-// successful calculator expression must neither install nor reschedule:
-// calculator-only queries are ineligible for file search.
+// A current file completion for an arithmetic-looking unified query
+// installs normally: the calculator ranks first but never suppresses
+// files (S-025).
 root.mode = ""; root.modeQuery = "2+2"; root.calculatorOnly = true;
 root.pendingFileQuery = "2+2"; root.fileGeneration = 3;
 root.fileRows = [{title: "old", kind: "file"}]; root.fileBusy = true;
-const restartsBeforeCalc = fileDelay.restarts;
-context.finishFileSearch(0, '{"results":[{"name":"stale-calc","path":"/stale-calc"}]}', 3, "2+2");
-if (root.fileRows[0].title !== "old") throw new Error("calculator-only query installed stale files");
-if (fileDelay.restarts !== restartsBeforeCalc) throw new Error("calculator-only completion rescheduled a search");
+context.finishFileSearch(0, '{"results":[{"name":"fresh-calc","path":"/fresh-calc","uri":"file:///fresh-calc"}]}', 3, "2+2");
+if (root.fileRows[0].title !== "fresh-calc") throw new Error("calculator query rejected current file completion");
+// A generation-stale completion for the same query still reschedules and
+// never installs.
 root.fileRows = [{title: "old", kind: "file"}]; root.fileBusy = true;
+const restartsBeforeStale = fileDelay.restarts;
 context.finishFileSearch(0, '{"results":[{"name":"stale-calc","path":"/stale-calc"}]}', 2, "old-query");
-if (root.fileRows[0].title !== "old") throw new Error("calculator-only query installed generation-stale files");
-if (fileDelay.restarts !== restartsBeforeCalc) throw new Error("calculator-only stale completion rescheduled a search");
+if (root.fileRows[0].title !== "old") throw new Error("calculator query installed generation-stale files");
+if (fileDelay.restarts !== restartsBeforeStale + 1) throw new Error("generation-stale completion did not reschedule");
 console.log("ok");
 '''
         completed = subprocess.run(
             ["node", "-e", script, str(PALETTE), str(DATASOURCES)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "ok")
+
+    def test_clipboard_ingest_is_capped_at_max_source_rows(self):
+        # S-056: cliphist ingest keeps the most recent maxSourceRows
+        # lines; short payloads pass through unchanged.
+        script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+function extract(name) {
+  const start = source.indexOf("function " + name + "(");
+  const open = source.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    if (source[i] === "}" && --depth === 0) return source.slice(start, i + 1);
+  }
+  throw new Error("missing " + name);
+}
+const root = {
+  openingGeneration: 2, requestedOpen: true, paletteOpen: true,
+  mode: "", modeQuery: "x", clipboardPending: true, clipboardLoaded: false,
+  clipboardFailed: false, clipboardText: "", maxSourceRows: 200,
+  isUnifiedSearch() { return this.mode === "" && !!this.modeQuery; },
+  loaded() {}, reloadRequested() {},
+};
+const context = {root};
+vm.createContext(context);
+vm.runInContext(extract("isUnifiedSearch"), context);
+root.isUnifiedSearch = context.isUnifiedSearch;
+vm.runInContext(extract("finishClipboardLoad"), context);
+const big = Array.from({length: 250}, (_, i) => (i + 1) + "\tvalue " + (i + 1)).join("\n");
+context.finishClipboardLoad(0, big, 2);
+const kept = root.clipboardText.split("\n");
+if (kept.length !== 200) throw new Error("ingest kept " + kept.length + " lines");
+if (kept[0] !== "1\tvalue 1" || kept[199] !== "200\tvalue 200")
+  throw new Error("ingest did not keep the most recent lines");
+context.finishClipboardLoad(0, "1\tfresh", 2);
+if (root.clipboardText !== "1\tfresh") throw new Error("short payload changed at ingest");
+console.log("ok");
+'''
+        completed = subprocess.run(
+            ["node", "-e", script, str(DATASOURCES)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "ok")
+
+    def test_clip_mode_matches_bounded_snippet(self):
+        # S-056: clip:/# match a bounded leading snippet per row, not
+        # the full value; the payload id still decodes the full entry.
+        # The DISPLAY is the same needle-centered 180-char snippet the
+        # unified path shows (plainSnippet): the centered window is
+        # display-only after the bounded match, never a deeper match.
+        script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const querySource = fs.readFileSync(process.argv[2], "utf8");
+const textSource = fs.readFileSync(process.argv[3], "utf8");
+function extract(name) {
+  const start = source.indexOf("function " + name + "(");
+  const open = source.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    if (source[i] === "}" && --depth === 0) return source.slice(start, i + 1);
+  }
+  throw new Error("missing " + name);
+}
+const resultModel = {
+  items: [], clear() { this.items = []; },
+  append(item) { this.items.push(item); },
+  get count() { return this.items.length; },
+};
+const late = "x".repeat(500) + " late-needle-zzz";
+const early = "x".repeat(10) + " early-needle-zzz";
+const longEarly = "x".repeat(10) + " early-needle-zzz" + "y".repeat(500);
+const root = {
+  mode: "clip", modeQuery: "late-needle-zzz", rows: [],
+  calculatorResult: {matched: false, value: "", error: ""},
+  selectedIndex: 0, requestedOpen: true,
+  maxSourceRows: 200, maxMatchSnippet: 240,
+  searchText() { return this.modeQuery; },
+};
+const dataSources = {clipboardText: "7\t" + late + "\n8\t" + early + "\n9\t" + longEarly,
+  fileRows: [], todos: []};
+const Query = {};
+const PaletteText = {};
+const context = {
+  root, resultModel, dataSources, Query, PaletteText,
+  selectedIndex: 0,
+  selector() { return root.mode.length === 1 && ">@%+#!/".includes(root.mode) ? root.mode : ""; },
+  searchText() { return root.modeQuery; },
+};
+vm.createContext(context);
+vm.runInContext(querySource, context);
+Query.score = context.score;
+Query.boundedKeywords = context.boundedKeywords;
+Query.prepareRow = context.prepareRow;
+vm.runInContext(textSource, context);
+PaletteText.plainSnippet = context.plainSnippet;
+vm.runInContext(extract("rebuildModel"), context);
+// A needle past the 240-char snippet never matches the full value.
+context.rebuildModel();
+if (root.rows.length !== 0) throw new Error("clip mode matched past the snippet bound");
+// A needle inside the snippet still matches, with the entry id kept
+// for decode-on-copy and the unified-style centered snippet shown.
+root.rows = []; resultModel.items = [];
+root.modeQuery = "early-needle-zzz";
+context.rebuildModel();
+if (root.rows.length !== 2) throw new Error("clip mode missed a snippet match");
+const short = root.rows.find(row => row.payload === "8");
+const long = root.rows.find(row => row.payload === "9");
+if (!short || !long) throw new Error("clipboard copy payload lost its id");
+if (short.title.indexOf("early-needle-zzz") < 0)
+  throw new Error("clipboard row lost its display value");
+if (long.title.length > 180) throw new Error("clipboard row display is not snippet-bounded");
+if (long.title.indexOf("early-needle-zzz") < 0)
+  throw new Error("clipboard snippet lost the needle");
+if (long.title.indexOf("y".repeat(500)) >= 0)
+  throw new Error("clipboard row still shows the full value");
+// An empty needle still lists rows.
+root.rows = []; resultModel.items = [];
+root.modeQuery = "";
+context.rebuildModel();
+if (root.rows.length !== 3) throw new Error("clip mode empty needle listed " + root.rows.length);
+console.log("ok");
+'''
+        completed = subprocess.run(
+            ["node", "-e", script, str(PALETTE), str(QUERY), str(TEXT)],
             check=True,
             text=True,
             capture_output=True,

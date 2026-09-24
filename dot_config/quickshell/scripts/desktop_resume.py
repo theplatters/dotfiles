@@ -57,6 +57,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import desktop_projects as _dp
+import qscli
 
 try:
     import projects as _projects
@@ -2142,24 +2143,12 @@ def execute_operations(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = qscli.SafeParser(
         description="Deterministic Resume backend (plan + typed execution)."
     )
-    parser.add_argument("--desktop-bin", default=None,
-                        help="qs-desktop-context binary; defaults to "
-                        "QS_DESKTOP_CONTEXT_BIN or "
-                        "<repo>/services/agent-orchestrator/target/release/"
-                        "qs-desktop-context")
-    parser.add_argument("--db", default=None,
-                        help="activity DB path; defaults to QS_DESKTOP_DB / "
-                        "QS_DESKTOP_CONTEXT_DB or the binary default")
-    parser.add_argument("--projects-file", default=None,
-                        help="registry TOML file; defaults to "
-                        "QUICKSHELL_PROJECTS_FILE or <repo>/projects.toml")
-    parser.add_argument("--graph", default=None,
-                        help="graph directory for Logseq page/session scope; "
-                        "defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
+    qscli.add_global_flags(parser, db=True, graph=True, desktop_bin=True,
+                            projects_file=True)
     parser.add_argument("command", choices=("list", "plan", "execute"))
     parser.add_argument("--project", default=None,
                         help="project UUID or name (plan/execute only)")
@@ -2170,58 +2159,63 @@ def main(argv=None):
     parser.add_argument("--operations", default=None,
                         help="CSV subset of operation kinds "
                         f"({','.join(OPERATION_KINDS)}; execute only)")
-    try:
-        args = parser.parse_args(argv)
-        if args.command == "list":
-            if args.project:
-                _error("list does not accept --project")
-            if args.operations is not None:
-                _error("list does not accept --operations")
-            value = list_entries(args.query, args.limit, args.projects_file)
-        elif args.command == "plan":
-            if not args.project or not args.project.strip():
-                _error("plan requires --project ID_OR_NAME")
-            if args.query is not None:
-                _error("plan does not accept --query")
-            if args.limit is not None:
-                _error("plan does not accept --limit")
-            if args.operations is not None:
-                _error("plan does not accept --operations")
-            value = plan_for_project(
-                args.project,
-                registry_file=args.projects_file,
-                desktop_bin=args.desktop_bin,
-                db=args.db,
-                graph=args.graph,
-            )
-        else:
-            if not args.project or not args.project.strip():
-                _error("execute requires --project ID_OR_NAME")
-            if args.query is not None:
-                _error("execute does not accept --query")
-            if args.limit is not None:
-                _error("execute does not accept --limit")
-            # Rebuild a fresh plan by stable registry identity; the caller
-            # never supplies paths/commands or a serialized plan. Validate
-            # the operation selection first so unknown kinds fail fast.
-            _parse_operations(args.operations)
-            plan = plan_for_project(
-                args.project,
-                registry_file=args.projects_file,
-                desktop_bin=args.desktop_bin,
-                db=args.db,
-                graph=args.graph,
-            )
-            value = execute_operations(plan, operations=args.operations)
-        print(json.dumps(value, ensure_ascii=False, sort_keys=True,
-                         separators=(",", ":")))
-        return 0
-    except SystemExit as exc:
-        return 0 if exc.code == 0 else 1
-    except (ResumeError, OSError, TypeError, ValueError,
-            UnicodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "list":
+        if args.project:
+            _error("list does not accept --project")
+        if args.operations is not None:
+            _error("list does not accept --operations")
+        value = list_entries(args.query, args.limit, args.projects_file)
+    elif args.command == "plan":
+        if not args.project or not args.project.strip():
+            _error("plan requires --project ID_OR_NAME")
+        if args.query is not None:
+            _error("plan does not accept --query")
+        if args.limit is not None:
+            _error("plan does not accept --limit")
+        if args.operations is not None:
+            _error("plan does not accept --operations")
+        value = plan_for_project(
+            args.project,
+            registry_file=args.projects_file,
+            desktop_bin=args.desktop_bin,
+            db=args.db,
+            graph=args.graph,
+        )
+    else:
+        if not args.project or not args.project.strip():
+            _error("execute requires --project ID_OR_NAME")
+        if args.query is not None:
+            _error("execute does not accept --query")
+        if args.limit is not None:
+            _error("execute does not accept --limit")
+        # Rebuild a fresh plan by stable registry identity; the caller
+        # never supplies paths/commands or a serialized plan. Validate
+        # the operation selection first so unknown kinds fail fast.
+        _parse_operations(args.operations)
+        plan = plan_for_project(
+            args.project,
+            registry_file=args.projects_file,
+            desktop_bin=args.desktop_bin,
+            db=args.db,
+            graph=args.graph,
+        )
+        value = execute_operations(plan, operations=args.operations)
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":")))
+    return 0
+
+
+_BOUNDED_EXCEPTIONS = (ResumeError, OSError, TypeError, ValueError,
+                       UnicodeError)
+
+
+def main(argv=None) -> int:
+    return qscli.run_main(_parse_args, _dispatch, "desktop resume",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

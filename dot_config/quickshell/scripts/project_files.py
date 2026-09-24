@@ -51,10 +51,16 @@ _SYSTEM_ROOTS = (Path("/etc"), Path("/proc"), Path("/sys"),
 _PI_PROTECTED = {"auth", "credentials", "config", "agent", "extensions",
                  "skills", "SYSTEM.md", "settings.json", "trust.json",
                  "APPEND_SYSTEM.md", "prompts", "themes"}
-_HELPER_NAMES = {"logseq_graph.py", "logseq_common.py", "logseq_todos.py",
-                 "project_planner.py", "project_files.py",
-                 "project_sessions.py", "journal_assistant.py",
-                 "journal_sessions.py", "screen_capture.py"}
+_TRUSTED_SCRIPTS_DIR = Path(__file__).resolve().parent
+_HELPER_NAMES = {"daily_agenda.py", "desktop_projects.py",
+                 "desktop_resume.py", "journal_assistant.py",
+                 "journal_sessions.py", "logseq_common.py",
+                 "logseq_graph.py", "logseq_todos.py", "palette_files.py",
+                 "project_files.py", "project_folder.py",
+                 "project_overview.py", "project_planner.py", "project_recap.py",
+                 "project_session_changes.py", "project_sessions.py",
+                 "projects.py", "quickshell_settings.py",
+                 "screen_capture.py", "zotero.py"}
 
 
 def _error(message: str):
@@ -74,6 +80,40 @@ def _sensitive_name(name: str) -> bool:
     stem = Path(name).stem.casefold()
     return (folded in SENSITIVE_NAMES or stem in SENSITIVE_NAMES
             or folded == ".env" or folded.startswith((".env.", ".credentials.")))
+
+
+def _is_inside_trusted_scripts(absolute: Path) -> bool:
+    """True when *absolute* is the actual helper import dir or below it.
+
+    Path-aware: only the canonical directory containing this file (the
+    trusted ``scripts/`` import location) is protected, never an unrelated
+    project's ``scripts/`` directory elsewhere. Both the resolved and the
+    lexical spellings are checked so a replaced-by-symlink spelling stays
+    blocked. This prevents creating ``json.py``/``hashlib.py``/``fcntl.py``/
+    ``__init__.py`` (or any other name, without enumerating dependencies)
+    that would shadow stdlib/imports on the next helper run.
+    """
+    try:
+        trusted = _TRUSTED_SCRIPTS_DIR
+    except Exception:
+        return False
+    for candidate in (absolute,):
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            resolved = candidate
+        try:
+            resolved.relative_to(trusted)
+            return True
+        except ValueError:
+            pass
+        # Lexical fallback (no filesystem stat) for missing-ancestor paths.
+        try:
+            Path(candidate.as_posix()).relative_to(trusted.as_posix())
+            return True
+        except (ValueError, OSError):
+            pass
+    return False
 
 
 def _protected_child(absolute: Path) -> bool:
@@ -97,12 +137,86 @@ def _protected_child(absolute: Path) -> bool:
     return False
 
 
+def _active_registry_files() -> list[Path]:
+    """Return the active registry file plus its sibling lock, lexically.
+
+    Resolution honors ``--projects-file`` (exported as
+    ``QUICKSHELL_PROJECTS_FILE`` by the folder helper) > env > repo default,
+    matching ``projects.resolve_registry_file``. Both paths are blocked even
+    when absent so the tool can never create its own scope file inside a
+    linked folder.
+    """
+    try:
+        import projects as _projects
+        registry = _projects.resolve_registry_file()
+    except Exception:
+        try:
+            raw = os.environ.get("QUICKSHELL_PROJECTS_FILE", "").strip()
+            if raw:
+                expanded = os.path.expanduser(raw)
+                registry = Path(expanded)
+                if not registry.is_absolute():
+                    try:
+                        import os as _os
+                        registry = Path(_os.path.abspath(
+                            _os.path.join(_os.getcwd(), expanded)))
+                    except OSError:
+                        return []
+            else:
+                registry = Path(__file__).resolve().parent.parent / "projects.toml"
+        except Exception:
+            return []
+    try:
+        lock = Path(str(registry) + ".lock")
+        return [registry, lock]
+    except Exception:
+        return []
+
+
+def _is_active_registry_target(absolute: Path) -> bool:
+    """True when *absolute* is the active registry file or its lock."""
+    try:
+        name = absolute.name
+    except Exception:
+        return False
+    candidates = _active_registry_files()
+    # Fast path: basename must match before any filesystem stat.
+    basenames = set()
+    for candidate in candidates:
+        try:
+            basenames.add(candidate.name)
+        except Exception:
+            continue
+    if name not in basenames:
+        return False
+    try:
+        canonical = absolute.resolve(strict=False)
+    except OSError:
+        canonical = absolute
+    for candidate in candidates:
+        try:
+            if canonical == candidate.resolve(strict=False):
+                return True
+        except OSError:
+            try:
+                if canonical.as_posix() == candidate.as_posix():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
 def is_excluded(root: Path, rel: Path) -> bool:
     """True when a root-relative path must never be listed, read, or diffed."""
     for part in rel.parts:
         if part in (".git", *_SENSITIVE_DIRS):
             return True
         if _sensitive_name(part):
+            return True
+        # Folder-helper lock/transaction files are never user data.
+        if part == ".project-folder.lock":
+            return True
+        if part.startswith(".project-folder-") and part.endswith(".tmp"):
             return True
     absolute = root / rel if not rel.is_absolute() else rel
     try:
@@ -113,6 +227,33 @@ def is_excluded(root: Path, rel: Path) -> bool:
     # Lexical check as well so a replaced-by-symlink spelling stays excluded.
     if _protected_child(absolute):
         return True
+    # Actual helper import directory (and descendants): creating json.py /
+    # hashlib.py / fcntl.py / __init__.py (or anything else) there would
+    # shadow imports on the next helper run. Path-aware: only the canonical
+    # trusted scripts dir, never an unrelated project's scripts/ directory.
+    try:
+        if _is_inside_trusted_scripts(absolute.resolve(strict=False)):
+            return True
+    except OSError:
+        pass
+    try:
+        if _is_inside_trusted_scripts(absolute):
+            return True
+    except Exception:
+        pass
+    # Active registry (plus lock) can never be listed/read/diffed via the
+    # folder tools, otherwise the tool could exfiltrate or rewrite its own
+    # scope. Only the exact active path is blocked, not any basename.
+    try:
+        if _is_active_registry_target(absolute.resolve(strict=False)):
+            return True
+    except OSError:
+        pass
+    try:
+        if _is_active_registry_target(absolute):
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -246,6 +387,15 @@ def _validate_root(resolved: Path) -> Path:
             _error("project folder is sensitive")
     if _protected_child(resolved):
         _error("project folder is protected")
+    # Actual helper import directory itself (or below it) can never be a
+    # linked root: otherwise writes there would shadow stdlib/imports.
+    try:
+        if _is_inside_trusted_scripts(resolved):
+            _error("project folder is protected")
+    except GraphError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        pass
     if resolved.name in _HELPER_NAMES or resolved.name == "ScopedAgent.qml":
         _error("project folder is protected")
     return resolved

@@ -11,13 +11,18 @@ Rectangle {
     color: Theme.transparent
 
     property var notifServer: null
+    property var notifHistory: null
     property var mediaPopout: null
-    property var audioPopup: null
-    property var networkPopup: null
-    property var batteryPopup: null
     property var controlCenter: null
     property var calendarPopout: null
     property var projectPlanner: null
+    property var projectOverviewPopup: null
+    // Shared DailyAgenda for the P5 session-ledger badge.
+    property var agenda: null
+    // Shared shell-level pollers (one instance per desktop, not per bar).
+    property var systemStats: null
+    property var projectSource: null
+    property var clockSource: null
     property alias trayAnchor: unifiedTray
     property alias clockAnchor: clockContainer
 
@@ -53,8 +58,11 @@ Rectangle {
     readonly property bool mediaFitsFull: mediaRemainder >= mediaFullNeed
     readonly property bool mediaFitsCompact: mediaRemainder >= mediaCompactNeed
     // Stable by design: never reads mediaModule.implicitWidth (which itself
-    // depends on compact and would jitter).
-    readonly property bool compactMedia: mediaModule.status !== "" && (bar.width < 1400 || !mediaFitsFull)
+    // depends on compact and would jitter). Driven purely by the measured
+    // center remainder against the bounded needs; compact cannot move the
+    // remainder (needs are constants), so no oscillation and no hysteresis
+    // band is needed.
+    readonly property bool compactMedia: mediaModule.status !== "" && !mediaFitsFull
     // When even the compact capsule cannot fit, the capsule hides and a
     // 32px mini entry keeps media reachable via the center scroller.
     readonly property bool showMediaCapsule: mediaModule.status !== "" && (compactMedia ? mediaFitsCompact : mediaFitsFull)
@@ -85,7 +93,10 @@ Rectangle {
                 spacing: 8
 
                 // Unified status tray: ONE shared capsule, first on the left.
-                // Toggle chevron + audio + network/BT + battery + tray icons.
+                // Toggle chevron + audio + network/BT + battery + current
+                // project. SNI tray icons live in their own capsule in the
+                // right slot (sysTrayCapsule) so the project module can
+                // never overlap them.
                 // Modules keep their own MouseAreas (no overlay stealing):
                 // audio left=mute right=section0 wheel=volume, network=section1,
                 // battery=section3, tray=own activate/middle/right.
@@ -147,7 +158,6 @@ Rectangle {
                             objectName: "audioModule"
                             height: 32
                             anchors.verticalCenter: parent.verticalCenter
-                            audioPopup: bar.audioPopup
                             controlCenter: bar.controlCenter
                         }
 
@@ -158,7 +168,6 @@ Rectangle {
                             objectName: "networkModule"
                             height: 32
                             anchors.verticalCenter: parent.verticalCenter
-                            networkPopup: bar.networkPopup
                             controlCenter: bar.controlCenter
                             compact: bar.compactNetwork || bar.tightSides
                         }
@@ -178,7 +187,6 @@ Rectangle {
                             anchors.verticalCenter: parent.verticalCenter
                             visible: UPower.displayDevice.type === 2
                             compact: bar.compactBattery
-                            batteryPopup: bar.batteryPopup
                             controlCenter: bar.controlCenter
                         }
 
@@ -195,56 +203,21 @@ Rectangle {
                             height: 32
                             anchors.verticalCenter: parent.verticalCenter
                             projectPlanner: bar.projectPlanner
+                            overviewPopup: bar.projectOverviewPopup
+                            // Shared DailyAgenda for the P5 badge.
+                            agenda: bar.agenda
+                            projectSource: bar.projectSource
                             compact: bar.compactNetwork
-                        }
-
-                        Rectangle {
-                            width: trayFlick.visible ? 1 : 0
-                            height: 16
-                            color: Theme.border
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: trayFlick.visible
-                        }
-
-                        // Tray viewport: capped at ~5 icons (5x20 + 4x8 + slack);
-                        // extra icons scroll with wheel/drag. Icon MouseAreas
-                        // keep native left/middle/right actions; tray icons
-                        // have no wheel action, so the wheel catcher is safe.
-                        Flickable {
-                            id: trayFlick
-                            objectName: "trayFlick"
-                            height: 32
-                            width: Math.min(trayModule.implicitWidth + 4, 148)
-                            visible: trayModule.visible
-                            anchors.verticalCenter: parent.verticalCenter
-                            contentWidth: trayModule.implicitWidth
-                            contentHeight: 32
-                            flickableDirection: Flickable.HorizontalFlick
-                            boundsBehavior: Flickable.StopAtBounds
-                            clip: true
-                            MouseArea {
-                                anchors.fill: parent
-                                acceptedButtons: Qt.NoButton
-                                hoverEnabled: false
-                                onWheel: (wheel) => {
-                                    trayFlick.contentX = Math.max(0, Math.min(trayFlick.contentWidth - trayFlick.width, trayFlick.contentX - wheel.angleDelta.y - wheel.angleDelta.x));
-                                }
-                            }
-                            TrayModule {
-                                id: trayModule
-                                objectName: "trayModule"
-                                x: 0
-                                height: 32
-                                anchors.verticalCenter: parent.verticalCenter
-                                visible: implicitWidth > 0
-                            }
                         }
                     }
                 }
 
                 // Notifications history stays reachable next to the tray.
+                // View over the shell-level NotificationHistory store: every
+                // bar's bell shares one model.
                 NotificationModule {
                     notifServer: bar.notifServer
+                    history: bar.notifHistory
                     anchors.verticalCenter: parent.verticalCenter
                 }
 
@@ -268,9 +241,9 @@ Rectangle {
                             font.pixelSize: 14
                             anchors.verticalCenter: parent.verticalCenter
                         }
-                        ClockModule { format: "ddd"; visible: !bar.compactClock; anchors.verticalCenter: parent.verticalCenter }
-                        ClockModule { format: "HH:mm"; anchors.verticalCenter: parent.verticalCenter }
-                        ClockModule { format: "MM-dd"; visible: !bar.compactClock; anchors.verticalCenter: parent.verticalCenter }
+                        ClockModule { format: "ddd"; visible: !bar.compactClock; anchors.verticalCenter: parent.verticalCenter; clockSource: bar.clockSource }
+                        ClockModule { format: "HH:mm"; anchors.verticalCenter: parent.verticalCenter; clockSource: bar.clockSource }
+                        ClockModule { format: "MM-dd"; visible: !bar.compactClock; anchors.verticalCenter: parent.verticalCenter; clockSource: bar.clockSource }
                     }
                     MouseArea {
                         anchors.fill: parent
@@ -344,26 +317,33 @@ Rectangle {
                         radius: Theme.controlRadius
                         border.color: Theme.border
                         border.width: 1
-                        color: Theme.mantle
+                        // Highlight stays while hovering the capsule body or
+                        // any transport/title control (no flicker when moving
+                        // between them).
+                        color: (mediaBgMouse.containsMouse || mediaModule.hovered) ? Theme.surface0 : Theme.mantle
                         anchors.verticalCenter: parent.verticalCenter
                         visible: bar.showMediaCapsule
+                        // One click owner per region: this background toggle
+                        // sits BELOW the module, so transport/title clicks
+                        // reach the control under the cursor first and only
+                        // the capsule body toggles the popout.
+                        MouseArea {
+                            id: mediaBgMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (bar.mediaPopout) {
+                                    bar.mediaPopout.toggle(mediaContainer);
+                                }
+                            }
+                        }
                         MediaModule {
                             id: mediaModule
                             objectName: "mediaModule"
                             anchors.centerIn: parent
                             mediaPopout: bar.mediaPopout
                             compact: bar.compactMedia
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            onEntered: mediaContainer.color = Theme.surface0
-                            onExited: mediaContainer.color = Theme.mantle
-                            onClicked: {
-                                if (bar.mediaPopout) {
-                                    bar.mediaPopout.toggle(mediaContainer);
-                                }
-                            }
                         }
                     }
 
@@ -420,10 +400,59 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 8
 
+                // SNI tray capsule: separate from the unified tray so the
+                // CurrentProjectModule can never overlap tray icons. Collapses
+                // when the tray is empty.
+                Rectangle {
+                    id: sysTrayCapsule
+                    objectName: "sysTrayCapsule"
+                    height: 32
+                    width: sysTrayFlick.width + 20
+                    radius: Theme.controlRadius
+                    border.color: Theme.border
+                    border.width: 1
+                    color: Theme.mantle
+                    visible: sysTrayModule.implicitWidth > 0
+                    // Tray viewport: capped at ~5 icons (5x20 + 4x8 + slack);
+                    // extra icons scroll with wheel/drag. Icon MouseAreas
+                    // keep native left/middle/right actions; tray icons
+                    // have no wheel action, so the wheel catcher is safe.
+                    Flickable {
+                        id: sysTrayFlick
+                        objectName: "sysTrayFlick"
+                        height: 32
+                        width: Math.min(sysTrayModule.implicitWidth + 4, 148)
+                        visible: sysTrayModule.implicitWidth > 0
+                        anchors.centerIn: parent
+                        contentWidth: sysTrayModule.implicitWidth
+                        contentHeight: 32
+                        flickableDirection: Flickable.HorizontalFlick
+                        boundsBehavior: Flickable.StopAtBounds
+                        clip: true
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.NoButton
+                            hoverEnabled: false
+                            onWheel: (wheel) => {
+                                sysTrayFlick.contentX = Math.max(0, Math.min(sysTrayFlick.contentWidth - sysTrayFlick.width, sysTrayFlick.contentX - wheel.angleDelta.y - wheel.angleDelta.x));
+                            }
+                        }
+                        TrayModule {
+                            id: sysTrayModule
+                            objectName: "sysTrayModule"
+                            x: 0
+                            height: 32
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+                }
+
                 // Screenshot
                 ScreenshotModule {}
 
-                // System Stats (Mem, CPU, Disk)
+                // System Stats (Mem, CPU, Disk): static capsule, no click
+                // action (stats popout is roadmap) and therefore no hover
+                // affordance.
                 Rectangle {
                     id: statsContainer
                     objectName: "statsContainer"
@@ -439,25 +468,22 @@ Rectangle {
                         spacing: 15
                         StatModule {
                             label: "Mem"; textColor: Theme.subtext1;
-                            command: ["sh", "-c", "LC_ALL=C free | awk '/Mem:/ {print int($3/$2 * 100)\"%\"}'"]
+                            statKey: "mem"
+                            statsSource: bar.systemStats
                             compact: bar.compactStats
                         }
                         StatModule {
                             label: "CPU"; textColor: Theme.subtext1;
-                            command: ["sh", "-c", "LC_ALL=C top -bn1 | grep '^%*Cpu(s)' | awk '{print int(100 - $8)\"%\"}'"]
+                            statKey: "cpu"
+                            statsSource: bar.systemStats
                             compact: bar.compactStats
                         }
                         StatModule {
                             label: "Disk"; textColor: Theme.subtext1;
-                            command: ["sh", "-c", "python3 -c \"import shutil; t, u, f = shutil.disk_usage('/'); print(f'{round((t-f)/t*100)}%')\""]
+                            statKey: "disk"
+                            statsSource: bar.systemStats
                             compact: bar.compactStats
                         }
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        onEntered: statsContainer.color = Theme.surface0
-                        onExited: statsContainer.color = Theme.mantle
                     }
                 }
             }

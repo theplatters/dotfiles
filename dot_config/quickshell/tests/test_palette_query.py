@@ -48,16 +48,88 @@ console.log(JSON.stringify(vm.runInContext(process.argv[2], context)));
             [100, 1, -1],
         )
 
+    def test_bounded_keywords_and_prepared_match_cache(self):
+        # S-056: named bounds exist and scoring respects them. Short
+        # values pass through unchanged (ranking preserved); long
+        # values match only on the leading snippet; a precomputed
+        # _matchText is scored directly.
+        self.assertEqual(
+            self.evaluate(
+                "[MAX_SOURCE_ROWS, MAX_MATCH_SNIPPET,"
+                ' boundedKeywords("short", 240),'
+                ' boundedKeywords("x".repeat(600) + "needle", 240).length,'
+                ' boundedKeywords("x".repeat(600) + "needle", 240).indexOf("needle"),'
+                ' boundedKeywords(null), boundedKeywords(undefined)]'
+            ),
+            [200, 240, "short", 240, -1, "", ""],
+        )
+        self.assertEqual(
+            self.evaluate(
+                '[score({title: "t", subtitle: "s",'
+                ' keywords: boundedKeywords("x".repeat(600) + "needle")}, "needle"),'
+                ' score({title: "t", subtitle: "s",'
+                ' keywords: "x".repeat(600) + "needle"}, "needle"),'
+                ' prepareRow({title: "Terminal", subtitle: "App",'
+                ' keywords: "term"})._matchText,'
+                ' score({_matchText: "needle here", title: "zzz",'
+                ' subtitle: "", keywords: ""}, "needle") >= 0,'
+                ' score({title: "Terminal", subtitle: "App", keywords: ""}, "term")]'
+            ),
+            [-1, 100, "terminal app term", True, 500],
+        )
+
     def test_parse_routes_and_trims(self):
         self.assertEqual(
             self.evaluate(
-                '["ai: hello", "clip: cats", "= 1 + 2", "> lock"].map(parseQuery)'
+                '["ai: hello", "clip: cats", "= 1 + 2", "> lock", "seen: deploy",'
+                ' "todo: fix backoff", "session: deploy", "work: deploy",'
+                ' "+ firefox", "hist: deploy", "inbox: triage",'
+                ' "history: deploy"].map(parseQuery)'
             ),
             [
                 {"mode": "ai", "text": "hello"},
                 {"mode": "clip", "text": "cats"},
                 {"mode": "=", "text": "1 + 2"},
                 {"mode": ">", "text": "lock"},
+                {"mode": "seen", "text": "deploy"},
+                {"mode": "todo", "text": "fix backoff"},
+                {"mode": "session", "text": "deploy"},
+                {"mode": "session", "text": "deploy"},
+                # `+` is app search (DesktopEntries), never the todo:
+                # alias — `todo:` is the only quick-add entry.
+                {"mode": "+", "text": "firefox"},
+                # L6: `hist:` is removed outright and `inbox:` is deleted
+                # (its meaning is the default session sort) — both fall
+                # through to unified search.
+                {"mode": "", "text": "hist: deploy"},
+                {"mode": "", "text": "inbox: triage"},
+                {"mode": "", "text": "history: deploy"},
+            ],
+        )
+
+    def test_session_and_seen_prefixes(self):
+        self.assertEqual(
+            self.evaluate(
+                '["session: deploy", "WORK:deploy", "session", "work: deploy",'
+                ' "seen:", "SEEN deploy", "seenfoo",'
+                ' "todo:", "TODO fix it", "todofoo",'
+                ' "inbox:", "sessionfoo", "inboxfoo", "hist:"].map(parseQuery)'
+            ),
+            [
+                {"mode": "session", "text": "deploy"},
+                {"mode": "session", "text": "deploy"},
+                {"mode": "session", "text": ""},
+                {"mode": "session", "text": "deploy"},
+                {"mode": "seen", "text": ""},
+                {"mode": "seen", "text": "deploy"},
+                {"mode": "", "text": "seenfoo"},
+                {"mode": "todo", "text": ""},
+                {"mode": "todo", "text": "fix it"},
+                {"mode": "", "text": "todofoo"},
+                {"mode": "", "text": "inbox:"},
+                {"mode": "", "text": "sessionfoo"},
+                {"mode": "", "text": "inboxfoo"},
+                {"mode": "", "text": "hist:"},
             ],
         )
 

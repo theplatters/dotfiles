@@ -299,7 +299,12 @@ function makeHarness() {{
   // Palette draft state; the capture component owns generations/prompt and
   // reports through the real CommandPalette onReopenRequest/onCaptured/
   // onFailed handlers extracted above (no hand-copied mirrors).
-  const palette = {{query: "ai: original", notice: "", requestedOpen: true, agent}};
+  // Ambient wrappers are pass-throughs here: this test pins images +
+  // draft preservation, while ambient attach is pinned behaviorally in
+  // test_scoped_agent_ui (capture-path ambient test).
+  const palette = {{query: "ai: original", notice: "", requestedOpen: true, agent,
+    palettePromptWithAmbient(p) {{ return p; }},
+    palettePromptWithAmbientImages(p, images) {{ return {{prompt: p, images: images || []}}; }}}};
   palette.open = function() {{ opens.push("open"); palette.requestedOpen = true; }};
   const root = {{
     captureProcessGeneration: 0, captureProcessPrompt: "", captureGeneration: 0,
@@ -518,10 +523,16 @@ console.log(JSON.stringify({{ok: true}}));
         self.assertIn("generation !== root.captureGeneration", capture)
         self.assertIn("root.captured(prompt, data.images || [])", capture)
         self.assertIn('root.query = "ai:"', PALETTE)
-        self.assertIn("root.agent.prompt(prompt, images", PALETTE)
+        # Capture-first sends attach ambient visibly (images-capable
+        # variant) instead of bypassing the first-message gate.
+        captured = extract_handler(PALETTE, "onCaptured:")
+        self.assertIn("palettePromptWithAmbientImages(prompt, images", captured)
+        self.assertIn("captured.prompt, captured.images", captured)
         activate = extract_function(PALETTE, "activate")
-        self.assertIn("agent.prompt(prompt)", activate)
-        self.assertIn('agent.prompt("/" + target.name', activate)
+        self.assertIn("agent.prompt(root.palettePromptWithAmbient(prompt))", activate)
+        self.assertIn('agent.prompt(root.palettePromptWithAmbient("/" + target.name', activate)
+        ai_action = extract_function(PALETTE, "aiAction")
+        self.assertIn("agent.prompt(root.palettePromptWithAmbient(prompts[name]))", ai_action)
 
     def test_ai_query_not_cleared_and_capture_rejection_preserves(self):
         activate = extract_function(PALETTE, "activate")
@@ -692,12 +703,176 @@ console.log(JSON.stringify({{ok: true, calls}}));
         approval_block = APPROVAL
         self.assertIn("let current = request;", approval_block)
         self.assertIn("let requestId = current.id;", approval_block)
-        self.assertIn("dismiss();", approval_block)
+        # Accept/Reject clear only the view (never park): a failed
+        # respond cannot defer the request; Defer/close own dismiss().
+        self.assertIn("clearView();", approval_block)
         self.assertIn("agent.respond(requestId", approval_block)
+        self.assertIn("function clearView()", approval_block)
         respond_src = extract_function(SCOPED, "respond")
-        self.assertIn("pendingApproval.id !== requestId", respond_src)
+        # Queue-membership guard mirrors the bridge op_respond: the
+        # displayed slot alone must not gate the response.
+        self.assertNotIn("pendingApproval.id !== requestId) return false", respond_src)
+        self.assertIn("pendingApproval.id === requestId", respond_src)
+        self.assertIn("pendingRequests[requestId]", respond_src)
         close_block = PALETTE[PALETTE.index("function close() {"):PALETTE.index("function handoffToProjectPlanner")]
         self.assertNotIn("agent.respond", close_block)
+        # S-048: closing with a visible approval defers it (round-robin
+        # park, never a silent cancel, same-id echo suppressed); the
+        # compositor-unmap path agrees. Both route through the dialog's
+        # dismiss() (defer + record + clear view).
+        self.assertIn("approvalDialog.dismiss()", close_block)
+        unmap_block = PALETTE[PALETTE.index("function immediateUnmap() {"):PALETTE.index("function setOpen(open) {")]
+        self.assertIn("approvalDialog.dismiss()", unmap_block)
+
+    def test_approval_gestures_labelled_and_preview_bounded(self):
+        # S-021/S-024/S-048: gestures are labelled by effect (Reject
+        # cancels, Defer parks the request queued), the footer states
+        # Defer/closing parks without expiry or auto-reopen while
+        # Reject/Stop cancel, and the preview is bounded — never a raw
+        # args dump.
+        approval_block = APPROVAL
+        self.assertIn('text: "Reject (Esc)"', approval_block)
+        self.assertIn('text: "Defer"', approval_block)
+        self.assertIn("onClicked: root.dismiss()", approval_block)
+        self.assertIn("function consequenceFor(value)", approval_block)
+        self.assertIn("function destinationFor(value)", approval_block)
+        self.assertIn("function boundedText(value", approval_block)
+        self.assertIn("Enter adds a newline", approval_block)
+        self.assertIn("parks the request queued", approval_block)
+        self.assertIn("never expires", approval_block)
+        self.assertIn("never reopens on its own", approval_block)
+        self.assertIn("shows whatever is pending then", approval_block)
+        self.assertIn("Stop cancels everything", approval_block)
+        self.assertNotIn("JSON.stringify", approval_block)
+
+    def test_approval_derives_from_shared_grammar(self):
+        # S-059: one preview/approval grammar. The dialog keeps thin
+        # wrappers with the same names (titleFor is pinned here by the
+        # visual-style test) and delegates every derivation to the
+        # shared ApprovalGrammar.js module — never a local fork.
+        self.assertIn('import "ApprovalGrammar.js" as ApprovalGrammar', APPROVAL)
+        for name in ("titleFor", "messageFor", "boundedText",
+                     "consequenceFor", "destinationFor",
+                     "argumentPreview", "moveChoice"):
+            body = extract_function(APPROVAL, name)
+            self.assertIn("ApprovalGrammar." + name, body)
+
+    def test_approval_dialog_surfaces_and_defers_without_answering(self):
+        # S-048: opening a dialog marks the request surfaced (no silent
+        # expiry); Defer/dismiss parks it round-robin and records the id
+        # against same-id echo. Neither path answers the RPC (no
+        # agent.respond); Accept/Reject clear only the view (clearView,
+        # never dismiss) so a failed respond cannot park, and Esc/Reject
+        # still cancels.
+        open_src = extract_function(APPROVAL, "openRequest")
+        self.assertIn("agent.surfaceRequest(value.id)", open_src)
+        dismiss_src = extract_function(APPROVAL, "dismiss")
+        self.assertIn("noteDeferred(deferredId)", dismiss_src)
+        self.assertIn("clearView();", dismiss_src)
+        self.assertIn("agent.deferRequest(deferredId)", dismiss_src)
+        self.assertNotIn("agent.respond", dismiss_src)
+        self.assertNotIn("agent.respond", open_src)
+        clear_src = extract_function(APPROVAL, "clearView")
+        self.assertNotIn("deferRequest", clear_src)
+        self.assertNotIn("agent.respond", clear_src)
+        for name in ("accept", "reject"):
+            body = extract_function(APPROVAL, name)
+            self.assertIn("clearView();", body)
+            self.assertNotIn("dismiss();", body)
+            self.assertIn("agent.respond(requestId", body)
+        script = f"""
+const vm = require("vm");
+const calls = [];
+const agent = {{
+  surfaceRequest(id) {{ calls.push(["surface", id]); return "ui-1"; }},
+  deferRequest(id) {{ calls.push(["defer", id]); return "ui-2"; }},
+  respond(id, fields) {{ calls.push(["respond", id, fields]); return "ui-3"; }}
+}};
+const context = {{request: null, choiceIndex: 0, agent: agent,
+  deferredIds: {{}},
+  responseInput: {{text: ""}}, Qt: {{callLater(fn) {{}}}},
+  focusRequest() {{}}, restoreFocus() {{}}}};
+context.root = context;
+vm.createContext(context);
+for (const value of {json.dumps([open_src, dismiss_src, clear_src,
+                                 extract_function(APPROVAL, "noteDeferred"),
+                                 extract_function(APPROVAL, "isDeferred"),
+                                 extract_function(APPROVAL, "resetDeferred"),
+                                 extract_function(APPROVAL, "accept"),
+                                 extract_function(APPROVAL, "reject")])}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+context.openRequest({{id: "appr-1", method: "confirm", message: "approve?"}});
+if (context.request.id !== "appr-1") throw new Error("open did not adopt");
+if (context.isDeferred("appr-1")) throw new Error("fresh request pre-suppressed");
+context.dismiss();
+if (context.request !== null) throw new Error("dismiss did not clear the view");
+if (!context.isDeferred("appr-1")) throw new Error("dismiss did not record the id");
+// Accept/Reject answer without parking: no defer, no re-record.
+context.openRequest({{id: "appr-2", method: "confirm", message: "run?"}});
+context.accept();
+context.openRequest({{id: "appr-3", method: "confirm", message: "stop?"}});
+context.reject();
+console.log(JSON.stringify({{calls, deferred: context.deferredIds}}));
+"""
+        completed = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=8)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        result = json.loads(completed.stdout.splitlines()[-1])
+        self.assertEqual(result["calls"],
+                         [["surface", "appr-1"], ["defer", "appr-1"],
+                          ["surface", "appr-2"], ["respond", "appr-2", {"confirmed": True}],
+                          ["surface", "appr-3"], ["respond", "appr-3", {"cancelled": True}]])
+        self.assertEqual(result["deferred"], {"appr-1": True})
+
+    def test_deferred_request_never_force_opens(self):
+        # Item 10: a request deferred in this surface session must not
+        # force-open the palette or the dialog when the bridge
+        # round-robin re-surfaces it; NEW ids still surface immediately;
+        # reopening re-shows whatever is pending via openRequest.
+        handler = extract_function(PALETTE, "onUiRequest")
+        self.assertIn("approvalDialog.isDeferred(id)", handler)
+        self.assertIn("approvalDialog.openRequest(request)", handler)
+        self.assertIn("approvalDialog.resetDeferred()", PALETTE)
+        self.assertIn("onModeChanged", PALETTE)
+        script = f"""
+const vm = require("vm");
+const deferred = {{ "appr-1": true }};
+const events = [];
+const root = {{ requestedOpen: false,
+  open() {{ this.requestedOpen = true; events.push("open"); }} }};
+const agent = {{ pendingApproval: null }};
+const approvalDialog = {{
+  opened: [], closed: 0,
+  isDeferred(id) {{ return !!deferred[id]; }},
+  openRequest(r) {{ this.opened.push(r.id); }},
+  close() {{ this.closed += 1; }} }};
+const context = {{ root, agent, approvalDialog }};
+context.root = context.root;
+vm.createContext(context);
+const onUiRequest = vm.runInContext("(" + {json.dumps(handler)} + ")", context);
+context.onUiRequest = onUiRequest;
+// The just-deferred id echoes: no force-open, no dialog.
+context.onUiRequest({{id: "appr-1"}});
+if (root.requestedOpen) throw new Error("suppressed id opened the palette");
+if (approvalDialog.opened.length) throw new Error("suppressed id opened the dialog");
+// A NEW id surfaces immediately, opening the palette first.
+context.onUiRequest({{id: "appr-2"}});
+if (!root.requestedOpen) throw new Error("new id did not open the palette");
+if (approvalDialog.opened.join(",") !== "appr-2") throw new Error("new id did not surface");
+// Null with nothing pending closes; null with pending stays.
+agent.pendingApproval = null;
+context.onUiRequest(null);
+if (approvalDialog.closed !== 1) throw new Error("empty clear did not close");
+agent.pendingApproval = {{id: "appr-2"}};
+context.onUiRequest(null);
+if (approvalDialog.closed !== 1) throw new Error("pending clear closed over state");
+console.log(JSON.stringify({{events, opened: approvalDialog.opened}}));
+"""
+        completed = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=8)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        result = json.loads(completed.stdout.splitlines()[-1])
+        self.assertEqual(result, {"events": ["open"], "opened": ["appr-2"]})
 
     def test_retry_button_reachable_and_no_auto_loops(self):
         self.assertIn('text: "Retry"', PALETTE)

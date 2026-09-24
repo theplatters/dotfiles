@@ -11,6 +11,9 @@ PanelWindow {
     property string ssid: ""
     property bool requestedOpen: false
     property bool closing: false
+    // Single reveal progress (ControlCenter pattern): backdrop + card
+    // derive from it so an interrupted close reopens mid-fade.
+    property real reveal: 0
     
     signal passwordEntered(string password)
     signal canceled()
@@ -23,7 +26,7 @@ PanelWindow {
         right: true
     }
     
-    color: "transparent"
+    color: Theme.transparent
     visible: false
     
     // Make it stay on top
@@ -37,15 +40,13 @@ PanelWindow {
     Rectangle {
         id: backdrop
         anchors.fill: parent
-        color: "#B0070707"
-        opacity: 0
+        color: Theme.scrim
+        opacity: root.reveal
         
         MouseArea {
             anchors.fill: parent
-            onClicked: {
-                root.dismiss();
-                root.canceled();
-            }
+            enabled: root.requestedOpen && !root.closing
+            onClicked: root.cancelAndClose()
         }
     }
 
@@ -58,8 +59,9 @@ PanelWindow {
         radius: Theme.cardRadius
         border.color: Theme.border
         border.width: 1
-        opacity: 0
-        scale: 0.98
+        opacity: root.reveal
+        scale: 0.96 + 0.04 * root.reveal
+        transformOrigin: Item.Center
         enabled: root.requestedOpen && !root.closing
         
         // Prevent clicks from closing the popup
@@ -124,10 +126,7 @@ PanelWindow {
                 Button {
                     text: "Cancel"
                     Layout.fillWidth: true
-                    onClicked: {
-                        root.canceled();
-                        root.dismiss();
-                    }
+                    onClicked: root.cancelAndClose()
                     
                     contentItem: Text {
                         text: parent.text
@@ -178,15 +177,25 @@ PanelWindow {
         passwordField.text = "";
     }
 
+    // One external dismissal path: notify the requester and clear the
+    // field exactly once (no double-cancel during the exit fade).
+    function cancelAndClose() {
+        if (!root.requestedOpen || root.closing) return false;
+        root.canceled();
+        root.dismiss();
+        return true;
+    }
+
     function setOpen(open) {
         requestedOpen = open;
         if (open) {
             closing = false;
             exitMotion.stop();
-            backdrop.opacity = 0;
-            card.opacity = 0;
-            card.scale = 0.98;
             if (!visible) visible = true;
+            // Already open and steady: keep the frame (no reset/flash).
+            if (root.reveal >= 0.99 && enterMotion.running === false) return;
+            // Otherwise reverse from the current reveal value. Never
+            // assign a fresh start while partially visible.
             enterMotion.restart();
         } else if (visible && !closing) {
             closing = true;
@@ -196,20 +205,34 @@ PanelWindow {
         }
     }
 
-    ParallelAnimation {
-        id: enterMotion
-        NumberAnimation { target: backdrop; property: "opacity"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
-        NumberAnimation { target: card; property: "opacity"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
-        NumberAnimation { target: card; property: "scale"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
+    Shortcut {
+        sequence: "Escape"
+        onActivated: root.cancelAndClose()
     }
 
-    SequentialAnimation {
+    // Single-progress motion (ControlCenter pattern): enter/exit animate
+    // reveal to 1/0 from the current value (interrupted close reopens
+    // mid-fade, never resets). No spring/overshoot: OutCubic in, InCubic
+    // out.
+    NumberAnimation {
+        id: enterMotion
+        target: root
+        property: "reveal"
+        to: 1
+        duration: Theme.motionPanel
+        easing.type: Easing.OutCubic
+    }
+
+    NumberAnimation {
         id: exitMotion
-        ParallelAnimation {
-            NumberAnimation { target: backdrop; property: "opacity"; to: 0; duration: Theme.motionExit; easing.type: Easing.InCubic }
-            NumberAnimation { target: card; property: "opacity"; to: 0; duration: Theme.motionExit; easing.type: Easing.InCubic }
-            NumberAnimation { target: card; property: "scale"; to: 0.98; duration: Theme.motionExit; easing.type: Easing.InCubic }
+        target: root
+        property: "reveal"
+        to: 0
+        duration: Theme.motionExit
+        easing.type: Easing.InCubic
+        onFinished: {
+            if (!root.requestedOpen) root.visible = false;
+            root.closing = false;
         }
-        ScriptAction { script: { if (!root.requestedOpen) root.visible = false; root.closing = false; } }
     }
 }

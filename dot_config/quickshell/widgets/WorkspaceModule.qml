@@ -76,7 +76,7 @@ Item {
 
                     width: 30
                     height: 24
-                    color: isFocused ? Theme.surface2 : (hovered ? Theme.surface0 : "transparent")
+                    color: isFocused ? Theme.surface2 : (hovered ? Theme.surface0 : Theme.transparent)
                     radius: Theme.controlRadius
                     clip: true
 
@@ -148,7 +148,7 @@ Item {
 
                     width: 32
                     height: 26
-                    color: isFocused ? modelData.color : (hovered ? Theme.surface0 : "transparent")
+                    color: isFocused ? modelData.color : (hovered ? Theme.surface0 : Theme.transparent)
                     radius: Theme.controlRadius
                     clip: true
 
@@ -160,7 +160,7 @@ Item {
                         font.pixelSize: 14
                         font.bold: isFocused
                         
-                        Behavior on color { ColorAnimation { duration: 200 } }
+                        Behavior on color { ColorAnimation { duration: Theme.motionPanel } }
                     }
 
                     MouseArea {

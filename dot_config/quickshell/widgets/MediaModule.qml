@@ -14,6 +14,12 @@ Item {
 
     property var mediaPopout: null
     property bool compact: false
+    // True while any transport/title control is hovered. The bar capsule
+    // uses this (plus its own background hover) for a flicker-free
+    // highlight: inner MouseAreas sit above the capsule toggle, so the
+    // background alone would lose hover over the controls.
+    readonly property bool hovered: titleMouse.containsMouse || prevMouse.containsMouse
+        || playMouse.containsMouse || nextMouse.containsMouse
 
     readonly property var players: Mpris.players.values
     readonly property var activePlayer: players.find(player => player.isPlaying)
@@ -69,7 +75,9 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
 
             MouseArea {
+                id: titleMouse
                 anchors.fill: parent
+                hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
                     if (root.mediaPopout) {
@@ -91,8 +99,10 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
 
                 MouseArea {
+                    id: prevMouse
                     anchors.fill: parent
                     enabled: root.activePlayer && root.activePlayer.canGoPrevious
+                    hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.control("previous")
                 }
@@ -106,8 +116,10 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
 
                 MouseArea {
+                    id: playMouse
                     anchors.fill: parent
                     enabled: root.activePlayer && root.activePlayer.canTogglePlaying
+                    hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.control("play-pause")
                 }
@@ -121,8 +133,10 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
 
                 MouseArea {
+                    id: nextMouse
                     anchors.fill: parent
                     enabled: root.activePlayer && root.activePlayer.canGoNext
+                    hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.control("next")
                 }

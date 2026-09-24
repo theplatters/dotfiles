@@ -357,7 +357,9 @@ class ResumePaletteTests(unittest.TestCase):
                ("selectedResumeEntry", "resumePlanForSelection", "requestResumePlanForSelection",
                 "resumePreviewText", "resumeSelectedProject", "askResumeProject",
                 "historyResumeProject", "startResumeExecute", "validResumeExecutePayload",
-                "resumeExecuteSummary", "finishResumeExecute")}
+                "resumeExecuteSummary", "finishResumeExecute", "resumeOperationKinds",
+                "resumeAvailableKinds", "isResumeConfirmCurrent", "openResumeConfirm",
+                "cancelResumeConfirm", "toggleResumeConfirmOperation", "confirmResumeExecute")}
         script = f"""
 const vm = require("vm");
 const plan = {{version: 1,
@@ -367,12 +369,20 @@ const plan = {{version: 1,
   files: [{{relative: "src/a.py"}}, {{relative: "src/b.py"}}],
   repository: {{available: true, branch: "main"}},
   logseq: {{available: true, page: "Demo", path: "pages/Demo.md", open_count: 2}},
-  pi_session: {{available: true}}, operations: []}};
+  pi_session: {{available: true}},
+  operations: [
+    {{id: "focus_workspace", kind: "focus_workspace", available: true}},
+    {{id: "open_editor", kind: "open_editor", available: true}},
+    {{id: "open_terminal", kind: "open_terminal", available: true}},
+    {{id: "open_logseq_page", kind: "open_logseq_page", available: true}},
+    {{id: "open_project_agent", kind: "open_project_agent", available: true}}]}};
 const context = {{
   mode: "resume", selectedIndex: 0, requestedOpen: true, notice: "",
   rows: [{{kind: "resume", payload: {{id: "p1", name: "Demo"}}}}],
   resumeExecuteBusy: false, resumeExecuteGeneration: 0, resumeExecuteProcessGeneration: 0,
   resumeExecuteProjectId: "", resumeExecuteProcessProjectId: "",
+  resumeConfirming: false, resumeConfirmProjectId: "",
+  resumeConfirmKinds: [], resumeConfirmSelected: [],
   resumeExecuteProcess: {{running: false, command: []}},
   resumeExecuteTimeout: {{restart() {{}}, stop() {{}}}},
   Quickshell: {{shellPath(v) {{ return v; }}}},
@@ -398,30 +408,46 @@ if (!out.preview.includes("Demo") || !out.preview.includes("Files: src/a.py")
     || !out.preview.includes("Repo: main") || !out.preview.includes("Logseq: Demo")
     || !out.preview.includes("TODOs: 2 open") || !out.preview.includes("Pi session: saved"))
   throw new Error("preview missing fields: " + out.preview);
-// Ask/History hand off without desktop execution.
+// Ask/History hand off without desktop execution and without the overlay.
 context.askResumeProject();
 context.historyResumeProject();
 out.handoffs = context.handoffs.slice();
 if (out.handoffs[0][0] !== "p1" || out.handoffs[0][1] !== "ask") throw new Error("ask handoff broken");
 if (out.handoffs[1][0] !== "p1" || out.handoffs[1][1] !== "history") throw new Error("history handoff broken");
-// Default Enter with a loaded plan starts backend execute.
+if (context.resumeConfirming) throw new Error("ask/history must not open the confirm overlay");
+// Default Enter with a loaded plan opens the confirm overlay (all
+// selected by default) and never executes until confirmed.
 context.handoffs = [];
-if (!context.resumeSelectedProject()) throw new Error("resume did not start");
+if (!context.resumeSelectedProject()) throw new Error("resume did not open confirm");
+if (!context.resumeConfirming) throw new Error("confirm overlay did not open");
+if (context.resumeExecuteProcess.running) throw new Error("confirm opened but backend executed early");
+if (JSON.stringify(context.resumeConfirmSelected) !== JSON.stringify(context.resumeAvailableKinds(plan)))
+  throw new Error("confirm did not default to all available: " + JSON.stringify(context.resumeConfirmSelected));
+// Confirming executes with the --operations subset.
+if (!context.confirmResumeExecute()) throw new Error("confirm did not execute");
+if (context.resumeConfirming) throw new Error("confirm overlay did not close on execute");
 if (context.resumeExecuteProcess.command.join(" ").indexOf("desktop_resume.py") < 0
     || !context.resumeExecuteProcess.command.includes("execute")
     || !context.resumeExecuteProcess.command.includes("p1"))
   throw new Error("execute did not use stable UUID argv");
+if (!context.resumeExecuteProcess.command.includes("--operations"))
+  throw new Error("confirmed execute omitted --operations csv");
+out.cmd = context.resumeExecuteProcess.command.slice();
 // No-plan Enter requests the plan and shows Loading, never executes.
 context.dataSources.resumePlan = null;
 context.resumeExecuteProcess.running = false;
+context.resumeExecuteProcess.command = [];
 context.dataSources.requested = "";
 context.notice = "";
 context.resumeExecuteBusy = false;
+context.resumeExecuteLaunched = false; context.resumeExecuteStarted = false;
+context.resumeExecuteRetiring = false;
+context.resumeConfirming = false;
 if (context.resumeSelectedProject()) throw new Error("resumed without a plan");
 if (context.dataSources.requested !== "p1" || context.notice !== "Loading project plan…")
   throw new Error("missing plan was not requested as Loading");
 console.log(JSON.stringify({{selected: out.selected, handoffs: out.handoffs,
-  cmd: context.resumeExecuteProcess.command, notice: context.notice}}));
+  cmd: out.cmd, notice: context.notice}}));
 """
         value = self.run_node(script)
         self.assertEqual(value["selected"], "p1")
@@ -479,6 +505,7 @@ const context = {{
   requestedOpen: true, notice: "", resumeExecuteBusy: true,
   resumeExecuteGeneration: 3, resumeExecuteProcessGeneration: 3,
   resumeExecuteProjectId: "p1", resumeExecuteProcessProjectId: "p1",
+  resumeExecuteLaunched: true, resumeExecuteStarted: true, resumeExecuteRetiring: false,
   resumeExecuteTimeout: {{stop() {{}}}},
   handoffs: [],
   handoffToProjectPlanner(pid, act, msg) {{ this.handoffs.push([pid, act, msg || ""]); }},
@@ -505,6 +532,7 @@ if (!context.handoffs[0][2] || context.handoffs[0][2].indexOf("1 failed") < 0)
 // Mismatched result id never hands off.
 context.handoffs = [];
 context.resumeExecuteBusy = true;
+context.resumeExecuteLaunched = true; context.resumeExecuteStarted = true;
 context.finishResumeExecute(0, JSON.stringify({{project: {{id: "p2"}}, results: []}}), 3, "p1");
 if (context.handoffs.length !== 0) throw new Error("mismatched project id handed off");
 console.log(JSON.stringify({{summary, handoffs: context.handoffs}}));
@@ -524,6 +552,7 @@ const context = {{
   requestedOpen: true, notice: "", resumeExecuteBusy: true,
   resumeExecuteGeneration: 3, resumeExecuteProcessGeneration: 3,
   resumeExecuteProjectId: "p1", resumeExecuteProcessProjectId: "p1",
+  resumeExecuteLaunched: true, resumeExecuteStarted: true, resumeExecuteRetiring: false,
   resumeExecuteTimeout: {{stop() {{}}}},
   handoffs: [],
   handoffToProjectPlanner(pid, act, msg) {{ this.handoffs.push([pid, act, msg || ""]); }},
@@ -537,7 +566,11 @@ for (const value of {json.dumps(list(fns.values()))}) {{
 context.finishResumeExecute(0, JSON.stringify({{project: {{id: "p1"}}, results: []}}), 3, "p1");
 if (context.handoffs.length !== 1 || context.handoffs[0][0] !== "p1" || context.handoffs[0][1] !== "resume")
   throw new Error("execute success did not hand off to planner");
+if (context.resumeExecuteLaunched) throw new Error("owned exit did not consume ownership");
 context.handoffs = [];
+// A second owned flight reports failure the same way.
+context.resumeExecuteBusy = true;
+context.resumeExecuteLaunched = true; context.resumeExecuteStarted = true;
 context.finishResumeExecute(1, "{{}}", 3, "p1");
 if (context.notice !== "Resume failed") throw new Error("execute failure was not surfaced");
 console.log(JSON.stringify({{handoffs: context.handoffs, notice: context.notice}}));
@@ -546,13 +579,15 @@ console.log(JSON.stringify({{handoffs: context.handoffs, notice: context.notice}
         self.assertEqual(value["notice"], "Resume failed")
 
     def test_execute_close_invalidates_delayed_completion(self):
-        # The palette close() (not the IpcHandler stub) must bump the
+        # close() must retire (never clear) an owned launch and bump the
         # execute generation before stopping the process.
         close_start = PALETTE_TEXT.rindex("    function close() {")
         close_fn = PALETTE_TEXT[close_start:close_start + 2000]
-        self.assertIn("resumeExecuteGeneration++", close_fn)
-        # close must bump before stopping so a delayed exit is stale.
-        self.assertLess(close_fn.index("resumeExecuteGeneration++"),
+        self.assertIn("resumeExecuteRetiring = true", close_fn)
+        self.assertNotIn("resumeExecuteLaunched = false", close_fn)
+        self.assertNotIn("resumeExecuteStarted = false", close_fn)
+        # close must retire before stopping so a delayed exit is stale.
+        self.assertLess(close_fn.index("resumeExecuteRetiring = true"),
                         close_fn.index("resumeExecuteProcess.running = false"))
         fns = {n: extract_function(PALETTE_TEXT, n) for n in
                ("finishResumeExecute", "validResumeExecutePayload", "resumeExecuteSummary")}
@@ -562,6 +597,7 @@ const context = {{
   requestedOpen: true, notice: "", resumeExecuteBusy: true,
   resumeExecuteGeneration: 4, resumeExecuteProcessGeneration: 4,
   resumeExecuteProjectId: "p1", resumeExecuteProcessProjectId: "p1",
+  resumeExecuteLaunched: true, resumeExecuteStarted: true, resumeExecuteRetiring: false,
   resumeExecuteTimeout: {{stop() {{}}}},
   handoffs: [],
   handoffToProjectPlanner(pid, act, msg) {{ this.handoffs.push([pid, act]); }},
@@ -572,15 +608,20 @@ for (const value of {json.dumps(list(fns.values()))}) {{
   const fn = vm.runInContext("(" + value + ")", context);
   context[fn.name] = fn;
 }}
-// Simulate close(): generation bumped before stop, then reopen.
+// Simulate close(): retire (never clear) the owned launch, bump the
+// generation, stop, clear busy — then reopen.
+context.resumeExecuteRetiring = true;
 context.resumeExecuteGeneration++;
 context.requestedOpen = false;
 context.resumeExecuteBusy = false;
 context.requestedOpen = true;
 context.resumeExecuteGeneration++;
-// Delayed old completion (generation 4) must be stale after reopen.
+// Delayed old completion (generation 4) is stale-consumed: no handoff,
+// and ownership is freed so a retry is allowed again.
 context.finishResumeExecute(0, JSON.stringify({{project: {{id: "p1"}}, results: []}}), 4, "p1");
 if (context.handoffs.length !== 0) throw new Error("close/reopen did not invalidate delayed completion");
+if (context.resumeExecuteLaunched || context.resumeExecuteRetiring)
+  throw new Error("stale exit did not consume ownership");
 console.log(JSON.stringify({{handoffs: context.handoffs}}));
 """
         value = self.run_node(script)
@@ -593,7 +634,7 @@ console.log(JSON.stringify({{handoffs: context.handoffs}}));
         self.assertIn("Resuming…", PALETTE_TEXT)
         self.assertIn("Resume", PALETTE_TEXT)
         self.assertIn('text: "Ask Pi"', PALETTE_TEXT)
-        self.assertIn('text: "History"', PALETTE_TEXT)
+        self.assertIn('text: "Open history"', PALETTE_TEXT)
         self.assertIn("root.projectPlanningRequested(pid, act", PALETTE_TEXT)
         self.assertIn("function onProjectPlanningRequested(projectId, action", SHELL)
         self.assertIn("projectPlanner.openProject(projectId, action", SHELL)
@@ -603,6 +644,703 @@ console.log(JSON.stringify({{handoffs: context.handoffs}}));
         block = source[source.index("function rebuildModel("):source.index("function rebuild(")]
         self.assertIn('root.mode === "resume"', block)
         self.assertIn("dataSources.resumeRows", block)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class ResumeConfirmOverlayTests(unittest.TestCase):
+    def run_node(self, script):
+        completed = subprocess.run(["node", "-e", script], text=True, capture_output=True)
+        if completed.returncode:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+
+    def palette_fns(self, *names):
+        return {n: extract_function(PALETTE_TEXT, n) for n in names}
+
+    def make_context_script(self, fns, plan_ops, selected_id="p1", plan_id="p1",
+                            selected_extra="", confirm_selected=None):
+        # Builds a node preamble with a resume-mode root + plan. The caller
+        # appends assertions; the preamble ends with the vm wiring done.
+        confirm_selected_js = "null" if confirm_selected is None else json.dumps(confirm_selected)
+        return f"""
+const vm = require("vm");
+const planOps = {json.dumps(plan_ops)};
+const plan = {{version: 1, project: {{id: {json.dumps(plan_id)}, name: "Demo"}},
+  session: null, session_reason: "no work session",
+  files: [], repository: {{available: false}}, logseq: {{available: false, reason: "x"}},
+  pi_session: {{available: false}}, operations: planOps}};
+const context = {{
+  mode: "resume", selectedIndex: 0, requestedOpen: true, notice: "",
+  rows: [{{kind: "resume", payload: {{id: {json.dumps(selected_id)}, name: "Demo"}}}}],
+  resumeExecuteBusy: false, resumeExecuteGeneration: 7, resumeExecuteProcessGeneration: 7,
+  resumeExecuteProjectId: "", resumeExecuteProcessProjectId: "",
+  resumeExecuteLaunched: false, resumeExecuteStarted: false, resumeExecuteRetiring: false,
+  resumeConfirming: false, resumeConfirmProjectId: "",
+  resumeConfirmKinds: [], resumeConfirmSelected: [],
+  resumeExecuteProcess: {{running: false, command: []}},
+  resumeExecuteTimeout: {{restart() {{}}, stop() {{}}}},
+  Quickshell: {{shellPath(v) {{ return v; }}}},
+  dataSources: {{
+    resumePlan: plan, resumePlanProjectId: {json.dumps(plan_id)},
+    resumePlanBusy: false, resumePlanError: "",
+    ensureResumePlan(id) {{ this.requested = id; return true; }},
+  }},
+}};
+context.root = context;
+vm.createContext(context);
+for (const value of {json.dumps(list(fns.values()))}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+  context.root[fn.name] = fn;
+}}
+"""
+
+    def test_allowlist_canonical_order_and_available_filter(self):
+        fns = self.palette_fns("resumeOperationKinds", "resumeAvailableKinds",
+                               "selectedResumeEntry", "resumePlanForSelection")
+        script = self.make_context_script(fns, [
+            {"id": "open_terminal", "kind": "open_terminal", "available": True},
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": False, "reason": "kitty is not available"},
+            {"id": "bogus_kind", "kind": "bogus_kind", "available": True},
+            {"id": "open_project_agent", "kind": "open_project_agent", "available": True},
+        ])
+        script += """
+const order = context.resumeOperationKinds();
+if (JSON.stringify(order) !== JSON.stringify(["focus_workspace", "open_editor", "open_terminal", "open_logseq_page", "open_project_agent"]))
+  throw new Error("allowlist/canonical order wrong: " + JSON.stringify(order));
+const avail = context.resumeAvailableKinds(context.dataSources.resumePlan);
+if (JSON.stringify(avail) !== JSON.stringify(["focus_workspace", "open_terminal", "open_project_agent"]))
+  throw new Error("available filter/order wrong: " + JSON.stringify(avail));
+console.log(JSON.stringify({order, avail}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["order"], ["focus_workspace", "open_editor", "open_terminal",
+                                          "open_logseq_page", "open_project_agent"])
+        self.assertEqual(value["avail"], ["focus_workspace", "open_terminal", "open_project_agent"])
+
+    def test_open_defaults_all_selected_and_never_renders_params(self):
+        for name in ("openResumeConfirm", "cancelResumeConfirm", "confirmResumeExecute",
+                     "toggleResumeConfirmOperation", "isResumeConfirmCurrent",
+                     "resumeOperationKinds", "resumeAvailableKinds"):
+            self.assertIn("function " + name + "(", PALETTE_TEXT)
+        for name in ("resumeOperationKinds", "resumeAvailableKinds", "openResumeConfirm",
+                     "toggleResumeConfirmOperation", "confirmResumeExecute"):
+            body = extract_function(PALETTE_TEXT, name)
+            self.assertNotIn("params", body)
+            self.assertNotIn("content", body)
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": True},
+            {"id": "open_terminal", "kind": "open_terminal", "available": False, "reason": "no kitty"},
+        ])
+        script += """
+if (!context.openResumeConfirm()) throw new Error("open failed");
+if (!context.resumeConfirming) throw new Error("overlay did not open");
+if (context.resumeConfirmProjectId !== "p1") throw new Error("snapshot id wrong");
+if (JSON.stringify(context.resumeConfirmKinds) !== JSON.stringify(["focus_workspace", "open_editor"]))
+  throw new Error("snapshot kinds wrong: " + JSON.stringify(context.resumeConfirmKinds));
+if (JSON.stringify(context.resumeConfirmSelected) !== JSON.stringify(["focus_workspace", "open_editor"]))
+  throw new Error("default is not all selected: " + JSON.stringify(context.resumeConfirmSelected));
+console.log(JSON.stringify({kinds: context.resumeConfirmKinds, selected: context.resumeConfirmSelected}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["selected"], ["focus_workspace", "open_editor"])
+
+    def test_subset_argv_canonical_order(self):
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": True},
+            {"id": "open_terminal", "kind": "open_terminal", "available": True},
+            {"id": "open_logseq_page", "kind": "open_logseq_page", "available": True},
+            {"id": "open_project_agent", "kind": "open_project_agent", "available": True},
+        ])
+        script += """
+if (!context.openResumeConfirm()) throw new Error("open failed");
+// Deselect in reverse order; stored selection must stay canonical.
+if (!context.toggleResumeConfirmOperation("open_terminal")) throw new Error("toggle off failed");
+if (!context.toggleResumeConfirmOperation("focus_workspace")) throw new Error("toggle off failed");
+if (JSON.stringify(context.resumeConfirmSelected) !== JSON.stringify(["open_editor", "open_logseq_page", "open_project_agent"]))
+  throw new Error("toggle order wrong: " + JSON.stringify(context.resumeConfirmSelected));
+// Toggle one back on; canonical order restored.
+if (!context.toggleResumeConfirmOperation("focus_workspace")) throw new Error("toggle on failed");
+if (!context.confirmResumeExecute()) throw new Error("confirm failed");
+const cmd = context.resumeExecuteProcess.command;
+const at = cmd.indexOf("--operations");
+if (at < 0) throw new Error("subset execute omitted --operations");
+if (cmd[at + 1] !== "focus_workspace,open_editor,open_logseq_page,open_project_agent")
+  throw new Error("csv not canonical: " + cmd[at + 1]);
+if (cmd.slice(0, 4).join(" ") !== "python3 scripts/desktop_resume.py execute --project".replace("scripts/desktop_resume.py", "scripts/desktop_resume.py"))
+  throw new Error("argv head wrong: " + JSON.stringify(cmd));
+console.log(JSON.stringify({cmd}));
+"""
+        value = self.run_node(script)
+        at = value["cmd"].index("--operations")
+        self.assertGreater(at, 0)
+        self.assertEqual(value["cmd"][at + 1],
+                         "focus_workspace,open_editor,open_logseq_page,open_project_agent")
+        self.assertEqual(value["cmd"][:4][0], "python3")
+        self.assertIn("execute", value["cmd"])
+
+    def test_empty_selection_disallowed_and_cancel_never_executes(self):
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": True},
+        ])
+        script += """
+if (!context.openResumeConfirm()) throw new Error("open failed");
+context.toggleResumeConfirmOperation("focus_workspace");
+context.toggleResumeConfirmOperation("open_editor");
+if (context.resumeConfirmSelected.length !== 0) throw new Error("deselect-all failed");
+if (context.confirmResumeExecute()) throw new Error("empty confirm executed");
+if (context.notice !== "Select at least one operation") throw new Error("empty notice wrong: " + context.notice);
+if (!context.resumeConfirming) throw new Error("empty confirm closed the overlay");
+if (context.resumeExecuteProcess.running || context.resumeExecuteProcess.command.length !== 0)
+  throw new Error("empty confirm started the backend");
+// Cancel clears the snapshot and never executes.
+context.cancelResumeConfirm();
+if (context.resumeConfirming) throw new Error("cancel did not close");
+if (context.resumeConfirmProjectId !== "" || context.resumeConfirmKinds.length !== 0)
+  throw new Error("cancel did not clear snapshot");
+if (context.resumeExecuteProcess.running || context.resumeExecuteProcess.command.length !== 0)
+  throw new Error("cancel executed the backend");
+// Direct start with an empty subset is also rejected.
+if (context.startResumeExecute("p1", [])) throw new Error("empty start executed");
+console.log(JSON.stringify({notice: context.notice}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["notice"], "Select at least one operation")
+
+    def test_stale_selection_plan_and_close_cancel_safely(self):
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": True},
+        ])
+        script += """
+if (!context.openResumeConfirm()) throw new Error("open failed");
+// Stale selection: user moved to another project.
+context.rows = [{kind: "resume", payload: {id: "p2"}}];
+if (context.confirmResumeExecute()) throw new Error("stale selection executed");
+if (context.resumeConfirming) throw new Error("stale selection did not cancel");
+if (context.resumeExecuteProcess.command.length !== 0) throw new Error("stale selection started backend");
+// Stale plan: same selection, different cached plan project.
+context.rows = [{kind: "resume", payload: {id: "p1"}}];
+context.dataSources.resumePlan = {version: 1, project: {id: "p2"}, operations: []};
+context.dataSources.resumePlanProjectId = "p2";
+context.resumeConfirming = true; context.resumeConfirmProjectId = "p1";
+context.resumeConfirmKinds = ["focus_workspace"]; context.resumeConfirmSelected = ["focus_workspace"];
+if (context.confirmResumeExecute()) throw new Error("stale plan executed");
+if (context.resumeConfirming) throw new Error("stale plan did not cancel");
+// Toggle while stale also cancels safely.
+context.resumeConfirming = true; context.resumeConfirmProjectId = "p1";
+context.resumeConfirmKinds = ["focus_workspace"]; context.resumeConfirmSelected = ["focus_workspace"];
+context.rows = [{kind: "resume", payload: {id: "p9"}}];
+if (context.toggleResumeConfirmOperation("focus_workspace")) throw new Error("stale toggle mutated");
+if (context.resumeConfirming) throw new Error("stale toggle did not cancel");
+console.log(JSON.stringify({ok: true}));
+"""
+        value = self.run_node(script)
+        self.assertTrue(value["ok"])
+
+    def test_unavailable_operations_not_executable(self):
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": False, "reason": "kitty is not available"},
+        ])
+        script += """
+if (!context.openResumeConfirm()) throw new Error("open failed");
+if (context.resumeConfirmKinds.includes("open_editor")) throw new Error("unavailable kind listed");
+if (context.toggleResumeConfirmOperation("open_editor")) throw new Error("unavailable toggle accepted");
+// Force-select an unavailable kind; confirm must refuse without executing.
+context.resumeConfirmSelected = ["focus_workspace", "open_editor"];
+if (context.confirmResumeExecute()) throw new Error("unavailable confirm executed");
+if (context.resumeExecuteProcess.command.length !== 0) throw new Error("unavailable started backend");
+// Unknown kinds are rejected the same way.
+context.resumeConfirmSelected = ["focus_workspace", "bogus_kind"];
+if (context.confirmResumeExecute()) throw new Error("unknown kind executed");
+console.log(JSON.stringify({notice: context.notice}));
+"""
+        value = self.run_node(script)
+        self.assertIn(value["notice"], ("Unavailable operation selected", "Unknown operation"))
+
+    def test_keyboard_overlay_guards_and_power_overlay_distinct(self):
+        source = PALETTE_TEXT
+        # Resume overlay state is distinct from the power-action overlay.
+        for token in ("resumeConfirming", "resumeConfirmProjectId",
+                      "resumeConfirmKinds", "resumeConfirmSelected",
+                      "openResumeConfirm", "cancelResumeConfirm",
+                      "toggleResumeConfirmOperation", "confirmResumeExecute",
+                      "resumeOperationKinds", "resumeAvailableKinds",
+                      "isResumeConfirmCurrent"):
+            self.assertIn(token, source)
+        self.assertIn("property bool confirming:", source)
+        self.assertIn("property string confirmationAction:", source)
+        for name in ("openResumeConfirm", "cancelResumeConfirm",
+                     "toggleResumeConfirmOperation", "confirmResumeExecute",
+                     "resumeAvailableKinds"):
+            body = extract_function(source, name)
+            self.assertNotIn("confirmationAction", body)
+            self.assertNotIn("runAction", body)
+        # Power-action flow is untouched.
+        activate = extract_function(source, "activate")
+        self.assertIn("resumeConfirming", activate)
+        self.assertIn("confirmResumeExecute", activate)
+        # Both input and card route through the shared dispatch.
+        self.assertIn("function paletteKeyPressed(", source)
+        input_start = source.index("id: input")
+        input_block = source[input_start:input_start + 3000]
+        self.assertIn("root.paletteKeyPressed(event)", input_block)
+        card_start = source.index("id: card")
+        card_block = source[card_start:card_start + 2500]
+        self.assertIn("root.paletteKeyPressed(event)", card_block)
+        # Overlay UI: bounded scrollable toggle list with fixed actions,
+        # kind labels only (no param payload rendering).
+        self.assertIn("resumeConfirmList", source)
+        self.assertIn("ScrollBar.vertical", source)
+        self.assertIn("resumeConfirmList.contentHeight", source)
+        self.assertNotIn("resumeConfirmRepeater", source)
+        self.assertIn("resumeConfirmSelected", source)
+        self.assertIn('objectName: "resumeConfirmButton"', source)
+        self.assertIn('objectName: "resumeConfirmCancelButton"', source)
+        self.assertIn("Select operations to resume", source)
+        self.assertIn("--operations", source)
+        overlay_start = source.index("Resume confirm overlay")
+        overlay_block = source[overlay_start:overlay_start + 5000]
+        self.assertNotIn(".params", overlay_block)
+        # Stale/close guards clear the snapshot without executing.
+        move_fn = extract_function(source, "moveSelection")
+        self.assertIn("cancelResumeConfirm", move_fn)
+        rebuild_fn = extract_function(source, "rebuild")
+        self.assertIn("resumeConfirm", rebuild_fn)
+        open_start = source.index("    function open() {")
+        open_fn = source[open_start:open_start + 2500]
+        self.assertIn("resumeConfirm", open_fn)
+        close_start = source.rindex("    function close() {")
+        close_fn = source[close_start:close_start + 2500]
+        self.assertIn("resumeConfirming = false", close_fn)
+        # Ask/History never touch the overlay.
+        for fn_name in ("askResumeProject", "historyResumeProject"):
+            body = extract_function(source, fn_name)
+            self.assertNotIn("resumeConfirm", body)
+            self.assertNotIn("--operations", body)
+
+    def test_execute_gap_latch_blocks_relaunch(self):
+        # Quickshell flips Process.running to false BEFORE onExited, so a
+        # running-only gate would allow a relaunch while the old exit is
+        # still unconsumed. The ownership latch (launched/retiring) must
+        # block every confirm-flow entry point during that gap.
+        start_fn = extract_function(PALETTE_TEXT, "startResumeExecute")
+        self.assertIn("resumeExecuteLaunched", start_fn)
+        self.assertIn("resumeExecuteRetiring", start_fn)
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+            {"id": "open_editor", "kind": "open_editor", "available": True},
+        ])
+        script += """
+// Simulate the gap: owned launch exited at the process level (running
+// false, started true) but onExited not yet consumed.
+context.resumeExecuteBusy = true;
+context.resumeExecuteLaunched = true; context.resumeExecuteStarted = true;
+context.resumeExecuteProcess.running = false;
+if (context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("gap relaunch started");
+if (context.openResumeConfirm()) throw new Error("gap opened confirm");
+if (context.resumeExecuteProcess.command.length !== 0) throw new Error("gap issued backend argv");
+// A confirm opened before the gap refuses but keeps its snapshot for
+// retry once the exit arrives.
+context.resumeExecuteBusy = false;
+context.resumeExecuteLaunched = false; context.resumeExecuteStarted = false;
+if (!context.openResumeConfirm()) throw new Error("open failed");
+context.resumeExecuteLaunched = true; context.resumeExecuteStarted = true;
+context.resumeExecuteProcess.running = false;
+if (context.confirmResumeExecute()) throw new Error("gap confirm executed");
+if (!context.resumeConfirming) throw new Error("gap confirm dropped the snapshot");
+if (context.resumeExecuteProcess.command.length !== 0) throw new Error("gap confirm issued argv");
+console.log(JSON.stringify({notice: context.notice, confirming: context.resumeConfirming}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["notice"], "Resuming project…")
+        self.assertTrue(value["confirming"])
+
+    def test_timeout_retires_and_stale_exit_consumes_ownership(self):
+        # Timeout retires (never clears) the owned launch: retry stays
+        # blocked until the delayed exit arrives. The exit is read through
+        # the actual immutable process identity (the reviewer's repro
+        # shape): stale, so no handoff — but ownership is consumed, which
+        # unblocks the retry. The retry's own exit then hands off.
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute", "cancelResumeExecute",
+                               "finishResumeExecute", "validResumeExecutePayload",
+                               "resumeExecuteSummary")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+        ])
+        script += """
+context.handoffs = [];
+context.handoffToProjectPlanner = (pid, act, msg) => { context.handoffs.push([pid, act, msg || ""]); };
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("initial start failed");
+// Spawned (started) launch whose exit is still pending at the watchdog.
+context.resumeExecuteStarted = true;
+context.resumeExecuteProcess.running = false;
+context.cancelResumeExecute();
+if (context.resumeExecuteBusy) throw new Error("timeout did not clear busy");
+if (!context.resumeExecuteLaunched || !context.resumeExecuteRetiring)
+  throw new Error("timeout cleared ownership instead of retiring");
+if (context.notice !== "Resume timed out; retry") throw new Error("timeout notice wrong: " + context.notice);
+if (context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("retry slipped in before the old exit");
+// Delayed old exit, tagged with the actual immutable process identity:
+// stale, so no handoff — but it consumes ownership and unblocks retry.
+context.finishResumeExecute(0, JSON.stringify({project: {id: "p1"}, results: []}),
+  context.resumeExecuteProcessGeneration, context.resumeExecuteProcessProjectId);
+if (context.handoffs.length !== 0) throw new Error("stale exit handed off");
+if (context.resumeExecuteLaunched || context.resumeExecuteRetiring)
+  throw new Error("stale exit did not consume ownership");
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("retry blocked after stale consume");
+context.resumeExecuteStarted = true;
+context.finishResumeExecute(0, JSON.stringify({project: {id: "p1"}, results: []}),
+  context.resumeExecuteProcessGeneration, context.resumeExecuteProcessProjectId);
+if (context.handoffs.length !== 1) throw new Error("retry exit did not hand off");
+console.log(JSON.stringify({handoffs: context.handoffs}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(len(value["handoffs"]), 1)
+
+    def test_close_retires_and_stale_exit_consumes_ownership(self):
+        # close() retires (never clears) the owned launch: reopen retry
+        # stays blocked until the delayed exit arrives stale. Uses the
+        # actual immutable process identity throughout.
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute", "finishResumeExecute",
+                               "validResumeExecutePayload", "resumeExecuteSummary")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+        ])
+        script += """
+context.handoffs = [];
+context.handoffToProjectPlanner = (pid, act, msg) => { context.handoffs.push([pid, act, msg || ""]); };
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("initial start failed");
+context.resumeExecuteStarted = true;
+// Simulate close(): retire (never clear) the owned launch, bump the
+// generation, stop, clear busy — then reopen.
+context.resumeExecuteRetiring = true;
+context.resumeExecuteGeneration++;
+context.resumeExecuteProcess.running = false;
+context.resumeExecuteBusy = false;
+context.requestedOpen = false;
+if (!context.resumeExecuteLaunched || !context.resumeExecuteStarted)
+  throw new Error("close cleared ownership lifecycle info");
+context.requestedOpen = true;
+if (context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("reopen retry slipped in before the old exit");
+context.finishResumeExecute(0, JSON.stringify({project: {id: "p1"}, results: []}),
+  context.resumeExecuteProcessGeneration, context.resumeExecuteProcessProjectId);
+if (context.handoffs.length !== 0) throw new Error("pre-close exit handed off after reopen");
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("reopen retry blocked after stale consume");
+console.log(JSON.stringify({handoffs: context.handoffs}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["handoffs"], [])
+
+    def test_close_before_failed_startup_recovers(self):
+        # Pending launch -> close -> spawn failure: close must keep
+        # launched/started (the F4 wedge was clearing them, so the
+        # failure was ignored forever). The terminal never-started
+        # runningChanged then retires ownership and unblocks retry.
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute", "handleResumeExecuteRunningChanged")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+        ])
+        script += """
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("initial start failed");
+// Simulate close() while spawn is pending (running, never started).
+context.resumeExecuteRetiring = true;
+context.resumeExecuteGeneration++;
+context.resumeExecuteProcess.running = false;
+context.resumeExecuteBusy = false;
+if (!context.resumeExecuteLaunched || context.resumeExecuteStarted)
+  throw new Error("close cleared ownership lifecycle info");
+if (context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("retry slipped in before failed start");
+// Terminal never-started signal: no exited will arrive; consume silently.
+if (context.handleResumeExecuteRunningChanged()) throw new Error("retiring consume should be silent");
+if (context.resumeExecuteLaunched || context.resumeExecuteRetiring)
+  throw new Error("failed start did not retire ownership");
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("wedged after failed-start recovery");
+console.log(JSON.stringify({busy: context.resumeExecuteBusy}));
+"""
+        value = self.run_node(script)
+        self.assertTrue(value["busy"])
+
+    def test_timeout_before_failed_startup_recovers(self):
+        # Watchdog fires while spawn is still pending (running, never
+        # started): retire and kill. The later terminal never-started
+        # signal consumes ownership silently; retry then succeeds.
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute", "cancelResumeExecute",
+                               "handleResumeExecuteRunningChanged")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+        ])
+        script += """
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("initial start failed");
+// Spawn still pending at the watchdog: running, never started.
+context.resumeExecuteProcess.running = true;
+context.cancelResumeExecute();
+if (!context.resumeExecuteLaunched || !context.resumeExecuteRetiring || context.resumeExecuteStarted)
+  throw new Error("timeout did not retire the pending start");
+if (context.resumeExecuteProcess.running) throw new Error("timeout did not kill the pending spawn");
+if (context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("retry slipped in before failed start");
+// Late terminal never-started signal consumes silently.
+if (context.handleResumeExecuteRunningChanged()) throw new Error("retiring consume should be silent");
+if (context.resumeExecuteLaunched || context.resumeExecuteRetiring)
+  throw new Error("failed start did not retire ownership");
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("wedged after failed-start recovery");
+console.log(JSON.stringify({busy: context.resumeExecuteBusy}));
+"""
+        value = self.run_node(script)
+        self.assertTrue(value["busy"])
+
+    def test_failed_startup_immediate_recovery(self):
+        # Spawn failure with the palette idle: runningChanged without
+        # started reconciles the failure at once (no exit will arrive),
+        # surfaces it, and unblocks retry.
+        fns = self.palette_fns("selectedResumeEntry", "resumePlanForSelection",
+                               "requestResumePlanForSelection", "resumeOperationKinds",
+                               "resumeAvailableKinds", "isResumeConfirmCurrent",
+                               "openResumeConfirm", "cancelResumeConfirm",
+                               "toggleResumeConfirmOperation", "confirmResumeExecute",
+                               "startResumeExecute", "cancelResumeExecute",
+                               "handleResumeExecuteRunningChanged")
+        script = self.make_context_script(fns, [
+            {"id": "focus_workspace", "kind": "focus_workspace", "available": True},
+        ])
+        script += """
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("initial start failed");
+context.resumeExecuteProcess.running = false;
+if (!context.handleResumeExecuteRunningChanged()) throw new Error("failed start was not reconciled");
+if (context.notice !== "Resume failed") throw new Error("failure notice wrong: " + context.notice);
+if (context.resumeExecuteLaunched) throw new Error("failed start kept ownership");
+const failNotice = context.notice;
+if (!context.startResumeExecute("p1", ["focus_workspace"])) throw new Error("wedged after recovery");
+// A started process going quiet is NOT a failed start: reconciliation
+// must not fire (its exit is still coming).
+context.resumeExecuteStarted = true;
+context.resumeExecuteProcess.running = false;
+if (context.handleResumeExecuteRunningChanged()) throw new Error("successful exit gap misread as failed start");
+if (!context.resumeExecuteLaunched) throw new Error("exit gap dropped ownership");
+console.log(JSON.stringify({notice: failNotice}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["notice"], "Resume failed")
+
+    def test_unowned_exit_touches_nothing(self):
+        # An exit with no owned launch (e.g. a duplicate/late exit racing
+        # a newer flight) must not stop the newer flight's watchdog nor
+        # clear its busy latch, and must never hand off.
+        fns = self.palette_fns("finishResumeExecute", "validResumeExecutePayload",
+                               "resumeExecuteSummary")
+        script = f"""
+const vm = require("vm");
+let stops = 0;
+const context = {{
+  requestedOpen: true, notice: "", resumeExecuteBusy: true,
+  resumeExecuteGeneration: 9, resumeExecuteProcessGeneration: 9,
+  resumeExecuteProjectId: "p1", resumeExecuteProcessProjectId: "p1",
+  resumeExecuteLaunched: false, resumeExecuteStarted: false, resumeExecuteRetiring: false,
+  resumeExecuteTimeout: {{stop() {{ stops++; }}}},
+  handoffs: [],
+  handoffToProjectPlanner(pid, act, msg) {{ this.handoffs.push([pid, act]); }},
+}};
+context.root = context;
+vm.createContext(context);
+for (const value of {json.dumps(list(fns.values()))}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+context.finishResumeExecute(0, JSON.stringify({{project: {{id: "p1"}}, results: []}}), 9, "p1");
+if (context.handoffs.length !== 0) throw new Error("unowned exit handed off");
+if (!context.resumeExecuteBusy) throw new Error("unowned exit cleared the newer busy latch");
+if (stops !== 0) throw new Error("unowned exit stopped the newer watchdog");
+if (context.notice !== "") throw new Error("unowned exit touched diagnostics");
+console.log(JSON.stringify({{handoffs: context.handoffs, stops}}));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(value["stops"], 0)
+
+    def test_execute_lifecycle_signals_and_preservation(self):
+        source = PALETTE_TEXT
+        # Live supported signals only: onStarted + onRunningChanged (the
+        # codebase idiom). onErrorOccurred is not assignable in QML.
+        proc_start = source.index("id: resumeExecuteProcess")
+        proc_block = source[proc_start:proc_start + 800]
+        self.assertIn("onStarted", proc_block)
+        self.assertIn("onRunningChanged", proc_block)
+        self.assertIn("handleResumeExecuteRunningChanged", proc_block)
+        self.assertIn("onExited", proc_block)
+        self.assertNotIn("onErrorOccurred", proc_block)
+        self.assertIn("function handleResumeExecuteRunningChanged(", source)
+        # Ownership flags exist and gate every launch entry.
+        for token in ("resumeExecuteLaunched", "resumeExecuteStarted",
+                      "resumeExecuteRetiring"):
+            self.assertIn(token, source)
+        start_fn = extract_function(source, "startResumeExecute")
+        self.assertIn("resumeExecuteLaunched", start_fn)
+        self.assertIn("resumeExecuteRetiring", start_fn)
+        # Timeout retires (never clears) and keeps started across the
+        # invalidation, so a cancelled pending start stays
+        # distinguishable from a successful process.
+        cancel_fn = extract_function(source, "cancelResumeExecute")
+        self.assertIn("resumeExecuteRetiring = true", cancel_fn)
+        # The retiring (invalidation) path must keep started so a
+        # cancelled pending start stays distinguishable from a
+        # successful process; only the terminal never-started branch
+        # (no exit will arrive) reconciles fully.
+        retire_tail = cancel_fn[cancel_fn.index("resumeExecuteRetiring = true"):]
+        self.assertNotIn("resumeExecuteStarted = false", retire_tail)
+        self.assertNotIn("resumeExecuteLaunched = false", retire_tail)
+        # close/open preserve ownership lifecycle info the same way.
+        close_start = source.rindex("    function close() {")
+        close_fn = source[close_start:close_start + 2200]
+        self.assertIn("resumeExecuteRetiring = true", close_fn)
+        self.assertNotIn("resumeExecuteLaunched = false", close_fn)
+        self.assertNotIn("resumeExecuteStarted = false", close_fn)
+        open_start = source.index("    function open() {")
+        open_fn = source[open_start:open_start + 2500]
+        self.assertIn("resumeExecuteRetiring = true", open_fn)
+        self.assertNotIn("resumeExecuteLaunched = false", open_fn)
+        self.assertNotIn("resumeExecuteStarted = false", open_fn)
+        # finish consumes ownership and drops stale/unowned results
+        # without touching a newer flight's timer or busy latch.
+        finish_fn = extract_function(source, "finishResumeExecute")
+        self.assertIn("resumeExecuteLaunched = false", finish_fn)
+        self.assertIn("resumeExecuteRetiring = false", finish_fn)
+
+    def test_enter_autorepeat_guard_and_overlay_owns_keyboard(self):
+        # A held Enter must not open the overlay and then confirm from the
+        # same hold: repeats never confirm inside the overlay branch, which
+        # owns the key before the generic destructive-confirm path. Both
+        # the input and the card (ancestor of all focusable controls)
+        # route through one shared dispatch function.
+        self.assertIn("function paletteKeyPressed(", PALETTE_TEXT)
+        dispatch = extract_function(PALETTE_TEXT, "paletteKeyPressed")
+        overlay_at = dispatch.index("resumeConfirming")
+        repeat_at = dispatch.index("isAutoRepeat")
+        confirm_at = dispatch.index("confirmResumeExecute")
+        generic_at = dispatch.index("root.confirming")
+        self.assertLess(overlay_at, repeat_at)
+        self.assertLess(repeat_at, confirm_at)
+        self.assertLess(confirm_at, generic_at)
+        self.assertIn("Qt.Key_Return", dispatch)
+        self.assertIn("Qt.Key_Escape", dispatch)
+        self.assertNotIn("content", dispatch)
+        input_start = PALETTE_TEXT.index("id: input")
+        input_block = PALETTE_TEXT[input_start:input_start + 3000]
+        self.assertIn("root.paletteKeyPressed(event)", input_block)
+        card_start = PALETTE_TEXT.index("id: card")
+        card_block = PALETTE_TEXT[card_start:card_start + 2500]
+        self.assertIn("Keys.onPressed", card_block)
+        self.assertIn("root.paletteKeyPressed(event)", card_block)
+
+    def test_palette_key_dispatch_behavioral(self):
+        # Behavioral dispatch through the shared handler with a mocked Qt
+        # and synthetic events: overlay owns Enter/Escape from any focused
+        # control, repeats never confirm, Space is untouched.
+        fns = self.palette_fns("paletteKeyPressed")
+        script = f"""
+const vm = require("vm");
+const Qt = {{Key_Down: 1, Key_Up: 2, Key_Escape: 3, Key_Return: 4, Key_Enter: 5,
+  Key_Space: 6, Key_N: 7, Key_P: 8, ControlModifier: 64}};
+const calls = [];
+const context = {{
+  Qt, mode: "resume", selectedIndex: 0, confirming: false, confirmationAction: "",
+  resumeConfirming: true, notice: "",
+  moveSelection(i) {{ calls.push(["move", i]); }},
+  close() {{ calls.push(["close"]); }},
+  activate(i) {{ calls.push(["activate", i]); }},
+  runAction(a) {{ calls.push(["run", a]); }},
+  cancelResumeConfirm() {{ calls.push(["cancel"]); }},
+  confirmResumeExecute() {{ calls.push(["confirm"]); return true; }},
+}};
+context.root = context;
+vm.createContext(context);
+const fn = vm.runInContext("(" + {json.dumps(list(fns.values())[0])} + ")", context);
+context.paletteKeyPressed = fn;
+function press(key, modifiers, repeat) {{
+  const event = {{key, modifiers: modifiers || 0, isAutoRepeat: !!repeat, accepted: false}};
+  context.paletteKeyPressed(event);
+  return event.accepted;
+}}
+// Overlay open: fresh Enter confirms, repeat Enter is swallowed.
+if (!press(4) || calls.pop()[0] !== "confirm") throw new Error("fresh Enter did not confirm");
+if (!press(4, 0, true) || calls.length !== 0) throw new Error("repeat Enter was not swallowed");
+// Overlay open: Escape cancels, arrows swallowed without moving, Space untouched.
+if (!press(3) || calls.pop()[0] !== "cancel") throw new Error("Escape did not cancel");
+if (!press(1) || calls.length !== 0) throw new Error("Down was not swallowed");
+if (press(6) || calls.length !== 0) throw new Error("Space was touched");
+// Overlay closed: Enter activates, Escape closes.
+context.resumeConfirming = false;
+if (!press(5) || calls.pop()[0] !== "activate") throw new Error("Enter did not activate");
+if (!press(3) || calls.pop()[0] !== "close") throw new Error("Escape did not close");
+// Armed power confirm (S-021): a bare second Enter is swallowed and
+// never executes; execution belongs to the labelled Confirm button.
+context.confirming = true; context.confirmationAction = "reboot";
+if (!press(4) || calls.length !== 0) throw new Error("armed Enter was not swallowed");
+if (!press(3) || calls.pop()[0] !== "close") throw new Error("Escape did not close the armed confirm");
+console.log(JSON.stringify({{ok: true}}));
+"""
+        value = self.run_node(script)
+        self.assertTrue(value["ok"])
 
 
 @unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")

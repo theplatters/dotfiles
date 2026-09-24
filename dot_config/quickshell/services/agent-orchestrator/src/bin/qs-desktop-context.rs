@@ -8,12 +8,32 @@
 //! - `qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS]`:
 //!   read-only history query printing JSON to stdout. Never claims the
 //!   persisted latest row as live `current`.
-//! - `qs-desktop-context current`: fresh on-demand snapshot with default
-//!   enrichment (`enrich_desktop_context`: app + project), rechecked for
-//!   focus races. No DB, no latest-row fallback. Prints one `DesktopContext`
-//!   object (unavailable object when no compositor or on race/failure).
-//! - `qs-desktop-context current-project`: same fresh path, prints the
-//!   `ProjectContext` object or `null`.
+//! - `qs-desktop-context [--db PATH] current`: fresh on-demand snapshot with
+//!   default enrichment (`enrich_desktop_context`: app + project), rechecked
+//!   for focus races. Prints one `DesktopContext` object (unavailable object
+//!   when no compositor or on race/failure). When the fresh snapshot is
+//!   focusless, the newest history row is consulted best-effort for bounded
+//!   focusless retention (same window as the collector); without a readable
+//!   database the snapshot is returned as observed.
+//! - `qs-desktop-context [--db PATH] current-project`: same fresh path,
+//!   prints the `ProjectContext` object or `null`.
+//! - `qs-desktop-context [--db PATH] watch`: resident current-project
+//!   source. Reuses the exact `current` library path per recheck
+//!   (`fresh_current_context` + enrichment + bounded focusless retention
+//!   via `current_with_retention`), and prints one compact-JSON
+//!   `DesktopContext` line to stdout whenever the projected
+//!   `current-project` state (`ctx.project`) CHANGES, plus one line
+//!   immediately at startup (including the null-project/unavailable case).
+//!   Consecutive identical project states are never re-emitted. No DB
+//!   writes (read-only retention reads, like `current`). Diagnostics go to
+//!   stderr only. SIGTERM/SIGINT shut down cleanly (exit 0). When stdin is
+//!   a pipe, EOF (the supervisor is gone, including SIGKILL) shuts down the
+//!   same clean way; with a TTY or /dev/null stdin there is no auto-exit.
+//!   The recheck is
+//!   an in-process bounded poll (no forks): there is no compositor event
+//!   subscription here by design, so `watch` stays a read-only query loop
+//!   sharing one code path with `current` instead of duplicating the
+//!   collector's event/subscription machinery (which owns persistence).
 //! - `qs-desktop-context [--db PATH] last-activity --project UUID`: latest row
 //!   for one project or `null`.
 //! - `qs-desktop-context [--db PATH] resources --project UUID [--limit N]`:
@@ -21,7 +41,9 @@
 //!
 //! All diagnostics go to stderr. Stdout carries ONLY JSON (no Pi frames).
 //! `current`/`current-project` are fresh snapshots, not collector-tracker
-//! reads and not historical rows. Nothing here installs helpers or spawns
+//! reads: the DB is only consulted best-effort for bounded focusless
+//! retention of an already-fresh focusless snapshot, never as a fallback for
+//! a failed observation. Nothing here installs helpers or spawns
 //! installers; enrichment reuses the existing library path.
 
 use qs_agent_orchestrator::desktop_context::{now_ms, DesktopContext, Source};
@@ -31,8 +53,10 @@ use qs_agent_orchestrator::{
     acquire_lock, default_db_path, discover_sockets, ensure_parent_dir, lock_path_for,
     run_collector_forever, ActivityStore, StoreError, Tracker, MAX_QUERY_LIMIT,
 };
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -62,6 +86,7 @@ enum Mode {
     },
     Current,
     CurrentProject,
+    Watch,
     LastActivity {
         project: String,
     },
@@ -107,7 +132,7 @@ enum Mode {
 }
 
 fn usage() -> String {
-    "usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-interruption-ms MS]]\n       qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS [--limit N]]\n       qs-desktop-context current\n       qs-desktop-context current-project\n       qs-desktop-context [--db PATH] last-activity --project UUID\n       qs-desktop-context [--db PATH] resources --project UUID [--limit N]\n       qs-desktop-context [--db PATH] current-session\n       qs-desktop-context [--db PATH] sessions [--project UUID] [--limit N] [--from START_MS --to END_MS]\n       qs-desktop-context [--db PATH] last-session --project UUID\n       qs-desktop-context [--db PATH] session-resources --session SESSION_ID [--limit N]\n       qs-desktop-context [--db PATH] session-events --session SESSION_ID [--limit N]\n       qs-desktop-context [--db PATH] search [--project UUID] [--application TEXT] [--resource TEXT] [--device 32HEX] [--query TEXT] [--from START_MS --to END_MS] [--limit N]\n       qs-desktop-context [--db PATH] session-detail --session SESSION_ID [--resource-limit N] [--include-events [--event-limit N]]\n       qs-desktop-context [--db PATH] device-id".to_string()
+    "usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-interruption-ms MS]]\n       qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS [--limit N]]\n       qs-desktop-context [--db PATH] current\n       qs-desktop-context [--db PATH] current-project\n       qs-desktop-context [--db PATH] watch\n       qs-desktop-context [--db PATH] last-activity --project UUID\n       qs-desktop-context [--db PATH] resources --project UUID [--limit N]\n       qs-desktop-context [--db PATH] current-session\n       qs-desktop-context [--db PATH] sessions [--project UUID] [--limit N] [--from START_MS --to END_MS]\n       qs-desktop-context [--db PATH] last-session --project UUID\n       qs-desktop-context [--db PATH] session-resources --session SESSION_ID [--limit N]\n       qs-desktop-context [--db PATH] session-events --session SESSION_ID [--limit N]\n       qs-desktop-context [--db PATH] search [--project UUID] [--application TEXT] [--resource TEXT] [--device 32HEX] [--query TEXT] [--from START_MS --to END_MS] [--limit N]\n       qs-desktop-context [--db PATH] session-detail --session SESSION_ID [--resource-limit N] [--include-events [--event-limit N]]\n       qs-desktop-context [--db PATH] device-id".to_string()
 }
 
 fn parse_ms(s: &str, what: &str) -> Result<i64, String> {
@@ -285,7 +310,7 @@ fn parse_args(argv: &[String]) -> Result<(Option<PathBuf>, Mode), String> {
                 include_events = true;
             }
             "--help" | "-h" => return Err(usage()),
-            "collect" | "history" | "current" | "current-project" | "last-activity"
+            "collect" | "history" | "current" | "current-project" | "watch" | "last-activity"
             | "resources" | "current-session" | "sessions" | "last-session"
             | "session-resources" | "session-events" | "search" | "session-detail"
             | "device-id" => {
@@ -402,11 +427,6 @@ fn parse_args(argv: &[String]) -> Result<(Option<PathBuf>, Mode), String> {
                 ));
             }
             let _ = collect_only("--session-gap-ms");
-            if db_override.is_some() {
-                eprintln!(
-                    "qs-desktop-context: warning: --db ignored for current (fresh snapshot, no DB)"
-                );
-            }
             Mode::Current
         }
         "current-project" => {
@@ -416,10 +436,17 @@ fn parse_args(argv: &[String]) -> Result<(Option<PathBuf>, Mode), String> {
                     usage()
                 ));
             }
-            if db_override.is_some() {
-                eprintln!("qs-desktop-context: warning: --db ignored for current-project (fresh snapshot, no DB)");
-            }
             Mode::CurrentProject
+        }
+        "watch" => {
+            if limit.is_some() || from.is_some() || project.is_some() || session.is_some() {
+                return Err(format!(
+                    "--limit/--from/--to/--project/--session are not for watch\n{}",
+                    usage()
+                ));
+            }
+            let _ = collect_only("--session-gap-ms");
+            Mode::Watch
         }
         "last-activity" => {
             let p = project.ok_or_else(|| {
@@ -588,10 +615,16 @@ fn parse_args(argv: &[String]) -> Result<(Option<PathBuf>, Mode), String> {
         }
         other => return Err(format!("unknown subcommand: {other}\n{}", usage())),
     };
-    // `current` modes never resolve the default DB path (no HOME requirement,
-    // no initialization). Query/collect modes resolve it.
+    // `current` modes resolve the DB lazily/best-effort for focusless
+    // retention only: an explicit `--db` wins, otherwise the default path is
+    // tried. A missing/unresolvable path (including no HOME) simply skips
+    // retention — `current` modes must still work without a database.
+    // Query/collect modes resolve strictly (missing HOME is an error).
     let db = match mode {
-        Mode::Current | Mode::CurrentProject => None,
+        Mode::Current | Mode::CurrentProject | Mode::Watch => match db_override {
+            Some(p) => Some(PathBuf::from(p)),
+            None => default_db_path().ok(),
+        },
         _ => {
             let db = match db_override {
                 Some(p) => PathBuf::from(p),
@@ -1429,8 +1462,11 @@ fn run_device_id(db: &PathBuf) -> i32 {
 /// historical row: discovers sockets, fetches, enriches, then re-fetches to
 /// reject a snapshot that changed mid-enrichment (focus/window/app/PID/
 /// title/workspace). Returns an unavailable object (no project) when there
-/// is no compositor, a fetch fails, or the race check trips. Never touches
-/// the DB.
+/// is no compositor, a fetch fails, or the race check trips.
+///
+/// This step never touches the DB itself; the caller applies
+/// [`apply_focusless_retention`] best-effort afterwards so a focusless
+/// snapshot keeps the current project inside the retention window.
 fn fresh_current_context() -> DesktopContext {
     let now_unavailable = || DesktopContext::unavailable(Source::Hyprland, now_ms());
     let Some(paths) = discover_sockets() else {
@@ -1490,8 +1526,8 @@ fn same_focus_for_current(a: &DesktopContext, b: &DesktopContext) -> bool {
     true
 }
 
-fn run_current() -> i32 {
-    let ctx = fresh_current_context();
+fn run_current(db: Option<&PathBuf>) -> i32 {
+    let ctx = current_with_retention(db);
     match serde_json::to_string_pretty(&ctx) {
         Ok(s) => {
             println!("{s}");
@@ -1504,8 +1540,8 @@ fn run_current() -> i32 {
     }
 }
 
-fn run_current_project() -> i32 {
-    let ctx = fresh_current_context();
+fn run_current_project(db: Option<&PathBuf>) -> i32 {
+    let ctx = current_with_retention(db);
     match &ctx.project {
         Some(p) => match serde_json::to_string_pretty(p) {
             Ok(s) => {
@@ -1522,6 +1558,150 @@ fn run_current_project() -> i32 {
             0
         }
     }
+}
+
+/// In-process recheck interval for `watch`: compositor socket round-trips
+/// only, zero forks (no child processes per tick at the bridge level).
+const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Shutdown-poll granularity inside the watch sleep: SIGTERM/SIGINT set
+/// `SHUTDOWN` via the installed handlers and the loop exits within this bound.
+const WATCH_SLEEP_GRANULE: Duration = Duration::from_millis(100);
+
+/// Projected `current-project` state of a full context: the dedup/emission
+/// key for `watch`. Compares on stable project identity only
+/// (`id`/`name`/`matched_by` via `ProjectContext` equality) so window,
+/// title, workspace, or timestamp movement inside one project never emits.
+fn watch_project_state(ctx: &DesktopContext) -> serde_json::Value {
+    match &ctx.project {
+        Some(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// True when the projected state changed since the last emission (`None` =
+/// nothing emitted yet, so the startup line always emits).
+fn watch_should_emit(last: &Option<serde_json::Value>, ctx: &DesktopContext) -> bool {
+    match last {
+        None => true,
+        Some(prev) => *prev != watch_project_state(ctx),
+    }
+}
+
+/// True when fd 0 is a pipe (FIFO): a supervisor (`desktop_projects.py`
+/// bridge, quickshell) holds the write end, so EOF means the supervisor is
+/// gone for good (including SIGKILL, which no signal handler can catch).
+/// TTYs, /dev/null, and closed/failed fds never arm the auto-exit, so
+/// manual runs and DEVNULL-spawned tests keep the old behavior.
+fn stdin_is_fifo() -> bool {
+    // `S_ISFIFO` is a C macro the `libc` crate does not expose; the manual
+    // file-type mask is equivalent.
+    unsafe {
+        let mut st: std::mem::MaybeUninit<libc::stat> = std::mem::MaybeUninit::uninit();
+        if libc::fstat(0, st.as_mut_ptr()) != 0 {
+            return false;
+        }
+        let st = st.assume_init();
+        (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
+    }
+}
+
+/// Watchdog for the resident `watch` loop: when stdin is a pipe (see
+/// `stdin_is_fifo`), a blocked reader thread trips the normal `SHUTDOWN`
+/// path on EOF, so an orphaned `watch` (supervisor SIGKILLed, quickshell
+/// reload dropping its Process child) exits cleanly instead of rechecking
+/// forever. The 2 s recheck loop otherwise only notices supervisor death on
+/// emission, so quiet orphans would burn CPU indefinitely. Stdin carries no
+/// commands: any bytes written are discarded.
+fn arm_stdin_eof_shutdown() {
+    if !stdin_is_fifo() {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        let mut buf = [0u8; 1];
+        match std::io::Read::read(&mut std::io::stdin(), &mut buf) {
+            // Supervisor closed the write end: shut down like SIGTERM.
+            Ok(0) => {
+                SHUTDOWN.store(true, Ordering::SeqCst);
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    });
+}
+
+fn watch_sleep_shutdown() -> bool {
+    let mut waited = Duration::from_secs(0);
+    while waited < WATCH_POLL_INTERVAL {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(WATCH_SLEEP_GRANULE.min(WATCH_POLL_INTERVAL - waited));
+        waited += WATCH_SLEEP_GRANULE.min(WATCH_POLL_INTERVAL);
+    }
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+/// Resident current-project source (see the `watch` bullet in the module
+/// docs). Emits one compact-JSON `DesktopContext` line (the exact `current`
+/// query shape, compact instead of pretty so it is one LF-delimited line)
+/// at startup and then only when `watch_project_state` changes. Read-only:
+/// retention reads via `current_with_retention` never write. Stdout carries
+/// ONLY JSON lines; diagnostics go to stderr. Returns 0 on clean
+/// SIGTERM/SIGINT shutdown, 1 on a stdout write failure (the supervisor
+/// restarts the pair). When stdin is a pipe, EOF from a dead supervisor
+/// shuts down cleanly the same way (exit 0); with a TTY or /dev/null stdin
+/// there is no auto-exit.
+fn run_watch(db: Option<&PathBuf>) -> i32 {
+    install_signal_handlers();
+    arm_stdin_eof_shutdown();
+    let mut last: Option<serde_json::Value> = None;
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("qs-desktop-context: watch shutting down");
+            return 0;
+        }
+        let ctx = current_with_retention(db);
+        if watch_should_emit(&last, &ctx) {
+            let line = match serde_json::to_string(&ctx) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("qs-desktop-context: watch serialize failed: {e}");
+                    return 1;
+                }
+            };
+            {
+                let stdout = std::io::stdout();
+                let mut handle = stdout.lock();
+                if writeln!(handle, "{line}").is_err() || handle.flush().is_err() {
+                    eprintln!("qs-desktop-context: watch stdout write failed");
+                    return 1;
+                }
+            }
+            last = Some(watch_project_state(&ctx));
+        }
+        if watch_sleep_shutdown() {
+            eprintln!("qs-desktop-context: watch shutting down");
+            return 0;
+        }
+    }
+}
+
+/// Fresh snapshot plus best-effort focusless retention.
+///
+/// Takes the fresh observation and, when it is focusless, consults the
+/// newest history row (read-only, failures ignored) so opening the project
+/// planner / moving focus to the topbar does not immediately clear the
+/// current project. The retention window is the env-aware session
+/// interruption grace (`SessionConfig::resolve(None, None)`), falling back
+/// to the compiled default when the environment is malformed. `None`/missing
+/// databases skip retention and return the snapshot as observed.
+fn current_with_retention(db: Option<&PathBuf>) -> DesktopContext {
+    let ctx = fresh_current_context();
+    let retention_ms = qs_agent_orchestrator::SessionConfig::resolve(None, None)
+        .map(|c| c.interruption_grace_ms())
+        .unwrap_or(qs_agent_orchestrator::DEFAULT_SESSION_INTERRUPTION_MS);
+    qs_agent_orchestrator::apply_focusless_retention(db.map(|p| p.as_path()), ctx, retention_ms)
 }
 
 fn run_collect(db: &PathBuf, gap_ms: Option<i64>, interruption_ms: Option<i64>) -> i32 {
@@ -1558,6 +1738,11 @@ fn run_collect(db: &PathBuf, gap_ms: Option<i64>, interruption_ms: Option<i64>) 
         }
     };
     eprintln!("qs-desktop-context: collecting to {}", db.display());
+    // Private change sidecar next to the activity DB (schema v4 untouched).
+    // Best-effort: capture failures never break collection.
+    qs_agent_orchestrator::session_changes::set_sidecar_path(Some(
+        qs_agent_orchestrator::session_changes::sidecar_path_for(db),
+    ));
     install_signal_handlers();
     // Live context only: a fresh Tracker (never backfilled from rows).
     let mut tracker = Tracker::new();
@@ -1603,8 +1788,9 @@ fn main() {
             to,
             project,
         ),
-        Mode::Current => run_current(),
-        Mode::CurrentProject => run_current_project(),
+        Mode::Current => run_current(db.as_ref()),
+        Mode::CurrentProject => run_current_project(db.as_ref()),
+        Mode::Watch => run_watch(db.as_ref()),
         Mode::LastActivity { project } => {
             run_last_activity(db.as_ref().expect("last-activity needs db"), &project)
         }
@@ -1761,5 +1947,127 @@ mod tests {
             err.contains("are only for session-detail"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn watch_parses_without_flags() {
+        let (_db, mode) = parse_args(&argv(&["qs-desktop-context", "watch"])).expect("watch parses");
+        assert!(matches!(mode, Mode::Watch));
+    }
+
+    #[test]
+    fn watch_rejects_query_flags() {
+        let hex32 = "a".repeat(32);
+        let cases: Vec<(Vec<String>, &str)> = vec![
+            (
+                argv(&["qs-desktop-context", "watch", "--limit", "5"]),
+                "not for watch",
+            ),
+            (
+                argv(&[
+                    "qs-desktop-context",
+                    "watch",
+                    "--project",
+                    "00000000-0000-4000-8000-000000000000",
+                ]),
+                "not for watch",
+            ),
+            (
+                argv(&["qs-desktop-context", "watch", "--session", &hex32]),
+                "--session is only for",
+            ),
+            (
+                argv(&["qs-desktop-context", "watch", "--application", "kitty"]),
+                "are only for search",
+            ),
+            (
+                argv(&["qs-desktop-context", "watch", "--resource-limit", "5"]),
+                "are only for session-detail",
+            ),
+        ];
+        for (args, want) in &cases {
+            let err = parse_args(args).expect_err("watch must reject query flags");
+            assert!(err.contains(want), "unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn watch_db_resolves_lazily_like_current() {
+        // No HOME / no explicit --db must still parse (best-effort retention):
+        // `watch` never fails for want of a database path.
+        let (_db, mode) = parse_args(&argv(&["qs-desktop-context", "watch"])).expect("watch parses");
+        assert!(matches!(mode, Mode::Watch));
+        let (_db2, mode2) =
+            parse_args(&argv(&["qs-desktop-context", "--db", "/tmp/x.db", "watch"]))
+                .expect("watch parses with --db");
+        assert!(matches!(mode2, Mode::Watch));
+    }
+
+    fn watch_ctx_with_project(
+        project: Option<qs_agent_orchestrator::desktop_context::ProjectContext>,
+    ) -> qs_agent_orchestrator::desktop_context::DesktopContext {
+        use qs_agent_orchestrator::desktop_context::{DesktopContext, Source};
+        let mut ctx = DesktopContext::unavailable(Source::Hyprland, 1);
+        ctx.project = project;
+        ctx
+    }
+
+    #[test]
+    fn watch_startup_always_emits_including_null() {
+        use qs_agent_orchestrator::desktop_context::ProjectContext;
+        // Nothing emitted yet => emit, even for the null-project case.
+        let null_ctx = watch_ctx_with_project(None);
+        assert!(watch_should_emit(&None, &null_ctx));
+        let some_ctx =
+            watch_ctx_with_project(Some(ProjectContext::new("id-1", "n", "file")));
+        assert!(watch_should_emit(&None, &some_ctx));
+    }
+
+    #[test]
+    fn watch_dedups_identical_consecutive_project_state() {
+        use qs_agent_orchestrator::desktop_context::ProjectContext;
+        let a = watch_ctx_with_project(Some(ProjectContext::new("id-1", "n", "file")));
+        // Same identity, different timestamp/focus: still deduped (project
+        // state is what matters, not the full context).
+        let mut a_moved = a.clone();
+        a_moved.observed_at_ms = 999;
+        let last = Some(watch_project_state(&a));
+        assert!(!watch_should_emit(&last, &a_moved));
+        // Different id => emit.
+        let b = watch_ctx_with_project(Some(ProjectContext::new("id-2", "n", "file")));
+        assert!(watch_should_emit(&last, &b));
+        // Some -> None (project cleared) => emit.
+        let cleared = watch_ctx_with_project(None);
+        assert!(watch_should_emit(&last, &cleared));
+        // None -> None => no re-emit.
+        let last_null = Some(watch_project_state(&cleared));
+        assert!(!watch_should_emit(&last_null, &watch_ctx_with_project(None)));
+    }
+
+    #[test]
+    fn watch_line_shape_matches_current_query_shape() {
+        use qs_agent_orchestrator::desktop_context::{
+            DesktopContext, FocusedWindow, ProjectContext, Source, Workspace,
+        };
+        // A watch line must parse as the exact `current` DesktopContext shape,
+        // and its projected `project` must serialize exactly like the
+        // `current-project` query output for the same context.
+        let ctx = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "code")),
+            42,
+        )
+        .with_project(Some(ProjectContext::new("id-9", "Proj", "cwd")));
+        let line = serde_json::to_string(&ctx).expect("watch line serializes");
+        assert!(!line.contains('\n'), "watch line must be single-line JSON");
+        let parsed: DesktopContext = serde_json::from_str(&line).expect("watch line parses");
+        assert_eq!(parsed, ctx);
+        let projected = watch_project_state(&parsed);
+        let query_shape = match &parsed.project {
+            Some(p) => serde_json::to_value(p).expect("project serializes"),
+            None => serde_json::Value::Null,
+        };
+        assert_eq!(projected, query_shape);
     }
 }

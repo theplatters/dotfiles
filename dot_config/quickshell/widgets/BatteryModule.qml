@@ -12,7 +12,6 @@ Item {
     height: implicitHeight
 
     property bool compact: false
-    property var batteryPopup: null
     property var controlCenter: null
     property bool hovered: mouseArea.containsMouse
     

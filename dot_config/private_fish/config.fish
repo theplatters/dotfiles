@@ -9,3 +9,7 @@ alias gpom="git push origin main"
 set -gx PATH "/home/franzs/.local/bin" $PATH
 
 fish_add_path /home/franzs/.local/bin
+
+if test -f ~/.config/secrets/openrouter.fish
+    source ~/.config/secrets/openrouter.fish
+end

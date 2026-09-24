@@ -84,7 +84,7 @@ logseq_path = "pages/Entwicklung der Sanktionierung in der Arbeitslosenversicher
 [[projects]]
 id = "51b2a763-cd73-4aa7-bebb-f7d44376d0d9"
 name = "Gender Norm ABM"
-logseq_path = "pages/Gender_Norm_ABM.md"
+logseq_path = "pages/Gender Norm ABM.md"
 local_folder = "~/Schreibtisch/Arbeit/gendernorms"
 github_url = "https://github.com/patrickmellacher/gendernorms"
 

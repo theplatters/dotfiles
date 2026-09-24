@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 AGENDA = (ROOT / "widgets" / "DailyAgenda.qml").read_text(encoding="utf-8")
 PLANNER_UI = (ROOT / "widgets" / "DailyPlanner.qml").read_text(encoding="utf-8")
+PANE = (ROOT / "widgets" / "DailyPlannerPane.qml").read_text(encoding="utf-8")
 POPOUT = (ROOT / "widgets" / "CalendarPopout.qml").read_text(encoding="utf-8")
 PLANNER = (ROOT / "widgets" / "ProjectPlanner.qml").read_text(encoding="utf-8")
 BAR = (ROOT / "widgets" / "Bar.qml").read_text(encoding="utf-8")
@@ -297,7 +298,9 @@ class DailyPlannerUiTests(unittest.TestCase):
         self.assertIn("agendaBusy", PLANNER_UI)
         self.assertIn("completionSaving", PLANNER_UI)
         self.assertIn("agenda.reload()", PLANNER_UI)
-        self.assertIn("Reload", PLANNER_UI)
+        self.assertIn("Refresh", PLANNER_UI)
+        self.assertIn('Accessible.name: "Refresh daily agenda"', PLANNER_UI)
+        self.assertNotIn("Reload", PLANNER_UI)
         self.assertIn("agendaError", PLANNER_UI)
         self.assertIn("agendaNotice", PLANNER_UI)
         self.assertIn("agendaTruncated", PLANNER_UI)
@@ -397,7 +400,8 @@ class CalendarPopoutTests(unittest.TestCase):
         self.assertIn("refreshPosition()", block)
 
     def test_popout_embeds_the_reusable_daily_planner(self):
-        self.assertIn("DailyPlanner {", POPOUT)
+        self.assertIn("DailyPlannerPane {", POPOUT)
+        self.assertNotIn("DailyPlanner {", POPOUT.replace("DailyPlannerPane {", ""))
         self.assertIn("agenda: root.agenda", POPOUT)
         self.assertIn("syncViewToDate()", POPOUT)
         self.assertIn("agenda.reload()", POPOUT)
@@ -519,7 +523,8 @@ class ProjectPlannerDailyTabTests(unittest.TestCase):
         self.assertIn("pauseIdleAgents()", select)
         self.assertIn('root.activeTab = "daily"', select)
         self.assertIn("property var agenda", PLANNER)
-        self.assertIn("DailyPlanner {", PLANNER)
+        self.assertIn("DailyPlannerPane {", PLANNER)
+        self.assertNotIn("DailyPlanner {", PLANNER.replace("DailyPlannerPane {", ""))
         self.assertIn("agenda: root.agenda", PLANNER)
         self.assertIn('Accessible.name: "Daily planner"', PLANNER)
         # Existing tabs keep their routing and guards.
@@ -820,6 +825,75 @@ class ProjectPlannerDailyRefreshTests(unittest.TestCase):
         reselect = extract_function(AGENDA, "reselectCompletion")
         self.assertIn("completionTask = {", reselect)
         self.assertNotIn('completionNote = ""', reselect)
+
+
+class DailyPlannerPaneParityTests(unittest.TestCase):
+    def test_wrapper_owns_the_identical_wiring(self):
+        self.assertIn("DailyPlanner {", PANE)
+        self.assertIn("property var agenda", PANE)
+        self.assertIn("property bool compact", PANE)
+        self.assertIn("agenda: root.agenda", PANE)
+        self.assertIn("compact: root.compact", PANE)
+        self.assertIn("signal projectPlanningRequested(string projectId, string action, string message)", PANE)
+        self.assertIn("onProjectPlanningRequested", PANE)
+        self.assertIn("function syncViewToDate()", PANE)
+        self.assertIn("inner.syncViewToDate()", PANE)
+
+    def test_both_surfaces_instantiate_the_wrapper(self):
+        self.assertIn("DailyPlannerPane {", POPOUT)
+        self.assertIn("DailyPlannerPane {", PLANNER)
+        # Neither surface may instantiate the bare planner: wiring lives
+        # in the wrapper so it cannot drift.
+        self.assertNotIn("DailyPlanner {",
+                         POPOUT.replace("DailyPlannerPane {", ""))
+        self.assertNotIn("DailyPlanner {",
+                         PLANNER.replace("DailyPlannerPane {", ""))
+        for source in (POPOUT, PLANNER):
+            self.assertIn("agenda: root.agenda", source)
+            self.assertIn("onProjectPlanningRequested", source)
+
+    def test_card_set_differs_per_host(self):
+        # Mirror model (D3) survives: both hosts instantiate the wrapper,
+        # but the card set differs by the compact flag. The popout keeps
+        # the slim set; Captured/Review/SessionCard render in the planner
+        # Daily tab only.
+        popout_pane = POPOUT[POPOUT.index("DailyPlannerPane {"):POPOUT.index("DailyPlannerPane {") + 800]
+        self.assertIn("compact: true", popout_pane)
+        planner_pane = PLANNER[PLANNER.index("DailyPlannerPane {"):PLANNER.index("DailyPlannerPane {") + 800]
+        self.assertIn("compact: false", planner_pane)
+        self.assertIn("property bool compact", PLANNER_UI)
+        for card in ("CaptureInbox {", "ReviewCard {", "SessionCard {"):
+            self.assertIn(card, PLANNER_UI)
+            block = PLANNER_UI[PLANNER_UI.index(card) - 400:PLANNER_UI.index(card) + 200]
+            self.assertIn("!root.compact", block)
+        # The popout embeds only the wrapper: no direct card refs.
+        popout_stripped = POPOUT.replace("DailyPlannerPane {", "")
+        self.assertNotIn("CaptureInbox {", popout_stripped)
+        self.assertNotIn("ReviewCard {", popout_stripped)
+        self.assertNotIn("SessionCard {", popout_stripped)
+
+    def test_compact_popout_has_quick_add_with_preview_confirm(self):
+        # The slim popout gains a todo: quick-add input routing into the
+        # project page (else today's journal) via preview -> Confirm.
+        self.assertIn('Accessible.name: "Quick-add TODO"', PLANNER_UI)
+        self.assertIn("quickAddField", PLANNER_UI)
+        self.assertIn("function quickBegin()", PLANNER_UI)
+        self.assertIn("function quickConfirmApply()", PLANNER_UI)
+        self.assertIn("function finishQuickStage(", PLANNER_UI)
+        self.assertIn('scripts/project_planner.py', PLANNER_UI)
+        self.assertIn('scripts/journal_assistant.py', PLANNER_UI)
+        self.assertIn('scripts/desktop_projects.py', PLANNER_UI)
+        self.assertIn("quickAddConfirm", PLANNER_UI)
+        self.assertIn("quickAddCancel", PLANNER_UI)
+        self.assertIn("onConfirmRequested", PLANNER_UI)
+        # Preview-first: Enter starts prepare but never confirms an armed
+        # preview.
+        begin = extract_function(PLANNER_UI, "quickBegin")
+        self.assertIn("quickConfirming", begin)
+        # Quick-add is compact-only; the full planner tab keeps the cards.
+        quick_at = PLANNER_UI.index('Accessible.name: "Quick-add TODO"')
+        quick_block = PLANNER_UI[max(0, quick_at - 1200):quick_at + 200]
+        self.assertIn("root.compact", quick_block)
 
 
 if __name__ == "__main__":

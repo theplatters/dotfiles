@@ -186,6 +186,95 @@ class NoHardwiredPathTests(unittest.TestCase):
         gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("settings.json", gitignore)
 
+    def test_settings_template_memory_block_matches_plan_defaults(self):
+        example = json.loads((REPO_ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        memory = example.get("memory")
+        self.assertIsInstance(memory, dict)
+        self.assertEqual(memory, {
+            "enabled": True,
+            "tickSeconds": 60,
+            "workLog": True,
+            "sessionCapture": True,
+            "dailyReview": True,
+            "organise": False,
+            "minSessionMs": 300000,
+            "reviewTime": "18:00",
+            "morningTime": "07:00",
+        })
+
+
+class MemorySettingsTests(unittest.TestCase):
+    def test_defaults_when_missing_or_malformed(self):
+        defaults = settings.memory_settings({})
+        self.assertTrue(defaults["enabled"])
+        self.assertEqual(defaults["tickSeconds"], 60)
+        self.assertTrue(defaults["workLog"])
+        self.assertTrue(defaults["sessionCapture"])
+        self.assertTrue(defaults["dailyReview"])
+        self.assertFalse(defaults["organise"])
+        self.assertEqual(defaults["minSessionMs"], 300000)
+        self.assertEqual(defaults["reviewTime"], "18:00")
+        self.assertEqual(defaults["morningTime"], "07:00")
+        self.assertEqual(set(defaults.keys()),
+                         {"enabled", "tickSeconds", "workLog",
+                          "sessionCapture", "dailyReview", "organise",
+                          "minSessionMs", "reviewTime", "morningTime"})
+        # Non-dict memory blocks and non-dict settings fail closed.
+        self.assertEqual(settings.memory_settings({"memory": None})["tickSeconds"], 60)
+        self.assertEqual(settings.memory_settings({"memory": []})["tickSeconds"], 60)
+        self.assertEqual(settings.memory_settings([])["tickSeconds"], 60)
+
+    def test_deleted_blocks_ignored(self):
+        value = settings.memory_settings({"memory": {"enabled": False}})
+        self.assertFalse(value["enabled"])
+        # Deleted Jev/ledger/polish keys never surface.
+        crowded = settings.memory_settings({"memory": {
+            "jev": {"model": "x"}, "ledger": {"autoIgnore": True},
+            "workLogPolish": True, "sessionEnrichment": True,
+            "associationSuggestions": True, "reviewPolish": True,
+            "reviewPrioritization": True}})
+        for gone in ("jev", "ledger", "workLogPolish",
+                     "sessionEnrichment", "associationSuggestions",
+                     "reviewPolish", "reviewPrioritization"):
+            self.assertNotIn(gone, crowded)
+        self.assertEqual(value["tickSeconds"], 60)
+
+    def test_strict_bool_typing_never_coerces(self):
+        for key in ("enabled", "workLog", "sessionCapture",
+                    "dailyReview", "organise"):
+            default = settings.memory_settings({})[key]
+            for bad in (0, 1, "true", "false", "", None, [], {}):
+                value = settings.memory_settings({"memory": {key: bad}})
+                self.assertIs(value[key], default, (key, bad))
+
+    def test_integer_clamping(self):
+        self.assertEqual(
+            settings.memory_settings({"memory": {"tickSeconds": 5}})["tickSeconds"], 10)
+        self.assertEqual(
+            settings.memory_settings({"memory": {"tickSeconds": 99999}})["tickSeconds"], 3600)
+        self.assertEqual(
+            settings.memory_settings({"memory": {"minSessionMs": -1}})["minSessionMs"], 0)
+        self.assertEqual(
+            settings.memory_settings({"memory": {"minSessionMs": 10 ** 12}})["minSessionMs"],
+            86400000)
+        # Bool is not an int (type(True) is bool): falls back to default.
+        self.assertEqual(
+            settings.memory_settings({"memory": {"tickSeconds": True}})["tickSeconds"], 60)
+        self.assertEqual(
+            settings.memory_settings({"memory": {"tickSeconds": "60"}})["tickSeconds"], 60)
+
+    def test_hhmm_validation(self):
+        self.assertEqual(
+            settings.memory_settings({"memory": {"reviewTime": "07:30"}})["reviewTime"],
+            "07:30")
+        for bad in ("7:30", "24:00", "18:60", "evening", "", None, 1800, "  "):
+            self.assertEqual(
+                settings.memory_settings({"memory": {"reviewTime": bad}})["reviewTime"],
+                "18:00", bad)
+            self.assertEqual(
+                settings.memory_settings({"memory": {"morningTime": bad}})["morningTime"],
+                "07:00", bad)
+
 
 if __name__ == "__main__":
     unittest.main()

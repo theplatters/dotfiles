@@ -148,3 +148,85 @@ def get_setting(key: str, default=None, settings: dict | None = None):
     if not isinstance(data, dict) or key not in data:
         return default
     return data[key]
+
+
+_MEMORY_BOOL_DEFAULTS = {
+    "enabled": True,
+    "workLog": True,
+    "sessionCapture": True,
+    "dailyReview": True,
+    "organise": False,
+}
+
+_MEMORY_INT_SPECS = {
+    # key: (default, minimum, maximum). Upper bounds are hard maxima:
+    # larger configured values clamp down, never pass through.
+    "tickSeconds": (60, 10, 3600),
+    "minSessionMs": (300000, 0, 86400000),
+}
+
+_MEMORY_TIME_DEFAULTS = {
+    "reviewTime": "18:00",
+    "morningTime": "07:00",
+}
+
+import re as _re
+
+_HHMM_RE = _re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+
+
+def _strict_bool(value, default: bool) -> bool:
+    return value if type(value) is bool else default
+
+
+def _clamped_int(value, default: int, low: int, high: int) -> int:
+    if type(value) is not int:
+        return default
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
+
+
+def _valid_hhmm(value, default: str) -> str:
+    if not isinstance(value, str):
+        return default
+    text = value.strip()
+    if _HHMM_RE.fullmatch(text):
+        return text
+    return default
+
+
+def memory_settings(settings: dict | None = None) -> dict:
+    """Return the validated ``memory`` block.
+
+    The result is flat::
+
+        {"enabled": bool, "tickSeconds": int, "workLog": bool,
+         "sessionCapture": bool, "dailyReview": bool, "organise": bool,
+         "minSessionMs": int, "reviewTime": "HH:MM", "morningTime": "HH:MM"}
+
+    ``sessionCapture`` defaults to true (local regex scan, no network);
+    ``organise`` gates the one explicit Pi call and defaults to false.
+    Rules: strict bool typing (non-bool → default, never truthy coercion),
+    integer clamping to safe ranges (tickSeconds 10..3600, minSessionMs
+    0..86400000), and HH:MM validation for review/morning times.
+    Malformed or missing input fails closed to defaults. Unknown keys
+    (including the deleted ``jev``/``ledger`` blocks and polish flags)
+    are ignored.
+    """
+    data = settings if settings is not None else load_settings()
+    if not isinstance(data, dict):
+        data = {}
+    raw = data.get("memory")
+    if not isinstance(raw, dict):
+        raw = {}
+    result: dict = {}
+    for key, default in _MEMORY_BOOL_DEFAULTS.items():
+        result[key] = _strict_bool(raw.get(key, default), default)
+    for key, (default, low, high) in _MEMORY_INT_SPECS.items():
+        result[key] = _clamped_int(raw.get(key, default), default, low, high)
+    for key, default in _MEMORY_TIME_DEFAULTS.items():
+        result[key] = _valid_hhmm(raw.get(key, default), default)
+    return result

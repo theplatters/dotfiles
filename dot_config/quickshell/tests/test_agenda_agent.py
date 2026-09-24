@@ -121,19 +121,24 @@ class AgendaPolicyContractTests(unittest.TestCase):
         self.assertIn('name: "logseq_agenda_add"', EXTENSION)
         self.assertIn("agendaHelper(ctx, \"list\"", EXTENSION)
         self.assertIn("agendaHelper(ctx, \"select\"", EXTENSION)
-        # Palette-only registration lives with the other palette tools.
+        # Shared registration for palette + project (journal denied) lives
+        # under `if (!journalMode())`, after the palette-only tools.
         palette_start = EXTENSION.index("if (!projectMode() && !journalMode())")
-        palette_block = EXTENSION[palette_start:EXTENSION.index("if (journalMode())", palette_start)]
-        self.assertIn("logseq_agenda_list", palette_block)
-        self.assertIn("logseq_agenda_add", palette_block)
+        shared_start = EXTENSION.index("if (!journalMode())", palette_start)
+        shared_block = EXTENSION[shared_start:EXTENSION.index("if (journalMode()) {", shared_start)]
+        self.assertIn("logseq_agenda_list", shared_block)
+        self.assertIn("logseq_agenda_add", shared_block)
+        palette_block = EXTENSION[palette_start:shared_start]
+        self.assertNotIn("logseq_agenda_list", palette_block)
+        self.assertNotIn("logseq_agenda_add", palette_block)
 
     def test_scope_gates_keep_existing_allowlists_isolated(self):
         self.assertIn('if (journalMode() && !["logseq_journal_context", "logseq_journal_append"].includes(event.toolName))', EXTENSION)
-        self.assertIn('if (projectMode() && !["logseq_project_read", "logseq_project_update", "logseq_project_files", "logseq_project_read_file", "logseq_project_git", "zotero_search", "zotero_item", "zotero_read_pdf", "zotero_collections", "zotero_prepare", "zotero_apply"].includes(event.toolName))', EXTENSION)
-        # Agenda tools fail closed outside the palette.
-        self.assertIn("agenda list is palette-only; wrong scope", EXTENSION)
-        self.assertIn("agenda add is palette-only; wrong scope", EXTENSION)
-        self.assertIn('if (projectMode() || journalMode()) return rejectPromise(new Error("agenda tool is palette-only; wrong scope"))', EXTENSION)
+        self.assertIn('if (projectMode() && !["logseq_project_read", "logseq_project_update", "logseq_project_files", "logseq_project_read_file", "logseq_project_git", "project_folder_list", "project_folder_read", "project_folder_write", "logseq_agenda_list", "logseq_agenda_add", "zotero_search", "zotero_item", "zotero_read_pdf", "zotero_collections", "zotero_prepare", "zotero_apply"].includes(event.toolName))', EXTENSION)
+        # Agenda tools fail closed in journal mode only (project shares them).
+        self.assertIn("agenda list is unavailable in journal mode", EXTENSION)
+        self.assertIn("agenda add is unavailable in journal mode", EXTENSION)
+        self.assertIn('if (journalMode()) return rejectPromise(new Error("agenda tool is unavailable in journal mode"))', EXTENSION)
 
     def test_tool_descriptions_instruct_discovery_then_add(self):
         self.assertIn("First discover the TODO by natural language", EXTENSION)
@@ -180,17 +185,22 @@ class AgendaPolicyContractTests(unittest.TestCase):
         for text in (system, skill):
             self.assertIn("logseq_agenda_list", text)
             self.assertIn("logseq_agenda_add", text)
-        # Scoped allowlists stay isolated in prompts.
-        self.assertIn("Agenda tools stay palette-only", skill)
-        self.assertIn("agenda tools stay palette-only", system.lower() if "agenda tools stay palette-only" in system.lower() else system)
+        # Scoped allowlists stay isolated in prompts: agenda is shared by
+        # palette and project, journal stays denied (whitespace-normalized:
+        # the sentence wraps across lines in both files).
+        for text in (system, skill):
+            flat = " ".join(text.split())
+            self.assertIn("Available in palette and project scopes", flat)
+            self.assertIn("journal is denied", flat)
 
 
 class DesktopHistoryCoherenceTests(unittest.TestCase):
-    def test_eight_desktop_tools_no_legacy_history_surface(self):
+    def test_nine_desktop_tools_no_legacy_history_surface(self):
         for name in ("desktop_current_context", "desktop_project_todos",
                      "desktop_project_logseq_context", "desktop_project_activity",
                      "desktop_current_session", "desktop_search_activity",
-                     "desktop_get_session", "desktop_resume_plan"):
+                     "desktop_get_session", "desktop_resume_plan",
+                     "session_search"):
             self.assertIn(f'name: "{name}"', EXTENSION)
         for name in ("desktop_current_project", "desktop_project_resources",
                      "desktop_work_sessions", "desktop_session_resources",
@@ -219,11 +229,11 @@ class DesktopHistoryCoherenceTests(unittest.TestCase):
 
     def test_scope_allowlists_state_desktop_exception(self):
         # Policy coherence: every scope allowlist explicitly permits the
-        # eight read-only desktop tools without weakening mutations.
+        # nine read-only desktop tools without weakening mutations.
         system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
         self.assertGreaterEqual(
-            system.count("eight read-only desktop tools"), 2)
-        self.assertIn("eight-tool desktop read-only exception", system)
+            system.count("nine read-only desktop tools"), 2)
+        self.assertIn("nine-tool desktop read-only exception", system)
         self.assertIn("desktop exception never permits writes", system)
         skill = (ROOT / ".pi" / "skills" / "logseq-graph" / "SKILL.md"
                  ).read_text(encoding="utf-8")
@@ -267,7 +277,7 @@ const lstatSync = () => { throw new Error("unused"); };
 const readFileSync = () => { throw new Error("unused"); };
 const realpathSync = { native: (value) => value };
 const SessionManager = {};
-const Type = { Object: (value) => value, String: () => ({}), Optional: (value) => value, Integer: () => ({}) };
+const Type = { Object: (value) => value, String: () => ({}), Optional: (value) => value, Integer: () => ({}), Boolean: () => ({}), Any: () => ({}) };
 const tools = {}, hooks = {}, commands = {}, calls = [], previews = [];
 let approve = true;
 let mode = "normal";
@@ -365,7 +375,7 @@ const pi = { on(name, cb) { hooks[name] = cb; }, registerTool(tool) { tools[tool
 process.env.LOGSEQ_GRAPH = "/graph"; process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "";
 desktopAgent(pi);
 const assert = (v, m) => { if (!v) throw new Error(m); };
-assert(Object.keys(tools).join(",") === "logseq_search,logseq_todos,logseq_append_journal,logseq_agenda_list,logseq_agenda_add,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "palette registration wrong: " + Object.keys(tools).join(","));
+assert(Object.keys(tools).join(",") === "logseq_search,logseq_todos,logseq_append_journal,create_project,create_logseq_page,logseq_agenda_list,logseq_agenda_add,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan,session_search", "palette registration wrong: " + Object.keys(tools).join(","));
 const ctx = { cwd: "/work", hasUI: true, ui: { confirm: async () => true } };
 const listedDefault = await tools.logseq_agenda_list.execute("id", {}, undefined, undefined, ctx);
 const firstPayload = calls.at(-1).child.payload;
@@ -375,18 +385,18 @@ const listedExplicit = await tools.logseq_agenda_list.execute("id", { date: "202
 assert(calls.at(-1).child.payload.date === "2026-09-13", "explicit date was not passed through");
 try { await tools.logseq_agenda_list.execute("id", { date: "not-a-date" }, undefined, undefined, ctx); throw new Error("invalid date succeeded"); }
 catch (e) { assert(String(e).includes("YYYY-MM-DD"), "invalid date error missing"); }
-// Scoped registrations stay isolated.
+// Scoped registrations stay isolated (agenda is shared by palette + project).
 const tools2 = {}, hooks2 = {};
 const pi2 = { on(n, cb) { hooks2[n] = cb; }, registerTool(t) { tools2[t.name] = t; }, registerCommand() {} };
 process.env.QS_PROJECT_PATH = "pages/Work.md";
 desktopAgent(pi2);
-assert(!("logseq_agenda_list" in tools2) && !("logseq_agenda_add" in tools2), "agenda leaked into project mode");
-assert(Object.keys(tools2).join(",") === "logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "project allowlist changed");
+assert(("logseq_agenda_list" in tools2) && ("logseq_agenda_add" in tools2), "agenda missing from project mode");
+assert(Object.keys(tools2).join(",") === "logseq_agenda_list,logseq_agenda_add,logseq_project_read,logseq_project_update,logseq_project_files,logseq_project_read_file,logseq_project_git,project_folder_list,project_folder_read,project_folder_write,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan,session_search", "project allowlist changed");
 const tools3 = {};
 process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "1";
 const pi3 = { on(n, cb) {}, registerTool(t) { tools3[t.name] = t; }, registerCommand() {} };
 desktopAgent(pi3);
-assert(Object.keys(tools3).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "journal allowlist changed");
+assert(Object.keys(tools3).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan,session_search", "journal allowlist changed");
 console.log(JSON.stringify({ ok: true }));
 '''
         self.assertEqual(self.run_bun(script), {"ok": True})
@@ -457,13 +467,18 @@ mode = "select-stale";
 try { await tools.logseq_agenda_add.execute("id", { path: "pages/Work.md", line: 1, revision: REVISION }, undefined, undefined, ctx); throw new Error("select-stale succeeded"); }
 catch (e) { assert(String(e).includes("stale"), "select stale was not propagated"); }
 mode = "normal";
-// Aborted and wrong scope fail closed.
+// Aborted and journal scope fail closed; project mode shares the palette flow.
 const aborted = new AbortController(); aborted.abort();
-try { await tools.logseq_agenda_add.execute("id", { path: "pages/Work.md", line: 1, revision: REVISION }, aborted.signal, undefined, ctx); throw new Error("aborted add succeeded"); }
+try { await tools.logseq_agenda_add.execute("id", { path: "pages/Work.md", line: 1, revision: REVISION }, aborted.signal, undefined, undefined, ctx); throw new Error("aborted add succeeded"); }
 catch (e) { assert(String(e).includes("aborted"), "abort error missing"); }
-process.env.QS_PROJECT_PATH = "pages/Work.md";
-try { await tools.logseq_agenda_add.execute("id", { path: "pages/Work.md", line: 1, revision: REVISION }, undefined, undefined, ctx); throw new Error("scoped add succeeded"); }
-catch (e) { assert(String(e).includes("wrong scope"), "scope error missing"); }
+process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "1";
+try { await tools.logseq_agenda_add.execute("id", { path: "pages/Work.md", line: 1, revision: REVISION }, undefined, undefined, ctx); throw new Error("journal add succeeded"); }
+catch (e) { assert(String(e).includes("journal mode"), "journal scope error missing"); }
+try { await tools.logseq_agenda_list.execute("id", {}, undefined, undefined, ctx); throw new Error("journal list succeeded"); }
+catch (e) { assert(String(e).includes("journal mode"), "journal list scope error missing"); }
+process.env.QS_JOURNAL_MODE = ""; process.env.QS_PROJECT_PATH = "pages/Work.md";
+const projectOut = await tools.logseq_agenda_add.execute("id", { path: "pages/Work.md", line: 1, revision: REVISION }, undefined, undefined, ctx);
+assert(JSON.parse(projectOut.content[0].text).page.revision === "new", "project add did not run the shared select flow");
 process.env.QS_PROJECT_PATH = "";
 try { await tools.logseq_agenda_list.execute("id", {}, undefined, undefined, ctx); }
 catch (e) { throw new Error("palette list should succeed after scope reset: " + e); }

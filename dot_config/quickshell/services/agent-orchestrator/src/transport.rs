@@ -1062,6 +1062,8 @@ mod tests {
             PendingReq {
                 request: approval.clone(),
                 deadline: Instant::now() + Duration::from_secs(60),
+                surfaced: false,
+                deferred: false,
             },
         );
         // Force over budget even after display trims + dedup by padding.
@@ -1224,6 +1226,8 @@ mod tests {
                 PendingReq {
                     request: req,
                     deadline: Instant::now() + Duration::from_secs(60),
+                    surfaced: false,
+                    deferred: false,
                 },
             );
         }
@@ -1311,6 +1315,8 @@ mod tests {
                 PendingReq {
                     request: req,
                     deadline: Instant::now() + Duration::from_secs(60),
+                    surfaced: false,
+                    deferred: false,
                 },
             );
         }

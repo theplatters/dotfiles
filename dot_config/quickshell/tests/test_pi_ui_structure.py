@@ -77,10 +77,12 @@ class PaletteUiStructureTests(unittest.TestCase):
             self.assertIn("Responsibility:", source)
             self.assertIn("Contract with CommandPalette:", source)
             self.assertIn("Owned state", source)
-        # Approval contract: agent in, view-only dismiss.
+        # Approval contract: agent in, deferring dismiss (S-048 parks the
+        # request queued round-robin instead of a view-only close).
         self.assertIn("property var agent", APPROVAL)
         self.assertIn("property var request", APPROVAL)
-        self.assertIn("leave the RPC request pending", APPROVAL)
+        self.assertIn("parks the request queued", APPROVAL)
+        self.assertIn("agent.deferRequest(deferredId)", APPROVAL)
         # Capture contract: captured/failed/reopen signals, prompt preserved,
         # stale drops inside, screenshot stays in the palette.
         self.assertIn("signal reopenRequest(string message)", CAPTURE)
@@ -102,6 +104,10 @@ class PaletteUiStructureTests(unittest.TestCase):
         self.assertIn("function rebuildModel()", PALETTE)
         self.assertIn("function rebuild()", PALETTE)
         # No duplicated logic left in the orchestrator.
+        # NOTE (Phase 2b §4.3): `id: todoProcess` is intentionally
+        # palette-owned — the todo: quick-add ladder drives the composer
+        # row, the exact-preview Confirm overlay, and the stays-open
+        # serial entry, none of which belong in the data-source caches.
         for needle in ("function openRequest(", "function moveChoice(",
                        "function beginRegionSelection(", "function finishRegionSelection(",
                        "function cancelRegionSelection(", "function reopenCaptureAi(",
@@ -111,12 +117,16 @@ class PaletteUiStructureTests(unittest.TestCase):
                        "function finishFileSearch(", "function startFileSearch(",
                        "property bool selectingRegion", "property string captureGeometry",
                        "property var todos", "property string clipboardText",
-                       "id: captureProcess", "id: todoProcess", "id: fileProcess",
+                       "id: captureProcess", "id: fileProcess",
                        "id: approval\n", "id: selectionOverlay", "id: choiceList"):
             self.assertNotIn(needle, PALETTE, "duplicated in palette: " + needle)
+        # The palette-owned todo ladder keeps its contract markers.
+        self.assertIn("id: todoProcess", PALETTE)
+        self.assertIn("function todoConfirmApply()", PALETTE)
+        self.assertIn('objectName: "todoConfirmButton"', PALETTE)
 
     def test_switch_command_reports_rejected_agent_action(self):
-        self.assertIn('["Switch session", "resume"]', PALETTE)
+        self.assertIn('["Switch Pi session", "resume"]', PALETTE)
         self.assertIn("if (!agent.switchSession()) notice", PALETTE)
 
     def test_capture_region_label_matches_its_search_term(self):
@@ -130,7 +140,10 @@ class PaletteUiStructureTests(unittest.TestCase):
         self.assertIn("root.captured(prompt, data.images || [])", capture)
         self.assertIn("generation !== root.captureGeneration", capture)
         # The palette owns the draft/agent side of those signals.
-        self.assertIn("root.agent.prompt(prompt, images", PALETTE)
+        # Capture-first sends ride through the ambient wrapper
+        # (images-capable variant), never raw.
+        self.assertIn("root.agent.prompt(captured.prompt, captured.images)", PALETTE)
+        self.assertNotIn("root.agent.prompt(prompt, images", PALETTE)
         self.assertIn('root.query = "ai:"', PALETTE)
         self.assertIn("input.text = root.query", PALETTE)
         self.assertIn("function boundedCaptureDetail(value)", PALETTE_TEXT)
@@ -251,8 +264,11 @@ class PaletteUiStructureTests(unittest.TestCase):
         self.assertIn("property bool calculatorOnly", DATASOURCES)
         self.assertIn("calculatorOnly: root.calculatorOnly()", PALETTE)
         should = DATASOURCES[DATASOURCES.index("function shouldSearchFiles()"):DATASOURCES.index("function finishFileSearch(")]
-        self.assertIn("!root.calculatorOnly", should)
+        # S-025: arithmetic-looking queries rank the calculator first but
+        # never suppress file rows; calculatorOnly no longer gates.
+        self.assertNotIn("!root.calculatorOnly", should)
         self.assertIn('root.mode === "file"', should)
+        self.assertIn("root.isUnifiedSearch()", should)
         # resetForOpen intentionally leaves in-flight processes to the
         # generation bump (matches pre-extraction open()).
         reset = DATASOURCES[DATASOURCES.index("function resetForOpen()"):DATASOURCES.index("function resetForClose()")]

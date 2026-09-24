@@ -753,6 +753,24 @@ impl Bridge {
                 let accepted = self.op_respond(&request_id, &fields, &mut events);
                 (events, ack, Some(accepted), false)
             }
+            "surfaceRequest" => {
+                let request_id = args
+                    .get("requestId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let accepted = self.op_surface_request(&request_id, &mut events);
+                (events, ack, Some(accepted), false)
+            }
+            "deferRequest" => {
+                let request_id = args
+                    .get("requestId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let accepted = self.op_defer_request(&request_id, &mut events);
+                (events, ack, Some(accepted), false)
+            }
             "compact" => {
                 let accepted = self.op_compact(&mut events);
                 (events, ack, Some(accepted), false)
@@ -1334,6 +1352,26 @@ impl Bridge {
         // Advance-before-write is handled by removal above; Pi may emit
         // another UI request while handling this write.
         self.write_pi(vec![payload])
+    }
+
+    /// UI opened a dialog for `request_id` (S-048): the request is marked
+    /// surfaced and no longer expires. Local-only, no Pi write. Unknown or
+    /// empty ids are rejected without side effects, like `respond`.
+    fn op_surface_request(&mut self, request_id: &str, events: &mut Vec<UiEvent>) -> bool {
+        if request_id.is_empty() {
+            return false;
+        }
+        self.state.mark_surfaced(request_id, events)
+    }
+
+    /// UI deferred `request_id` (S-048): the request is parked round-robin
+    /// and never expires. Local-only, no Pi write. Unknown or empty ids
+    /// are rejected without side effects, like `respond`.
+    fn op_defer_request(&mut self, request_id: &str, events: &mut Vec<UiEvent>) -> bool {
+        if request_id.is_empty() {
+            return false;
+        }
+        self.state.defer_request(request_id, events)
     }
 
     fn op_shutdown(&mut self) -> bool {

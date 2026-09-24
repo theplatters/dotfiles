@@ -1,0 +1,25 @@
+{
+  "manifest_version": 2,
+  "name": "QS Zen Context",
+  "description": "Publishes the focused Zen tab URL to the quickshell desktop-activity collector via a local native host. Multi-window safe via per-window title markers; fail-closed, no network, no clipboard.",
+  "version": "0.1.1",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "qs-zen-context@quickshell.local",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": [
+    "tabs",
+    "nativeMessaging"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": true
+  }
+}

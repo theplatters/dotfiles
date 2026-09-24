@@ -20,7 +20,6 @@ Item {
     readonly property bool isMuted: root.hasSink && root.sink.audio.muted
     readonly property real volume: root.hasSink ? root.sink.audio.volume : 0
 
-    property var audioPopup: null
     property var controlCenter: null
     property bool hovered: false
 
@@ -83,7 +82,6 @@ Item {
         onClicked: (mouse) => {
             if (mouse.button === Qt.RightButton) {
                 if (root.controlCenter) root.controlCenter.toggleSection(0);
-                else if (root.audioPopup) root.audioPopup.toggle(parent);
             } else {
                 if (root.hasSink) {
                     root.sink.audio.muted = !root.sink.audio.muted;

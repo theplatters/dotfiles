@@ -22,16 +22,17 @@ QtObject {
     readonly property color focusBorder: "#33F5F5F5"
     readonly property color accent: "#D6D6D6"
     readonly property color accentMuted: "#969696"
+    // Dim layer behind modal backdrops (palette, planner, capture, password).
+    readonly property color scrim: "#B0070707"
 
     // Compatibility aliases for modules that use semantic state colors. They
     // are intentionally muted so ordinary controls stay monochrome.
     readonly property color red: "#C59D9D"
+    readonly property color teal: "#008080"
+    readonly property color pink: "#ff69b4"
+    readonly property color blue: " #87ceeb "
     readonly property color green: "#A8B6A4"
     readonly property color mauve: "#C8C8C8"
-    readonly property color teal: "#A8B8B8"
-    readonly property color pink: "#BDBDBD"
-    readonly property color blue: "#AAB3BD"
-    readonly property color base3: "#F5F5F5"
 
     readonly property string fontFamily: Qt.fontFamilies().indexOf("Inter") >= 0 ? "Inter" : "Noto Sans"
     readonly property string fallbackFontFamily: "Noto Sans"
@@ -50,15 +51,16 @@ QtObject {
         return "Noto Sans";
     }
     readonly property int controlRadius: 12
+    readonly property int chipRadius: 7
     readonly property int cardRadius: 16
     readonly property int largeRadius: 20
-    readonly property int radius: 16 // compatibility alias
     // Shared control sizing. WidgetButton targets a 40-44px touch height;
     // WidgetIconButton keeps a 44px hit target with a centered 22px glyph
     // so tab, journal, panel, close, and history controls stay coherent.
     readonly property int controlMinHeight: 40
     readonly property int iconButtonSize: 44
     readonly property int iconSize: 22
+    readonly property int iconSizeSmall: 18
     readonly property int motionFast: 140
     readonly property int motionPanel: 200
     readonly property int motionExit: 220

@@ -1197,5 +1197,72 @@ class PaletteOrchestratorHarness(unittest.TestCase):
         bridge.wait_exit(timeout=8.0)
 
 
+class PaletteCapabilityMatrixTests(unittest.TestCase):
+    """Phase 1 §2.2: static capability-matrix pins for desktop-agent.ts.
+
+    No bridge/pi is launched: these assert the documented matrix (§2.2)
+    directly on the extension source so they stay green without cargo.
+    """
+
+    EXTENSION = (REPO_ROOT / ".pi" / "extensions" / "desktop-agent.ts").read_text(encoding="utf-8")
+    SYSTEM = (REPO_ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
+
+    DESKTOP_READ = ["desktop_current_context", "desktop_project_todos",
+                    "desktop_project_logseq_context", "desktop_project_activity",
+                    "desktop_current_session", "desktop_search_activity",
+                    "desktop_get_session", "desktop_resume_plan",
+                    "session_search"]
+
+    def test_desktop_read_tools_pass_every_scope_gate(self):
+        marker = 'if ((DESKTOP_READ_TOOLS as string[]).includes(event.toolName)) return;'
+        self.assertIn(marker, self.EXTENSION)
+        for name in self.DESKTOP_READ:
+            self.assertIn(f'"{name}"', self.EXTENSION)
+            self.assertIn(f'name: "{name}"', self.EXTENSION)
+
+    def test_agenda_registered_for_palette_and_project_journal_denied(self):
+        # Registered once under `if (!journalMode())`: palette + project.
+        self.assertIn("if (!journalMode()) {", self.EXTENSION)
+        block = self.EXTENSION[self.EXTENSION.index("if (!journalMode()) {"):]
+        self.assertIn('name: "logseq_agenda_list"', block)
+        self.assertIn('name: "logseq_agenda_add"', block)
+        # Guards deny journal only (no palette-only remnant).
+        self.assertNotIn("palette-only", self.EXTENSION)
+        self.assertIn("agenda list is unavailable in journal mode", self.EXTENSION)
+        self.assertIn("agenda add is unavailable in journal mode", self.EXTENSION)
+        self.assertIn("agenda tool is unavailable in journal mode", self.EXTENSION)
+
+    def test_project_allowlist_includes_agenda(self):
+        allow = self.EXTENSION[self.EXTENSION.index("if (projectMode() && !["):]
+        allow = allow[:allow.index("].includes")]
+        self.assertIn('"logseq_agenda_list"', allow)
+        self.assertIn('"logseq_agenda_add"', allow)
+
+    def test_agenda_flow_unchanged_preview_and_confirm(self):
+        # §8.2: no silent writes — the list/select flow with preview + UI
+        # confirm is untouched by the scope widening.
+        self.assertIn("Approve add to daily todos", self.EXTENSION)
+        self.assertIn("stale revision; list again and request a new approval", self.EXTENSION)
+
+    def test_palette_default_scoping_documented(self):
+        self.assertEqual(
+            self.EXTENSION.count("Omit project to use the fresh current project"), 3)
+
+    def test_journal_handoff_documented_allowlist_unchanged(self):
+        self.assertIn('file to project X', self.EXTENSION)
+        journal_block = self.EXTENSION[self.EXTENSION.index("if (journalMode()) {"):]
+        journal_block = journal_block[:journal_block.index("if (projectMode() && !journalMode()) {")]
+        self.assertIn('name: "logseq_journal_context"', journal_block)
+        self.assertIn('name: "logseq_journal_append"', journal_block)
+        self.assertNotIn("logseq_agenda", journal_block)
+
+    def test_system_matrix_matches_extension(self):
+        self.assertIn("logseq_agenda_list", self.SYSTEM)
+        self.assertIn("Available in palette and project scopes", self.SYSTEM)
+        self.assertIn("journal is denied", self.SYSTEM)
+        self.assertIn("file to project X", self.SYSTEM)
+        self.assertIn("to use the fresh current project", self.SYSTEM)
+
+
 if __name__ == "__main__":
     unittest.main()

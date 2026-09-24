@@ -1,0 +1,1132 @@
+@import 'colors.css';
+
+/* Rich Black GTK 4 and libadwaita theme. Flat opaque override over
+ * Arc-Darker base. Same tokens and radii as the GTK 3 companion:
+ * window bg, elevated bars, mantle controls, hover and border states,
+ * accent fill with dark text, flat focus ring, no gradients or assets. */
+
+/* Global Arc neutralization: kill gradients, image assets, shadows. */
+* {
+  background-image: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+}
+
+/* Windows, dialogs, banners, background surfaces. */
+window,
+dialog,
+.background,
+.window-frame,
+assistant,
+printdialog {
+  background-color: @window_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border-color: @borders;
+  box-shadow: none;
+}
+
+window,
+dialog {
+  border-radius: 16px;
+}
+
+banner,
+infobar {
+  background-color: @dialog_bg_color;
+  background-image: none;
+  color: @dialog_fg_color;
+  border: 1px solid @borders;
+  border-radius: 16px;
+  box-shadow: none;
+  padding: 8px;
+}
+
+banner button,
+infobar button {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+banner button:hover,
+infobar button:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+}
+
+/* Elevated bars: header, title, toolbar, menubar. */
+headerbar,
+.titlebar,
+toolbar,
+toolbarview,
+menubar,
+.actionbar,
+statusbar {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @headerbar_fg_color;
+  border-color: @borders;
+  box-shadow: none;
+}
+
+headerbar,
+.titlebar {
+  border-bottom: 1px solid @borders;
+  border-radius: 16px 16px 0 0;
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+headerbar button,
+.titlebar button {
+  min-height: 28px;
+}
+
+toolbar,
+toolbarview,
+actionbar {
+  border-bottom: 1px solid @borders;
+  padding: 4px;
+}
+
+menubar {
+  border-bottom: 1px solid @borders;
+  padding: 2px 4px;
+}
+
+menubar > item,
+menubar > menubutton > button {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border: 1px solid @headerbar_bg_color;
+  border-radius: 7px;
+  box-shadow: none;
+  padding: 4px 10px;
+}
+
+menubar > item:hover,
+menubar > menubutton > button:hover {
+  background-color: @rb_surface1;
+  background-image: none;
+  color: @rb_text;
+  border-color: @rb_surface1;
+}
+
+menubar > item:disabled {
+  color: @rb_subtext0;
+}
+
+/* Menus, popovers, tooltips, floating overlays. */
+menu,
+popover,
+popover.background,
+popover.menu,
+.dropdowns popover,
+tooltip,
+.tooltip {
+  background-color: @popover_bg_color;
+  background-image: none;
+  color: @popover_fg_color;
+  border: 1px solid @borders;
+  border-radius: 20px;
+  box-shadow: none;
+  padding: 6px;
+}
+
+tooltip {
+  border-radius: 20px;
+  padding: 6px 10px;
+}
+
+menuitem,
+modelbutton,
+popover modelbutton,
+menu > item {
+  background-color: @popover_bg_color;
+  background-image: none;
+  color: @popover_fg_color;
+  border: 1px solid @popover_bg_color;
+  border-radius: 7px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 6px 12px;
+}
+
+menuitem:hover,
+modelbutton:hover,
+popover modelbutton:hover,
+menu > item:hover,
+modelbutton:selected {
+  background-color: @rb_surface1;
+  background-image: none;
+  color: @rb_text;
+  border-color: @rb_surface1;
+}
+
+menuitem:hover label,
+modelbutton:hover label {
+  color: @rb_text;
+}
+
+menuitem:disabled,
+modelbutton:disabled {
+  color: @rb_subtext0;
+}
+
+menu separator,
+popover separator {
+  background-color: @borders;
+  background-image: none;
+  min-height: 1px;
+  margin: 4px 6px;
+}
+
+/* Cards and elevated content blocks. */
+.card,
+.frame,
+frame > border {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+  border-radius: 16px;
+  box-shadow: none;
+}
+
+/* Buttons: normal, hover, active, checked, disabled, variants. */
+button,
+.button {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+  border-radius: 12px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 6px 12px;
+}
+
+button:hover,
+.button:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @card_fg_color;
+  border-color: @borders;
+}
+
+/* Transient press is a dark surface; toggle-ON stays accent fill.
+ * :active first so :checked wins when both apply (pressed toggle). */
+button:active,
+.button:active {
+  background-color: @rb_surface1;
+  background-image: none;
+  color: @card_fg_color;
+  border-color: @borders;
+  box-shadow: none;
+}
+
+button:checked,
+.button:checked {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+  box-shadow: none;
+}
+
+button:disabled,
+.button:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+  border-color: @borders;
+  box-shadow: none;
+}
+
+button.suggested-action,
+button.accent,
+.button.suggested-action {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+
+button.suggested-action:hover,
+button.accent:hover {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_color;
+}
+
+button.suggested-action:active,
+button.suggested-action:checked {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_fg_color;
+}
+
+button.destructive-action {
+  background-color: @destructive_bg_color;
+  background-image: none;
+  color: @destructive_fg_color;
+  border-color: @destructive_bg_color;
+}
+
+button.destructive-action:hover {
+  background-color: @destructive_bg_color;
+  background-image: none;
+  color: @destructive_fg_color;
+  border-color: @accent_color;
+}
+
+button.destructive-action:disabled,
+button.suggested-action:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+  border-color: @borders;
+}
+
+button.flat,
+.button.flat {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border-color: @headerbar_bg_color;
+  box-shadow: none;
+}
+
+button.flat:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  border-color: @borders;
+}
+
+button.flat:active {
+  background-color: @rb_surface1;
+  background-image: none;
+  color: @window_fg_color;
+  border-color: @borders;
+}
+
+button.flat:checked {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+
+button.flat:disabled {
+  color: @rb_subtext0;
+}
+
+button.circular,
+.button.circular,
+button.pill {
+  border-radius: 999px;
+}
+
+button image,
+button label {
+  color: @card_fg_color;
+}
+
+button:active image,
+button:active label,
+.button:active image,
+.button:active label {
+  color: @card_fg_color;
+}
+
+button:checked image,
+button:checked label,
+.button:checked image,
+.button:checked label {
+  color: @accent_fg_color;
+}
+
+button.suggested-action image,
+button.suggested-action label,
+button.accent image,
+button.accent label,
+button.destructive-action image,
+button.destructive-action label {
+  color: @accent_fg_color;
+}
+
+button:disabled image,
+button:disabled label {
+  color: @rb_subtext0;
+}
+
+/* Entries, text views, generic views. */
+entry,
+.entry {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+  border-radius: 12px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 6px 12px;
+  caret-color: @card_fg_color;
+}
+
+entry:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+}
+
+entry:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+  border-color: @borders;
+}
+
+entry placeholder,
+entry > placeholder,
+entry > text > placeholder {
+  color: @rb_subtext0;
+}
+
+textview,
+.view,
+list,
+listview,
+columnview,
+gridview {
+  background-color: @view_bg_color;
+  background-image: none;
+  color: @view_fg_color;
+  border-color: @borders;
+}
+
+textview text,
+textview > text {
+  background-color: @view_bg_color;
+  background-image: none;
+  color: @view_fg_color;
+  caret-color: @view_fg_color;
+}
+
+/* Rows, lists, selection. */
+listview row,
+columnview row,
+gridview child,
+list row,
+row {
+  background-color: @view_bg_color;
+  background-image: none;
+  color: @view_fg_color;
+  border: 1px solid @view_bg_color;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+listview row:hover,
+columnview row:hover,
+list row:hover,
+row:hover,
+gridview child:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @view_fg_color;
+  border-color: @borders;
+}
+
+listview row:selected,
+columnview row:selected,
+list row:selected,
+row:selected,
+gridview child:selected {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+
+listview row:selected label,
+columnview row:selected label,
+row:selected label {
+  color: @accent_fg_color;
+}
+
+listview row:disabled,
+columnview row:disabled,
+row:disabled {
+  color: @rb_subtext0;
+}
+
+selection,
+label selection,
+entry selection,
+text selection,
+textview selection {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+}
+
+/* Dropdowns, combobox arrows, spinbuttons. */
+dropdown,
+combobox {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+  border-radius: 12px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 6px 12px;
+}
+
+dropdown:hover,
+combobox:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+}
+
+dropdown:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+}
+
+dropdown arrow,
+combobox arrow {
+  color: @rb_subtext1;
+  background-image: none;
+  min-height: 16px;
+  min-width: 16px;
+}
+
+dropdown:disabled arrow {
+  color: @rb_subtext0;
+}
+
+spinbutton,
+.spinbutton {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+  border-radius: 12px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 0 0 0 12px;
+  caret-color: @card_fg_color;
+}
+
+spinbutton:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+}
+
+spinbutton:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+}
+
+spinbutton button,
+spinbutton > button {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @rb_subtext1;
+  border: none;
+  border-left: 1px solid @borders;
+  border-radius: 0 12px 12px 0;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 4px 10px;
+}
+
+spinbutton button:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @card_fg_color;
+}
+
+spinbutton button:active {
+  background-color: @rb_surface1;
+  background-image: none;
+  color: @card_fg_color;
+}
+
+spinbutton button:disabled {
+  color: @rb_subtext0;
+}
+
+/* Check and radio nodes: filled accent mark stays distinguishable. */
+checkbutton,
+checkbutton check,
+radio,
+check {
+  background-image: none;
+  color: @window_fg_color;
+}
+
+check {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @rb_subtext1;
+  border: 1px solid @borders;
+  border-radius: 7px;
+  box-shadow: none;
+  min-height: 18px;
+  min-width: 18px;
+  margin: 2px;
+  -gtk-icon-source: none;
+}
+
+radio {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @rb_subtext1;
+  border: 1px solid @borders;
+  border-radius: 999px;
+  box-shadow: none;
+  min-height: 18px;
+  min-width: 18px;
+  margin: 2px;
+  -gtk-icon-source: none;
+}
+
+check:hover,
+radio:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @window_fg_color;
+  border-color: @rb_subtext1;
+}
+
+check:checked,
+radio:checked {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+  -gtk-icon-source: none;
+}
+
+check:checked:hover,
+radio:checked:hover {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_color;
+}
+
+check:disabled,
+radio:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+  border-color: @borders;
+}
+
+check:disabled:checked,
+radio:disabled:checked {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext0;
+  border-color: @borders;
+}
+
+checkbutton label {
+  color: @window_fg_color;
+}
+
+checkbutton:disabled label {
+  color: @rb_subtext0;
+}
+
+/* Switch: dark trough with light knob, light trough with dark knob. */
+switch,
+.switch {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border: 1px solid @borders;
+  border-radius: 999px;
+  box-shadow: none;
+  min-height: 24px;
+  min-width: 44px;
+  padding: 2px;
+}
+
+switch:checked {
+  background-color: @accent_bg_color;
+  background-image: none;
+  border-color: @accent_bg_color;
+}
+
+switch:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  border-color: @borders;
+}
+
+switch > slider,
+switch slider {
+  background-color: @rb_text;
+  background-image: none;
+  color: @rb_bg;
+  border: 1px solid @borders;
+  border-radius: 999px;
+  box-shadow: none;
+  min-height: 18px;
+  min-width: 18px;
+}
+
+switch:checked > slider {
+  background-color: @accent_fg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_fg_color;
+}
+
+switch:disabled > slider {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  border-color: @borders;
+}
+
+/* Scale and slider. */
+scale {
+  color: @window_fg_color;
+}
+
+scale > trough,
+scale trough {
+  background-color: @card_bg_color;
+  background-image: none;
+  border: 1px solid @borders;
+  border-radius: 7px;
+  box-shadow: none;
+  min-height: 6px;
+  min-width: 6px;
+}
+
+scale > trough > highlight {
+  background-color: @accent_bg_color;
+  background-image: none;
+  border-color: @accent_bg_color;
+  border-radius: 7px;
+  box-shadow: none;
+}
+
+scale > trough > slider,
+scale slider {
+  background-color: @rb_text;
+  background-image: none;
+  border: 1px solid @rb_text;
+  border-radius: 999px;
+  box-shadow: none;
+  min-height: 16px;
+  min-width: 16px;
+}
+
+scale > trough > slider:hover {
+  border-color: @rb_subtext1;
+}
+
+scale > trough > slider:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  border-color: @borders;
+}
+
+scale marks,
+scale value {
+  color: @rb_subtext1;
+}
+
+scale:disabled {
+  color: @rb_subtext0;
+}
+
+/* Progressbar. */
+progressbar,
+.progressbar {
+  background-image: none;
+  color: @window_fg_color;
+  border: none;
+  box-shadow: none;
+}
+
+progressbar > trough,
+progressbar trough {
+  background-color: @card_bg_color;
+  background-image: none;
+  border: 1px solid @borders;
+  border-radius: 7px;
+  box-shadow: none;
+  min-height: 8px;
+  min-width: 8px;
+}
+
+progressbar > trough > progress,
+progressbar progress {
+  background-color: @accent_bg_color;
+  background-image: none;
+  border-color: @accent_bg_color;
+  border-radius: 7px;
+  box-shadow: none;
+  color: @accent_fg_color;
+  min-height: 8px;
+  min-width: 8px;
+}
+
+/* Scrollbar with trough, slider, and steppers. */
+scrollbar,
+.scrollbar {
+  background-color: @window_bg_color;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+scrollbar > range > trough,
+scrollbar trough {
+  background-color: @window_bg_color;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  min-width: 12px;
+  min-height: 12px;
+}
+
+scrollbar slider,
+scrollbar > range > trough > slider {
+  background-color: @rb_surface2;
+  background-image: none;
+  border: 1px solid @borders;
+  border-radius: 7px;
+  box-shadow: none;
+  min-width: 10px;
+  min-height: 24px;
+}
+
+scrollbar slider:hover {
+  background-color: @rb_accent_muted;
+  background-image: none;
+  border-color: @rb_subtext1;
+}
+
+scrollbar slider:active {
+  background-color: @rb_accent_muted;
+  background-image: none;
+  border-color: @rb_subtext1;
+}
+
+scrollbar slider:disabled {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  border-color: @borders;
+}
+
+scrollbar button {
+  background-color: @window_bg_color;
+  background-image: none;
+  color: @rb_subtext1;
+  border: none;
+  box-shadow: none;
+  min-height: 16px;
+  min-width: 16px;
+  padding: 2px;
+}
+
+scrollbar button:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @window_fg_color;
+}
+
+scrollbar button:disabled {
+  color: @rb_subtext0;
+}
+
+/* Tabs: active tab is an accent fill with dark text. */
+tabbar,
+tabbox,
+notebook,
+.tabbar {
+  background-color: @window_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border: 1px solid @borders;
+  border-radius: 16px;
+  box-shadow: none;
+  padding: 6px;
+}
+
+tabbar tab,
+.tab,
+tab {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @rb_subtext1;
+  border: 1px solid @borders;
+  border-radius: 12px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 6px 12px;
+  margin: 2px;
+}
+
+tabbar tab:hover,
+.tab:hover,
+tab:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @window_fg_color;
+}
+
+tabbar tab:selected,
+.tab:selected,
+tab:selected,
+tab.active {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+
+tabbar tab:selected label,
+.tab:selected label,
+tab:selected label {
+  color: @accent_fg_color;
+}
+
+stack,
+tabbar ~ stack {
+  background-color: @window_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border-radius: 16px;
+}
+
+/* Sidebar, split panes, separators, status text. */
+.sidebar,
+navigation-split-view .sidebar,
+stacksidebar,
+.sidebar list,
+.sidebar row,
+.navigation-sidebar {
+  background-color: @sidebar_bg_color;
+  background-image: none;
+  color: @sidebar_fg_color;
+  border-color: @borders;
+  box-shadow: none;
+}
+
+.sidebar row,
+stacksidebar row {
+  background-color: @sidebar_bg_color;
+  background-image: none;
+  border: 1px solid @sidebar_bg_color;
+  border-radius: 12px;
+  box-shadow: none;
+  min-height: 28px;
+  padding: 6px 12px;
+}
+
+.sidebar row:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  border-color: @borders;
+}
+
+.sidebar row:selected {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+
+.sidebar row:selected label {
+  color: @accent_fg_color;
+}
+
+separator,
+.separator {
+  background-color: @borders;
+  background-image: none;
+  color: @borders;
+  border: none;
+  box-shadow: none;
+  min-height: 1px;
+  min-width: 1px;
+}
+
+/* Avatar and revealer stay monochrome and flat. */
+avatar {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+  border: 1px solid @borders;
+}
+
+revealer {
+  background-color: @window_bg_color;
+  background-image: none;
+  color: @window_fg_color;
+  border: none;
+  box-shadow: none;
+}
+
+/* Disabled and placeholder text everywhere. */
+*:disabled {
+  color: @rb_subtext0;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+}
+
+/* Focus rings on focusable widgets: flat ring, never a glow. */
+button:focus,
+entry:focus,
+textview:focus,
+dropdown:focus,
+spinbutton:focus,
+check:focus,
+radio:focus,
+switch:focus,
+scale:focus slider,
+tab:focus,
+tabbar tab:focus,
+menuitem:focus,
+modelbutton:focus,
+row:focus,
+listview row:focus,
+columnview row:focus {
+  outline: none;
+  border-color: @rb_focus;
+  box-shadow: 0 0 0 2px @rb_focus;
+}
+
+entry:focus {
+  background-color: @card_bg_color;
+  background-image: none;
+  color: @card_fg_color;
+}
+
+/* Column/list headers: structural, NOT pill buttons. Flat and square
+ * so header strips (message lists, file views) read as structure.
+ * Scoped to column views only -- headerbar buttons are untouched. */
+columnview header button,
+columnview > header > button,
+column-header,
+column-header button {
+  background-color: @headerbar_bg_color;
+  background-image: none;
+  color: @view_fg_color;
+  border: 1px solid @borders;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+columnview header button:hover,
+column-header button:hover {
+  background-color: @rb_surface0;
+  background-image: none;
+  color: @view_fg_color;
+  border: 1px solid @borders;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+columnview header button:active,
+column-header button:active {
+  background-color: @rb_surface1;
+  background-image: none;
+  color: @view_fg_color;
+  border: 1px solid @borders;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* Accent-bleed neutralization: every selecting state is an accent
+ * fill with dark text; links stay monochrome. Fully opaque. */
+*:selected,
+label:selected,
+row:selected,
+list row:selected,
+gridview child:selected {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+
+*:link {
+  background-image: none;
+  color: @rb_subtext1;
+}
+
+*:link:hover {
+  color: @window_fg_color;
+}
+
+/* Toolbar / search-bar spacing normalization: symmetric tight
+ * spacing, transparent toolbar separators (no phantom filled bars). */
+toolbar box,
+toolbar label {
+  margin: 0;
+  padding: 0 4px;
+}
+
+toolbar entry,
+toolbar dropdown,
+toolbar combobox,
+toolbar button {
+  margin: 0 2px;
+}
+
+toolbar separator,
+toolbar .separator {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  min-width: 6px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+/* Late-file state coherence (ties win): pressed links, entry
+ * search progress, assistant highlight, links in selected rows.
+ * (No treeview dnd rule: GTK4 removed treeview; columnview/listview
+ * have no equivalent dnd node.) */
+*:link:active {
+  color: @window_fg_color;
+}
+
+entry progress {
+  border-color: @accent_bg_color;
+  background-color: @accent_bg_color;
+  background-image: none;
+  box-shadow: none;
+}
+
+assistant .sidebar label.highlight {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+}
+
+*:selected *:link {
+  color: @accent_fg_color;
+}

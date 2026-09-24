@@ -1,9 +1,7 @@
 ---
 description: Independently review completed implementations for correctness, bugs, architectural problems, missing edge cases, and inadequate tests. Do not modify files; report concrete issues and recommended fixes.
 mode: subagent
-model: openai/gpt-6-astra
-reasoningEffort: low
-variant: low
+model: opencode-go/glm-5.3-flash
 permission:
   edit: deny
 ---

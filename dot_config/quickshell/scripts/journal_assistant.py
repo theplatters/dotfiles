@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import time
 from urllib.parse import unquote
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -24,9 +25,11 @@ if str(SCRIPT_DIR) not in sys.path:
 from logseq_common import (GraphError, SENSITIVE_NAMES as BASELINE_SENSITIVE_NAMES,
                            graph_path, resolve_graph)
 from project_planner import (LOCK_NAME, LOCK_TIMEOUT, _GraphLock)
+import qscli
 
 
 JOURNAL_LIMIT = 128 * 1024
+# Transport cap; single source of truth is qscli.INPUT_LIMIT (same value).
 INPUT_LIMIT = 1024 * 1024
 OUTPUT_LIMIT = 1024 * 1024
 PAGE_NAME_LIMIT = 500
@@ -36,6 +39,12 @@ RECENT_EXCERPT_LIMIT = 16 * 1024
 MATCH_TEXT_LIMIT = 2048
 PATH_LIMIT = 4096
 DATE_RE = re.compile(r"^\d{4}_\d{2}_\d{2}$")
+#: Provenance identity bound (§8.2 bounded labels, ≤ 160 chars each).
+REF_IDENTITY_LIMIT = 160
+#: quickshell-at:: bound (a clock timestamp, never free prose).
+AT_LIMIT = 64
+_SESSION_ID_RE = re.compile(r"[0-9a-fA-F]{32}\Z")
+_BULLET_RE = re.compile(r"\A([ \t]*)[-*][ \t]+")
 HEX_REVISION = re.compile(r"^[0-9a-f]{64}$")
 # These limits apply to the traversal itself, rather than just to its JSON
 # response. Rejected entries count against the budgets too.
@@ -53,6 +62,39 @@ def _error(message):
 
 def _today():
     return datetime.date.today().strftime("%Y_%m_%d")
+
+
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+               "Sep", "Oct", "Nov", "Dec")
+
+
+def journal_page_title(date_text):
+    """Logseq default journal page title (``MMM do, yyyy``) for a date.
+
+    ``date_text`` is the stored journal date string in ``%Y_%m_%d`` (as
+    :func:`_today` produces). Returns e.g. ``Sep 20th, 2026`` in
+    English, or ``""`` for any invalid input.
+    """
+    if not isinstance(date_text, str):
+        return ""
+    if not DATE_RE.fullmatch(date_text):
+        return ""
+    try:
+        parsed = datetime.datetime.strptime(date_text, "%Y_%m_%d").date()
+    except ValueError:
+        return ""
+    day = parsed.day
+    if 11 <= day % 100 <= 13:
+        suffix = "th"
+    elif day % 10 == 1:
+        suffix = "st"
+    elif day % 10 == 2:
+        suffix = "nd"
+    elif day % 10 == 3:
+        suffix = "rd"
+    else:
+        suffix = "th"
+    return f"{_MONTH_ABBR[parsed.month - 1]} {day}{suffix}, {parsed.year}"
 
 
 def _date(value):
@@ -521,16 +563,179 @@ def _normal_text(value, *, nonblank=True):
     return value, normalized
 
 
-def prepare(graph, date, revision, text):
+def _validate_session_id(value) -> str:
+    """Collector session id, or "" when absent (degraded, never blocked).
+
+    An explicitly supplied but malformed id fails closed
+    (misattribution risk); an absent/blank one means the text is stored
+    without markers.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.strip()
+    if not _SESSION_ID_RE.fullmatch(text):
+        _error("session id is invalid")
+    return text.lower()
+
+
+def _validate_ref(value) -> str:
+    """Provenance identity, or "" when absent or gate-dropped.
+
+    Untrusted resource data, so the shared ``text_safety`` gate
+    *filters* (drops the line, never the write): over-long (160),
+    control-character, or secret-looking identities yield no
+    ``quickshell-ref::`` line. The exact preview always shows what
+    lands.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        _error("ref identity is invalid")
+    if not value.strip():
+        return ""
+    from text_safety import safe_text_or_none as _gate
+    kept = _gate(value, REF_IDENTITY_LIMIT)
+    return kept if kept is not None else ""
+
+
+def _validate_at(value) -> str:
+    """Clock timestamp for ``quickshell-at::``, or "" when absent.
+
+    Explicit metadata (never resource data): a supplied but malformed
+    value fails closed rather than writing a misleading timestamp.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        if isinstance(value, str):
+            return ""
+        _error("timestamp is invalid")
+    text = value.strip()
+    if len(text) > AT_LIMIT or "\x00" in text:
+        _error("timestamp is invalid")
+    if any(ord(c) < 32 for c in text):
+        _error("timestamp is invalid")
+    return text
+
+
+def _session_markers(normalized_text, session_id, ref, at) -> list:
+    """Marker lines for a session-marked thought (indent-aware).
+
+    The child indent extends the thought's first-line bullet indent by
+    two spaces (matching the fixture shape); non-bullet text gets a
+    flat two-space indent. ``quickshell-at::`` / ``quickshell-ref::``
+    appear only when applicable.
+    """
+    first = normalized_text.split("\n", 1)[0] if normalized_text else ""
+    match = _BULLET_RE.match(first)
+    child = (match.group(1) + "  ") if match is not None else "  "
+    markers = [child + "quickshell-session:: " + session_id]
+    if at:
+        markers.append(child + "quickshell-at:: " + at)
+    if ref:
+        markers.append(child + "quickshell-ref:: " + ref)
+    return markers
+
+
+def _insert_markers(payload: bytes, markers: list) -> bytes:
+    """Insert marker lines after the payload's first line."""
+    lines = payload.split(b"\n")
+    encoded = [marker.encode("utf-8") for marker in markers]
+    # The normalized payload always ends with LF, so lines[-1] == b""
+    # and rejoining preserves the terminator.
+    return b"\n".join([lines[0]] + encoded + lines[1:])
+
+
+def _link_session_thought(conn, *, session_id: str, thought_ref: str,
+                           index_text: str, page: str, line: int,
+                           now_ms: int) -> None:
+    """Record a saved thought in session_meta + content_index.
+
+    Fail-closed: sidecar errors propagate as GraphError (bounded, no
+    traceback). The journal write already landed, so the message never
+    claims otherwise; the derived index is rebuildable via
+    ``content_index rebuild``. ``attended`` is never touched here — an
+    apply does not mean nothing remains (read path derives pending).
+    """
+    import annotations as _annotations
+    from content_index import index_block
+    try:
+        meta = _annotations.get_session_meta(conn, session_id)
+    except _annotations.AnnotationsError as exc:
+        raise GraphError(str(exc)) from exc
+    try:
+        if meta is None:
+            _annotations.upsert_session_meta(
+                conn, session_id=session_id, now_ms=now_ms,
+                thought_ref=thought_ref)
+        else:
+            try:
+                _annotations.upsert_session_meta(
+                    conn, session_id=session_id, now_ms=now_ms,
+                    expect_revision=meta.get("revision"),
+                    thought_ref=thought_ref)
+            except _annotations.AnnotationsError as exc:
+                if str(exc) != "session meta changed":
+                    raise
+                fresh = _annotations.get_session_meta(conn, session_id)
+                if fresh is None:
+                    raise GraphError(str(exc)) from exc
+                _annotations.upsert_session_meta(
+                    conn, session_id=session_id, now_ms=now_ms,
+                    expect_revision=fresh.get("revision"),
+                    thought_ref=thought_ref)
+    except _annotations.AnnotationsError as exc:
+        raise GraphError(str(exc)) from exc
+    try:
+        index_block(conn, text=index_text, page=page, line=line,
+                    kind="thought", session_id=session_id)
+    except Exception as exc:
+        raise GraphError("session link failed") from exc
+
+
+def prepare(graph, date, revision, text, session_id=None, ref=None,
+            at=None):
+    """Stage the exact journal addition (UI-level prepare → preview → Confirm).
+
+    There is no token table: the caller shows ``addition`` verbatim,
+    obtains user confirmation, then calls :func:`append` with the same
+    arguments. Destination is always today's journal (``_require_today``
+    enforced here and rechecked under lock in :func:`append`).
+
+    When *session_id* (32-hex collector session) is supplied, session
+    provenance markers are composed into the addition: non-bullet
+    property lines directly under the thought's first line (before any
+    child bullet), following the ``quickshell-agenda::`` pattern::
+
+        - the thought
+          quickshell-session:: <id>
+          quickshell-at:: <ts>          (only when *at* is supplied)
+          quickshell-ref:: <identity>   (only when *ref* passes the gate)
+
+    Without a session id the text is appended unchanged (degraded, never
+    blocked). A malformed session id or timestamp fails closed; a
+    gated-out ref identity (over-long, control characters,
+    secret-looking per the shared ``text_safety`` gate) simply yields no
+    ``quickshell-ref::`` line — the preview always shows what lands.
+    """
     graph = graph_path(graph)
     date = _date(date)
     expected = _revision(revision)
+    sid = _validate_session_id(session_id)
+    gated_ref = _validate_ref(ref)
+    bounded_at = _validate_at(at)
     raw, _mode, identity_value = _current_journal(graph, date=date)
     exists = identity_value is not None
     actual = _digest(raw, exists)
     if actual != expected:
         _error("journal revision is stale; reload the journal")
-    _normalized, payload = _normal_text(text)
+    normalized, payload = _normal_text(text)
+    if sid:
+        markers = _session_markers(normalized, sid, gated_ref, bounded_at)
+        payload = _insert_markers(payload, markers)
+        normalized = payload.decode("utf-8")
     separator = b"\n" if raw and not raw.endswith(b"\n") else b""
     addition = separator + payload
     if len(raw) + len(addition) > JOURNAL_LIMIT:
@@ -569,10 +774,34 @@ def _write_all(fd, data):
         view = view[count:]
 
 
-def append(graph, date, revision, addition):
+def append(graph, date, revision, addition, session_id=None, ref=None,
+           at=None, db=None):
+    """Append a prepared addition to today's journal (revision-checked).
+
+    The atomic lock → recheck → write flow is unchanged; *addition* is
+    written verbatim (the exact approved preview — never recomposed
+    here). Destination is always today's journal: ``_require_today``
+    runs before lock acquisition and again immediately before replace,
+    so a request validated before midnight never writes after it.
+
+    When *session_id* is supplied (with the same *ref*/*at* passed to
+    :func:`prepare`), the addition must contain the
+    ``quickshell-session:: <id>`` marker line it produced — a mismatch
+    fails closed. On success the block ref
+    (``journal:<date>.md:<line>``) is written to
+    ``session_meta.thought_ref`` and the exact block text is inserted
+    into ``content_index`` (kind ``thought``); both are returned as
+    ``thought_ref`` ("" without a session, in which case no sidecar is
+    touched). ``attended`` is never modified here.
+    """
     graph = graph_path(graph)
     date = _date(date)
     expected = _revision(revision)
+    sid = _validate_session_id(session_id)
+    gated_ref = _validate_ref(ref)
+    bounded_at = _validate_at(at)
+    if sid and not isinstance(addition, str):
+        _error("addition must be a string")
     target = date + ".md"
     graph_before_fd = _open_directory(str(graph))
     graph_before_identity = _identity(graph_before_fd)
@@ -596,6 +825,9 @@ def append(graph, date, revision, addition):
         if actual != expected:
             _error("journal revision is stale; reload the journal")
         payload = _validate_addition(addition, raw)
+        if sid and ("quickshell-session:: " + sid) not in addition:
+            _error("addition does not carry the session marker;"
+                   " prepare it again")
         first_line = 1 if not raw else raw.count(b"\n") + (1 if raw.endswith(b"\n") else 2)
         temporary = None
         temp_fd = None
@@ -660,60 +892,81 @@ def append(graph, date, revision, addition):
                 except OSError:
                     pass
         new_raw = raw + payload
+    thought_ref = ""
+    if sid:
+        thought_ref = f"journal:{date}.md:{first_line}"
+        _write_session_link(db, sid, thought_ref, addition, date,
+                            first_line)
     return {"date": date, "path": "journals/" + date + ".md",
-            "revision": hashlib.sha256(new_raw).hexdigest(), "line": first_line}
+            "revision": hashlib.sha256(new_raw).hexdigest(),
+            "line": first_line, "thought_ref": thought_ref}
 
 
-def _read_input():
-    stream = getattr(sys.stdin, "buffer", sys.stdin)
+def _write_session_link(db, session_id, thought_ref, addition, date,
+                        first_line):
+    """Connect the sidecar and record the saved thought (fail-closed).
+
+    Errors map to a bounded GraphError that states the journal write
+    already landed, so callers never retry the append (which would
+    duplicate the thought): the derived index is rebuildable via
+    ``content_index rebuild``.
+    """
+    import annotations as _annotations
+    index_text = addition.strip("\n") if isinstance(addition, str) else ""
     try:
-        data = stream.read(INPUT_LIMIT + 1)
-    except OSError as exc:
-        raise GraphError("cannot read JSON input") from exc
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    if len(data) > INPUT_LIMIT:
-        _error("JSON input exceeds 1 MiB")
+        conn = _annotations.connect(db)
+    except _annotations.AnnotationsError as exc:
+        raise GraphError("thought saved; session link failed") from exc
     try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise GraphError(f"invalid JSON input: {exc}") from exc
-    if not isinstance(value, dict):
-        _error("JSON input must be an object")
-    return value
+        _link_session_thought(
+            conn, session_id=session_id, thought_ref=thought_ref,
+            index_text=index_text, page=date, line=first_line,
+            now_ms=int(time.time() * 1000))
+    except Exception as exc:
+        raise GraphError("thought saved; session link failed") from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
-def _emit(value):
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(encoded) + 1 > OUTPUT_LIMIT:
-        _error("JSON output exceeds 1 MiB")
-    sys.stdout.buffer.write(encoded + b"\n")
+# ---------------------------------------------------------------------------
+# CLI (shared plumbing lives in qscli.py; argv stays byte-identical)
+# ---------------------------------------------------------------------------
 
-
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--graph", default=None,
-                        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = qscli.SafeParser()
+    qscli.add_global_flags(parser, db=True, graph=True)  # --graph defaults to LOGSEQ_GRAPH or logseqGraph in settings.json
     parser.add_argument("command", choices=("context", "prepare", "append"))
-    try:
-        args = parser.parse_args(argv)
-        graph = resolve_graph(args.graph)
-        request = _read_input()
-        if args.command == "context":
-            value = _context_response(graph, request.get("query"))
-        elif args.command == "prepare":
-            value = prepare(graph, request.get("date"), request.get("revision"),
-                            request.get("text"))
-        else:
-            value = append(graph, request.get("date"), request.get("revision"),
-                           request.get("addition"))
-        _emit(value)
-        return 0
-    except SystemExit as exc:
-        return 0 if exc.code == 0 else 1
-    except (GraphError, OSError, TypeError, ValueError, UnicodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args: argparse.Namespace) -> dict:
+    graph = resolve_graph(args.graph)
+    request = qscli.read_input()
+    if args.command == "context":
+        return _context_response(graph, request.get("query"))
+    elif args.command == "prepare":
+        return prepare(graph, request.get("date"), request.get("revision"),
+                       request.get("text"),
+                       session_id=request.get("session_id"),
+                       ref=request.get("ref"), at=request.get("at"))
+    else:
+        return append(graph, request.get("date"), request.get("revision"),
+                      request.get("addition"),
+                      session_id=request.get("session_id"),
+                      ref=request.get("ref"), at=request.get("at"),
+                      db=args.db)
+
+
+_BOUNDED_EXCEPTIONS = (GraphError, OSError, TypeError, ValueError,
+                       UnicodeError)
+
+
+def main(argv=None) -> int:
+    return qscli.run_main(_parse_args, _dispatch, "journal assistant",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

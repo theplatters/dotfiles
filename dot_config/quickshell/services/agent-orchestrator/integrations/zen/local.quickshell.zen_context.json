@@ -1,0 +1,9 @@
+{
+  "name": "local.quickshell.zen_context",
+  "description": "QS Zen Context native host: marker-verified focused-tab publisher for the desktop-activity collector. No network, no clipboard.",
+  "path": "/absolute/path/to/qs-zen-native-host.py",
+  "type": "stdio",
+  "allowed_extensions": [
+    "qs-zen-context@quickshell.local"
+  ]
+}

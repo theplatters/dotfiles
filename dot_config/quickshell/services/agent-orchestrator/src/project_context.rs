@@ -1062,6 +1062,34 @@ impl ProjectResolver {
             None => base.with_project(None),
         }
     }
+
+    /// Authoritative `local_folder` projection for one project id.
+    ///
+    /// Scans the cached registry for an entry whose `id` matches
+    /// case-insensitively, then projects its raw `local_folder` through the
+    /// short-TTL canonicalizer. `None` means the project has no linked folder
+    /// right now (unknown id, empty `local_folder`, or currently
+    /// unresolvable) — callers treat that as "no linked repo", never a guess.
+    pub fn folder_for_project(
+        &mut self,
+        project_id: &str,
+        now_ms: i64,
+    ) -> Option<std::path::PathBuf> {
+        let want = project_id.trim().to_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        // Ensure the registry mapping is loaded before scanning.
+        self.ensure_loaded(now_ms);
+        let raw: Option<String> = self
+            .entries
+            .iter()
+            .find(|e| e.id.to_lowercase() == want)
+            .and_then(|e| e.folder_raw.clone());
+        let raw = raw?;
+        let canonical = self.project_folder(&raw, now_ms)?;
+        Some(std::path::PathBuf::from(canonical))
+    }
 }
 
 impl Default for ProjectResolver {
@@ -1849,6 +1877,14 @@ pub fn resolve_project_for_resource(
 /// Unavailable / focusless / resourceless inputs clear the project.
 pub fn enrich_desktop_with_project(base: DesktopContext, now_ms: i64) -> DesktopContext {
     DEFAULT_RESOLVER.with(|c| c.borrow_mut().enrich(base, now_ms))
+}
+
+/// Authoritative `local_folder` for one project id via the thread-local
+/// cached registry (see `ProjectResolver::folder_for_project`). `None` means
+/// no linked folder right now — never a guess.
+pub fn folder_for_project_id(project_id: &str) -> Option<std::path::PathBuf> {
+    let now = crate::desktop_context::now_ms();
+    DEFAULT_RESOLVER.with(|c| c.borrow_mut().folder_for_project(project_id, now))
 }
 
 #[cfg(test)]

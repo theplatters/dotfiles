@@ -312,6 +312,32 @@ pub struct DesktopContext {
     pub resource: Option<ResourceContext>,
     #[serde(default)]
     pub project: Option<ProjectContext>,
+    /// Focusless-retention marker: `Some(first_focusless_ms)` where retention
+    /// was applied against a previous context with signal (a focused window
+    /// or a non-empty resource/project — typically carrying that previous
+    /// context's `resource`/`project` onto this focusless snapshot inside
+    /// the bounded window; see [`retain_focusless`]). `None` on real window
+    /// observations and on honest (expired/unretained) focusless rows.
+    ///
+    /// Additive Phase 2 field: missing in older JSON reads as `None`, and it
+    /// round-trips through the same `activity` table without any schema
+    /// change. Intentionally excluded from [`DesktopContext::semantic_eq`]
+    /// so repeated retained rows dedup against the tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_since_ms: Option<i64>,
+    /// Focusless-streak clock: `Some(streak_start_ms)` on EVERY available
+    /// focusless observation, whether a project/resource is currently being
+    /// carried or not. It records the UTC-ms start of the current
+    /// uninterrupted focusless streak so expiry stays durable once the
+    /// lookback skips project-less rows (see [`retain_focusless`]).
+    ///
+    /// `None` on real window observations and unavailable snapshots (either
+    /// ends the streak and clears both markers). Additive: missing in older
+    /// JSON reads as `None`, no schema/SQL change, and excluded from
+    /// [`DesktopContext::semantic_eq`] so streak bookkeeping never defeats
+    /// dedup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focusless_since_ms: Option<i64>,
 }
 
 impl DesktopContext {
@@ -329,6 +355,8 @@ impl DesktopContext {
             observed_at_ms,
             resource: None,
             project: None,
+            retained_since_ms: None,
+            focusless_since_ms: None,
         }
     }
 
@@ -348,6 +376,8 @@ impl DesktopContext {
             observed_at_ms,
             resource,
             project: None,
+            retained_since_ms: None,
+            focusless_since_ms: None,
         }
     }
 
@@ -360,14 +390,21 @@ impl DesktopContext {
             observed_at_ms,
             resource: None,
             project: None,
+            retained_since_ms: None,
+            focusless_since_ms: None,
         }
     }
 
-    /// Semantic equality: everything except the observation timestamp and
-    /// the focused-window PID. Focused windows compare on opaque
+    /// Semantic equality: everything except the observation timestamp,
+    /// the focused-window PID, and the focusless-retention markers.
+    /// Focused windows compare on opaque
     /// id/application/title only; resource compares on meaningful location
     /// fields; project compares on stable identity (id/name/matched_by
     /// only, never the registry revision) so identical mappings do not flap.
+    /// `retained_since_ms` and `focusless_since_ms` are deliberately ignored
+    /// so a retained focusless row dedups against the tail instead of
+    /// appending on every event, and so a real window event (which clears
+    /// both markers) still compares on user meaning alone.
     /// Provider timestamps/diagnostics must never be stored here.
     /// Used for dedup so paired/duplicate events do not append history.
     pub fn semantic_eq(&self, other: &Self) -> bool {
@@ -383,9 +420,15 @@ impl DesktopContext {
     /// Any resource change clears a possibly-stale project: the project
     /// resolver re-derives it from the new resource, and stripped worker
     /// inputs (`None`) must never carry a previous focus's project.
+    /// It also clears both focusless markers (`retained_since_ms` and
+    /// `focusless_since_ms`): persistence re-derives retention via
+    /// [`retain_focusless`], so a stripped or refreshed resource never
+    /// carries a stale window.
     pub fn with_resource(mut self, resource: Option<ResourceContext>) -> Self {
         self.resource = resource.filter(|r| !r.is_empty());
         self.project = None;
+        self.retained_since_ms = None;
+        self.focusless_since_ms = None;
         self
     }
 
@@ -394,6 +437,176 @@ impl DesktopContext {
         self.project = project;
         self
     }
+}
+
+/// Focusless retention: keep the current project across brief compositor
+/// focus gaps (e.g. a Quickshell layer-surface stealing focus), instead of
+/// clearing it the moment `focused_window` reads `None`.
+///
+/// A focusless candidate (`available`, no focused window) carries the
+/// previous context's `resource` + `project` while the bounded retention
+/// window is active. The persisted row keeps `focused_window: None`
+/// (honest: no window is focused) but the retained project keeps the
+/// session open (`classify_transition` emits `focus`, `resolved_project_id`
+/// stays the project).
+///
+/// Retention applies only when all of these hold:
+/// - the candidate is available and has no focused window;
+/// - a previous context exists and is available;
+/// - the previous workspace equals the candidate workspace;
+/// - the previous context has something to retain (a focused window, or a
+///   non-empty resource/project);
+/// - the total focusless period has not exceeded `retention_ms`.
+///
+/// Two markers are maintained:
+/// - `retained_since_ms`: `Some(first_focusless_ms)` where retention was
+///   applied against a previous context with signal (a focused window or a
+///   non-empty resource/project — typically carrying that `resource` /
+///   `project`). `None` on real window observations, unavailable snapshots,
+///   and honestly-cleared focusless rows (expired, unretained,
+///   workspace-mismatched).
+/// - `focusless_since_ms`: the UTC-ms start of the current uninterrupted
+///   focusless streak, set on EVERY available focusless observation —
+///   retained or honestly cleared. Windowed and unavailable observations
+///   clear both markers. This is what makes expiry durable: once the
+///   lookback skips project-less rows, an expired project-less focusless
+///   row stops being a latch only if its streak clock survives on the row
+///   itself; the next observation re-reads that clock and stays expired
+///   instead of re-anchoring on an older signal row and resurrecting the
+///   project forever.
+///
+/// The window bounds the *total* focusless period, not each event. The
+/// effective anchor is, in precedence order: the explicit `streak_anchor_ms`
+/// passed to [`retain_focusless_with_anchor`] (the live path threads the
+/// newest available focusless row's `focusless_since_ms` here, even when
+/// that row carries no project), else the previous row's
+/// `focusless_since_ms`, else its legacy `retained_since_ms`, else — for a
+/// legacy bare focusless previous with no markers at all — its
+/// `observed_at_ms`, else (windowed previous / fresh streak) the
+/// candidate's own `observed_at_ms`. Retention expires once
+/// `candidate.observed_at_ms - anchor > retention_ms`, so repeated
+/// focusless events never extend the window.
+///
+/// Re-anchoring a stale windowed row at the candidate time is intentional.
+/// The newest persisted activity row is written only on semantically distinct
+/// observations, so while a window stays focused for a long time (no
+/// title/resource changes) the newest row can be minutes old even though the
+/// collector's live `current_context()` stayed fresh via timestamp refreshes.
+/// Anchoring at `previous.observed_at_ms` would therefore expire immediately
+/// on the first live-path focusless poll and drop the current project — the
+/// bug this retention exists to fix. When the collector is running it
+/// promptly persists the retained row with both markers, so the *second*
+/// focusless event already reads the streak clock and the total period stays
+/// bounded; when the collector is not running the live path (`current` /
+/// `current-project` via [`crate::collector::apply_focusless_retention`])
+/// retains the last observed project while focusless by paging back past
+/// un-enriched windowed rows to a carry-capable signal row (see that
+/// function's docs for the window-change boundary). While the collector
+/// process is NOT running the live path is read-only, so for a windowed
+/// carry source there is no persisted streak clock and every poll re-anchors
+/// fresh (the grace effectively does not expire until the collector
+/// persists a row).
+///
+/// Every other case keeps the candidate's own resource/project as observed
+/// with `retained_since_ms` cleared but `focusless_since_ms` set to the
+/// streak anchor (fresh streaks anchor at the candidate time): unavailable
+/// snapshots and windowed candidates (a real window event ends retention)
+/// clear BOTH markers; workspace changes, previous contexts with nothing to
+/// retain, and expired windows persist the honest focusless context with the
+/// streak clock preserved exactly as observed.
+///
+/// Both markers are excluded from [`DesktopContext::semantic_eq`] so
+/// bookkeeping never defeats dedup.
+pub fn retain_focusless(
+    previous: Option<&DesktopContext>,
+    candidate: DesktopContext,
+    retention_ms: i64,
+) -> DesktopContext {
+    retain_focusless_with_anchor(previous, candidate, retention_ms, None)
+}
+
+/// [`retain_focusless`] with an explicit streak anchor.
+///
+/// `streak_anchor_ms` is the start of the current uninterrupted focusless
+/// streak as seen by the caller. The live DB path
+/// ([`crate::collector::apply_focusless_retention`]) passes the newest
+/// available focusless row's `focusless_since_ms` here (falling back to that
+/// row's `observed_at_ms` for legacy rows), because the carry source it
+/// passes as `previous` may be an older enriched row while the streak clock
+/// lives on a newer project-less focusless row. In-memory collector paths
+/// pass `None`, which derives the anchor from `previous` alone and behaves
+/// exactly like the original [`retain_focusless`], plus streak-clock
+/// bookkeeping. An explicit anchor takes precedence over every fallback;
+/// legacy rows without either marker still behave sanely (fresh anchor at
+/// the candidate time, or at the legacy focusless row's own time — see
+/// body).
+pub fn retain_focusless_with_anchor(
+    previous: Option<&DesktopContext>,
+    mut candidate: DesktopContext,
+    retention_ms: i64,
+    streak_anchor_ms: Option<i64>,
+) -> DesktopContext {
+    // Only available focusless snapshots are eligible; anything else ends
+    // the streak and passes through with both markers cleared.
+    if !candidate.available || candidate.focused_window.is_some() {
+        candidate.retained_since_ms = None;
+        candidate.focusless_since_ms = None;
+        return candidate;
+    }
+    let Some(prev) = previous else {
+        // Fresh streak: no previous to continue from.
+        candidate.retained_since_ms = None;
+        candidate.focusless_since_ms = Some(candidate.observed_at_ms);
+        return candidate;
+    };
+    if !prev.available || prev.workspace != candidate.workspace {
+        // Workspace change / unavailable previous: no carry, fresh streak.
+        candidate.retained_since_ms = None;
+        candidate.focusless_since_ms = Some(candidate.observed_at_ms);
+        return candidate;
+    }
+    // Streak anchor: explicit (live-path newest focusless) wins, then the
+    // previous row's own streak clock, then its legacy retain marker, then
+    // — for a legacy bare focusless row with no markers — its own
+    // observation time so the streak still advances instead of restarting.
+    // A windowed previous with no explicit anchor is a fresh streak.
+    let anchor = streak_anchor_ms
+        .or(prev.focusless_since_ms)
+        .or(prev.retained_since_ms)
+        .or(if prev.focused_window.is_none() {
+            Some(prev.observed_at_ms)
+        } else {
+            None
+        })
+        .unwrap_or(candidate.observed_at_ms);
+    if candidate.observed_at_ms.saturating_sub(anchor) > retention_ms {
+        // Expired: persist the honest focusless context (resource/project as
+        // observed), carry marker cleared, streak clock preserved so the
+        // next observation stays expired instead of resurrecting.
+        candidate.retained_since_ms = None;
+        candidate.focusless_since_ms = Some(anchor);
+        return candidate;
+    }
+    let has_signal = prev.focused_window.is_some()
+        || prev
+            .resource
+            .as_ref()
+            .map(|r| !r.is_empty())
+            .unwrap_or(false)
+        || prev.project.is_some();
+    if !has_signal {
+        // Project-less focusless previous: nothing to carry, but the streak
+        // continues — record its clock so a later observation expires at
+        // `anchor + retention_ms`, not later.
+        candidate.retained_since_ms = None;
+        candidate.focusless_since_ms = Some(anchor);
+        return candidate;
+    }
+    candidate.resource.clone_from(&prev.resource);
+    candidate.project.clone_from(&prev.project);
+    candidate.retained_since_ms = Some(anchor);
+    candidate.focusless_since_ms = Some(anchor);
+    candidate
 }
 
 fn windows_opt_semantic_eq(a: Option<&FocusedWindow>, b: Option<&FocusedWindow>) -> bool {
@@ -946,6 +1159,469 @@ mod tests {
         assert_eq!(t.pending_len(), 1);
         // Live current still refreshes to latest timestamp.
         assert_eq!(t.current_context().unwrap().observed_at_ms, 200);
+    }
+
+    #[test]
+    fn retain_focusless_within_ttl_carries_resource_and_project() {
+        let proj = ProjectContext::new("proj-1", "P", "file");
+        let res = ResourceContext::new(
+            "neovim",
+            Some("/repo/note.md"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let prev = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_resource(Some(res))
+        .with_project(Some(proj));
+        let candidate =
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1050);
+        let out = retain_focusless(Some(&prev), candidate, 120_000);
+        assert!(
+            out.focused_window.is_none(),
+            "retained rows stay honestly focusless"
+        );
+        assert!(out.available);
+        assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some("proj-1"));
+        assert!(out.resource.is_some());
+        // A windowed previous row means focuslessness is first observed now:
+        // the window anchors at the candidate time, not the stale row time.
+        assert_eq!(out.retained_since_ms, Some(1050));
+    }
+
+    #[test]
+    fn retain_focusless_expiry_uses_first_focusless_time_not_each_event() {
+        let proj = ProjectContext::new("proj-1", "P", "file");
+        let prev_windowed = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_project(Some(proj.clone()));
+        // First focusless event at t=1010 retains, anchored at the first
+        // focusless observation (t=1010), NOT at the stale windowed row time.
+        let first = retain_focusless(
+            Some(&prev_windowed),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            100,
+        );
+        assert_eq!(first.retained_since_ms, Some(1010));
+        assert!(first.project.is_some());
+        // Second focusless at t=1050: only 40 ms after the anchor, so it
+        // still retains with the same anchor — repeated events never extend
+        // the window.
+        let second = retain_focusless(
+            Some(&first),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1050),
+            100,
+        );
+        assert_eq!(second.retained_since_ms, Some(1010));
+        assert!(second.project.is_some());
+        // ...but t=1120 is 110 ms past the anchor and must expire even
+        // though it is recent relative to the previous retained row.
+        let expired = retain_focusless(
+            Some(&second),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1120),
+            100,
+        );
+        assert!(
+            expired.project.is_none(),
+            "expired retention clears the project"
+        );
+        assert!(expired.resource.is_none());
+        assert_eq!(expired.retained_since_ms, None);
+    }
+
+    #[test]
+    fn retain_focusless_stale_windowed_previous_anchors_at_candidate() {
+        // Live-path/DB-row regression: the newest persisted windowed row is
+        // written only on semantically distinct observations, so it can be
+        // minutes old while the window stayed focused. The first focusless
+        // observation after it must still retain (anchored at the candidate
+        // time), not expire immediately against the stale row timestamp.
+        let proj = ProjectContext::new("proj-1", "P", "file");
+        let res = ResourceContext::new(
+            "neovim",
+            Some("/repo/note.md"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let stale = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1_000,
+        )
+        .with_resource(Some(res))
+        .with_project(Some(proj));
+        let candidate_time = 1_000 + 600_000;
+        let candidate = DesktopContext::available(
+            Source::Hyprland,
+            None,
+            Some(Workspace::new("1", "1")),
+            candidate_time,
+        );
+        let out = retain_focusless(Some(&stale), candidate, 120_000);
+        assert!(
+            out.focused_window.is_none(),
+            "retained rows stay honestly focusless"
+        );
+        assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some("proj-1"));
+        assert!(out.resource.is_some());
+        assert_eq!(out.retained_since_ms, Some(candidate_time));
+    }
+
+    #[test]
+    fn retain_focusless_expiry_boundary() {
+        // The boundary is measured from the first focusless time: build the
+        // retained row first (anchor = first candidate time), then probe the
+        // edge against that marker. A windowed previous always anchors at the
+        // candidate time itself (delta 0), so it can never be past-boundary.
+        let prev = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_project(Some(ProjectContext::new("proj-1", "P", "file")));
+        let first = retain_focusless(
+            Some(&prev),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1000),
+            100,
+        );
+        assert_eq!(first.retained_since_ms, Some(1000));
+        // Exactly at the window: `now - since > retention` is false, retain.
+        let at = retain_focusless(
+            Some(&first),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1100),
+            100,
+        );
+        assert!(at.project.is_some());
+        assert_eq!(at.retained_since_ms, Some(1000));
+        // One ms past: expire.
+        let past = retain_focusless(
+            Some(&first),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1101),
+            100,
+        );
+        assert!(past.project.is_none());
+        assert_eq!(past.retained_since_ms, None);
+    }
+
+    #[test]
+    fn retain_focusless_rejects_workspace_change_empty_previous_and_unavailable() {
+        let prev = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_project(Some(ProjectContext::new("proj-1", "P", "file")));
+        // Workspace change: no retention.
+        let moved = retain_focusless(
+            Some(&prev),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("2", "2")), 1010),
+            120_000,
+        );
+        assert!(moved.project.is_none());
+        assert_eq!(moved.retained_since_ms, None);
+        // Previous with nothing to retain (no window, no resource/project).
+        let bare =
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1000);
+        let none = retain_focusless(
+            Some(&bare),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            120_000,
+        );
+        assert!(none.project.is_none());
+        assert_eq!(none.retained_since_ms, None);
+        // No previous at all.
+        let fresh = retain_focusless(
+            None,
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            120_000,
+        );
+        assert!(fresh.project.is_none());
+        assert_eq!(fresh.retained_since_ms, None);
+        // Unavailable previous.
+        let un_prev = DesktopContext::unavailable(Source::Hyprland, 1000);
+        let un = retain_focusless(
+            Some(&un_prev),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            120_000,
+        );
+        assert!(un.project.is_none());
+        assert_eq!(un.retained_since_ms, None);
+    }
+
+    #[test]
+    fn retain_focusless_never_touches_unavailable_or_windowed_candidates() {
+        let prev = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_project(Some(ProjectContext::new("proj-1", "P", "file")));
+        // Unavailable snapshots must NOT retain.
+        let un = retain_focusless(
+            Some(&prev),
+            DesktopContext::unavailable(Source::Hyprland, 1010),
+            120_000,
+        );
+        assert!(!un.available);
+        assert!(un.project.is_none());
+        assert_eq!(un.retained_since_ms, None);
+        // Windowed candidates pass through with the marker cleared (a real
+        // window event ends retention), keeping their own project.
+        let mut windowed = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x2", "kitty", "t2")),
+            Some(Workspace::new("1", "1")),
+            1010,
+        )
+        .with_project(Some(ProjectContext::new("proj-2", "Q", "file")));
+        windowed.retained_since_ms = Some(500);
+        let out = retain_focusless(Some(&prev), windowed, 120_000);
+        assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some("proj-2"));
+        assert_eq!(out.retained_since_ms, None);
+    }
+
+    #[test]
+    fn retain_focusless_marks_dedup_against_tail() {
+        // A retained row is semantically equal to the previous windowed row
+        // modulo the (ignored) marker... except focused_window differs, so a
+        // first focusless event is a real `focus` transition; repeats dedup.
+        let prev = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_project(Some(ProjectContext::new("proj-1", "P", "file")));
+        let first = retain_focusless(
+            Some(&prev),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            120_000,
+        );
+        assert!(
+            !prev.semantic_eq(&first),
+            "window -> focusless is a real transition"
+        );
+        let repeat = retain_focusless(
+            Some(&first),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1020),
+            120_000,
+        );
+        assert!(first.semantic_eq(&repeat), "repeated retained rows dedup");
+        assert_eq!(repeat.retained_since_ms, Some(1010));
+    }
+
+    #[test]
+    fn retain_focusless_sets_streak_clock_on_every_focusless_observation() {
+        // `focusless_since_ms` is the streak start on retained AND on
+        // honestly-cleared rows; windowed/unavailable clear both.
+        let prev = DesktopContext::available(
+            Source::Hyprland,
+            Some(FocusedWindow::new("0x1", "kitty", "t")),
+            Some(Workspace::new("1", "1")),
+            1000,
+        )
+        .with_project(Some(ProjectContext::new("proj-1", "P", "file")));
+        // Retained: both markers equal the anchor.
+        let kept = retain_focusless(
+            Some(&prev),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            120_000,
+        );
+        assert_eq!(kept.retained_since_ms, Some(1010));
+        assert_eq!(kept.focusless_since_ms, Some(1010));
+        // Expired: carry cleared, streak clock preserved.
+        let expired = retain_focusless(
+            Some(&kept),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010 + 120_001),
+            120_000,
+        );
+        assert_eq!(expired.retained_since_ms, None);
+        assert_eq!(expired.focusless_since_ms, Some(1010));
+        assert!(expired.project.is_none());
+        // Bare previous (no signal): nothing carried, streak continues from
+        // the previous observation time.
+        let bare =
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 2000);
+        let continued = retain_focusless(
+            Some(&bare),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 2010),
+            120_000,
+        );
+        assert_eq!(continued.retained_since_ms, None);
+        assert_eq!(continued.focusless_since_ms, Some(2000));
+        assert!(continued.project.is_none());
+        // Fresh streak (no previous) anchors at the candidate time.
+        let fresh = retain_focusless(
+            None,
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 3000),
+            120_000,
+        );
+        assert_eq!(fresh.retained_since_ms, None);
+        assert_eq!(fresh.focusless_since_ms, Some(3000));
+        // Windowed and unavailable candidates clear both markers.
+        let mut windowed = ctx_with(Some("0x2"), "t2", Some("1"), 3010);
+        windowed.retained_since_ms = Some(1);
+        windowed.focusless_since_ms = Some(1);
+        let out = retain_focusless(Some(&prev), windowed, 120_000);
+        assert_eq!(out.retained_since_ms, None);
+        assert_eq!(out.focusless_since_ms, None);
+        let un = retain_focusless(
+            Some(&prev),
+            DesktopContext::unavailable(Source::Hyprland, 3020),
+            120_000,
+        );
+        assert_eq!(un.retained_since_ms, None);
+        assert_eq!(un.focusless_since_ms, None);
+    }
+
+    #[test]
+    fn retain_focusless_streak_anchor_survives_projectless_row() {
+        // Two consecutive focusless observations where the first is
+        // persisted WITHOUT a carry still expire at `anchor + retention`,
+        // not later: the first bare row records the streak clock, the
+        // second re-reads it.
+        let bare =
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1000);
+        let first = retain_focusless(
+            Some(&bare),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            100,
+        );
+        // Nothing carried, but the streak started at the bare row's time.
+        assert!(first.project.is_none());
+        assert_eq!(first.retained_since_ms, None);
+        assert_eq!(first.focusless_since_ms, Some(1000));
+        // Inside the window anchored at 1000: still no carry, same anchor.
+        let inside = retain_focusless(
+            Some(&first),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1050),
+            100,
+        );
+        assert_eq!(inside.focusless_since_ms, Some(1000));
+        assert_eq!(inside.retained_since_ms, None);
+        // Past `anchor + retention`: still project-less with the SAME anchor
+        // (never extended by the project-less intermediate row).
+        let expired = retain_focusless(
+            Some(&inside),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1101),
+            100,
+        );
+        assert!(expired.project.is_none());
+        assert_eq!(expired.retained_since_ms, None);
+        assert_eq!(
+            expired.focusless_since_ms,
+            Some(1000),
+            "project-less rows must not extend the window"
+        );
+    }
+
+    #[test]
+    fn retain_focusless_with_anchor_explicit_wins_for_live_path() {
+        // The live path threads the newest focusless row's clock explicitly
+        // while the carry source is an older enriched row: expiry is judged
+        // against the streak, not the source.
+        let mut source = ctx_with(Some("0x1"), "t", Some("1"), 1000);
+        source.resource = Some(ResourceContext::new(
+            "neovim",
+            Some("/repo/note.md"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        source.project = Some(ProjectContext::new("proj-1", "P", "file"));
+        // Streak started at 5000 (newer project-less focusless row); the
+        // candidate at 5050 is inside a 100 ms window anchored at 5000.
+        let kept = retain_focusless_with_anchor(
+            Some(&source),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 5050),
+            100,
+            Some(5000),
+        );
+        assert_eq!(kept.project.as_ref().map(|p| p.id.as_str()), Some("proj-1"));
+        assert_eq!(kept.retained_since_ms, Some(5000));
+        assert_eq!(kept.focusless_since_ms, Some(5000));
+        // Same streak, candidate past the window: expired even though the
+        // source row itself is fresh relative to the candidate.
+        let expired = retain_focusless_with_anchor(
+            Some(&source),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 5200),
+            100,
+            Some(5000),
+        );
+        assert!(expired.project.is_none());
+        assert_eq!(expired.retained_since_ms, None);
+        assert_eq!(expired.focusless_since_ms, Some(5000));
+    }
+
+    #[test]
+    fn retain_focusless_legacy_rows_without_markers() {
+        // Older JSON without either marker must still deserialize (additive
+        // fields default to None) and behave sanely with a fresh anchor.
+        let legacy_json = r#"{"focused_window":{"id":"0x1","application":"kitty","title":"t"},"workspace":{"id":"1","name":"1"},"available":true,"source":"hyprland","observed_at_ms":1000,"resource":null,"project":null}"#;
+        let legacy: DesktopContext = serde_json::from_str(legacy_json).expect("legacy deserializes");
+        assert_eq!(legacy.retained_since_ms, None);
+        assert_eq!(legacy.focusless_since_ms, None);
+        let legacy_focusless_json = r#"{"focused_window":null,"workspace":{"id":"1","name":"1"},"available":true,"source":"hyprland","observed_at_ms":1000}"#;
+        let legacy_focusless: DesktopContext =
+            serde_json::from_str(legacy_focusless_json).expect("legacy focusless deserializes");
+        assert_eq!(legacy_focusless.focusless_since_ms, None);
+        // A legacy windowed previous anchors a first focusless observation
+        // at the candidate time (fresh streak).
+        let out = retain_focusless(
+            Some(&legacy),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 600_000),
+            120_000,
+        );
+        // Legacy windowed row names a window (signal) but carries no
+        // resource/project, so the markers anchor fresh at the candidate
+        // with an empty carry.
+        assert_eq!(out.retained_since_ms, Some(600_000));
+        assert_eq!(out.focusless_since_ms, Some(600_000));
+        // A legacy bare focusless previous continues from its own time.
+        let cont = retain_focusless(
+            Some(&legacy_focusless),
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 1010),
+            120_000,
+        );
+        assert_eq!(cont.focusless_since_ms, Some(1000));
+    }
+
+    #[test]
+    fn focusless_markers_ignored_by_semantic_eq_and_cleared_by_with_resource() {
+        let mut a = ctx_with(Some("0x1"), "t", Some("1"), 1000);
+        let mut b = ctx_with(Some("0x1"), "t", Some("1"), 2000);
+        a.retained_since_ms = Some(1000);
+        a.focusless_since_ms = Some(1000);
+        b.retained_since_ms = Some(1500);
+        b.focusless_since_ms = Some(1500);
+        assert!(a.semantic_eq(&b), "streak bookkeeping must never defeat dedup");
+        // Resource refresh clears both markers so stale windows never ride.
+        let cleared = a.with_resource(None);
+        assert_eq!(cleared.retained_since_ms, None);
+        assert_eq!(cleared.focusless_since_ms, None);
     }
 
     #[test]

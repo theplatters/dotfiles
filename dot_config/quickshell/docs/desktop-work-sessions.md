@@ -103,6 +103,26 @@ local open session plus the new event. Gap is checked first
   grace`, the open session finalizes as `interruption` and the later
   event starts the new session. Earlier unresolved events remain in the
   prior session (stable IDs never shift retroactively).
+- Brief compositor focus gaps do not even open an unresolved run: a
+  focusless snapshot (`available`, no focused window — e.g. a Quickshell
+  layer surface takes keyboard focus while the project planner/popup is
+  open) retains the previous snapshot's `resource`/`project` for up to the
+  session's stored interruption grace, anchored at the first observed
+  focusless time (`focusless_since_ms` in the snapshot JSON;
+  `retained_since_ms` still means retention was applied; schema v4 is
+  unchanged). The persisted row stays honestly `focused_window: null`, and
+  repeated focusless events never extend the window (both anchors carry
+  over). Expiry is anchored on the streak clock, so an expired,
+  honestly-cleared focusless row stays expired instead of re-anchoring
+  on an older signal row. A real window event or a workspace change ends
+  retention immediately; past the grace the honest cleared context is persisted and
+  the normal unresolved/interruption rules above apply. The live
+  `current`/`current-project` reads apply the same rule read-only over a
+  bounded lookback (up to 64 newest rows) to find the newest row that
+  actually carries a project/resource — skipping un-enriched same-window
+  rows, and stopping unchanged on an unavailable row, a workspace
+  mismatch, or an intervening unknown-project row — so opening the
+  planner/topbar does not blank the current project indicator.
 - Unresolved session `→` resolved project starts a new project session
   (`project_switch`); unresolved `→` unresolved continues unless gapped.
 - Timestamps drive gaps; equal timestamps order by activity ID upstream
@@ -184,8 +204,8 @@ carries ONLY JSON):
 ```text
 usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-interruption-ms MS]]
        qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS [--limit N]]
-       qs-desktop-context current
-       qs-desktop-context current-project
+       qs-desktop-context [--db PATH] current
+       qs-desktop-context [--db PATH] current-project
        qs-desktop-context [--db PATH] last-activity --project UUID
        qs-desktop-context [--db PATH] resources --project UUID [--limit N]
        qs-desktop-context [--db PATH] current-session

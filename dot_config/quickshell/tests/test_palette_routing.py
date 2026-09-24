@@ -120,6 +120,9 @@ const root = {
   clipboardText: "1\tcat\n2\tdog", selectedIndex: 0,
   requestedOpen: true, confirming: false, confirmationAction: "",
   notice: "", showStats: false, fileTruncated: false,
+  calculatorResult: {matched: false, value: "", error: ""},
+  calculateQuery(expression) { return {matched: false, value: "", error: ""}; },
+  todoConfirming: false,
   searchText() { return this.modeQuery; }
 };
 root.fileRows = [];
@@ -131,8 +134,16 @@ const dataSources = {
   get fileRows() { return root.fileRows || []; },
   set fileRows(v) { root.fileRows = v; },
   pendingFileQuery: "",
-  resetForQueryChange() { root.fileRows = []; },
+  resetForQueryChange() { root.fileRows = []; root.seenRows = []; root.sessionRows = []; },
   scheduleFileSearch() {},
+  get seenRows() { return root.seenRows || []; },
+  set seenRows(v) { root.seenRows = v; },
+  pendingSeenQuery: "",
+  scheduleSeenSearch() {},
+  get sessionRows() { return root.sessionRows || []; },
+  set sessionRows(v) { root.sessionRows = v; },
+  pendingSessionQuery: "",
+  scheduleSessionSearch() {},
 };
 const context = {
   root, resultModel, dataSources, clipboardText: root.clipboardText, todos: root.todos,
@@ -216,6 +227,69 @@ root.rows = [{prefix: "file:", title: "stale", subtitle: "/tmp/stale", kind: "fi
 context.rebuildModel();
 if (root.rows.length !== 0 || resultModel.count !== 0)
   throw new Error("empty file cache did not clear stale file rows");
+
+root.mode = "seen"; root.modeQuery = "deploy";
+root.seenRows = [{prefix: "seen:", title: "/x/a.py", subtitle: "File · Demo",
+                  kind: "seen", payload: {identity: "file:/x/a.py"}}];
+root.rows = [];
+context.rebuildModel();
+if (root.rows.length !== 1 || resultModel.count !== 1 || root.rows[0].kind !== "seen")
+  throw new Error("seen rows were not preserved from authoritative cache");
+// An empty seen cache clears previously displayed rows (stale cache off).
+root.seenRows = [];
+root.rows = [{prefix: "seen:", title: "stale", subtitle: "", kind: "seen", payload: {}}];
+context.rebuildModel();
+if (root.rows.length !== 0 || resultModel.count !== 0)
+  throw new Error("empty seen cache did not clear stale seen rows");
+// A changed seen query schedules the debounced search with the new needle.
+context.query = "seen: deploy2";
+let seenScheduled = 0;
+dataSources.scheduleSeenSearch = () => { seenScheduled++; };
+context.rebuild();
+if (dataSources.pendingSeenQuery !== "deploy2" || seenScheduled !== 1)
+  throw new Error("seen query did not schedule the debounced search");
+// Session cache is authoritative like seen: preserved when present.
+root.mode = "session"; root.modeQuery = "deploy";
+root.sessionRows = [{prefix: "session:", title: "Deploy", subtitle: "Demo",
+                  kind: "session", payload: {session_id: "s"}}];
+root.rows = [];
+context.rebuildModel();
+if (root.rows.length !== 1 || resultModel.count !== 1 || root.rows[0].kind !== "session")
+  throw new Error("session rows were not preserved from authoritative cache");
+// An empty session cache clears previously displayed rows (stale cache off).
+root.sessionRows = [];
+root.rows = [{prefix: "session:", title: "stale", subtitle: "", kind: "session", payload: {}}];
+context.rebuildModel();
+if (root.rows.length !== 0 || resultModel.count !== 0)
+  throw new Error("empty session cache did not clear stale session rows");
+// A changed session query schedules the debounced search with the new needle.
+context.query = "session: deploy2";
+let sessionScheduled = 0;
+dataSources.scheduleSessionSearch = () => { sessionScheduled++; };
+context.rebuild();
+if (dataSources.pendingSessionQuery !== "deploy2" || sessionScheduled !== 1)
+  throw new Error("session query did not schedule the debounced search");
+// hist: and inbox: are deleted: they fall through to unified search and
+// never schedule a dedicated source.
+context.query = "hist: deploy";
+context.rebuild();
+if (root.mode !== "" || dataSources.pendingSeenQuery === "hist: deploy")
+  throw new Error("hist query did not fall through to unified search");
+context.query = "inbox: triage";
+context.rebuild();
+if (root.mode !== "")
+  throw new Error("inbox query did not fall through to unified search");
+// todo: is a synchronous composer row: no search, no cache. Enter starts
+// prepare, never confirms — covered by the todo ladder tests.
+context.query = "todo: fix the backoff";
+context.rebuild();
+if (root.mode !== "todo" || root.rows.length !== 1 || root.rows[0].kind !== "todoQuickAdd" ||
+    root.rows[0].prefix !== "todo:" || resultModel.count !== 1)
+  throw new Error("todo composer row was not built synchronously");
+context.query = "todo:";
+context.rebuild();
+if (root.rows.length !== 0)
+  throw new Error("bare todo incorrectly built a composer row");
 '''
         completed = subprocess.run(
             ["node", "-e", script, str(PALETTE), str(QUERY), str(TEXT), str(MODEL)],

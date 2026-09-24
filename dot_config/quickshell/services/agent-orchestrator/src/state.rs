@@ -32,6 +32,14 @@ pub const MAX_MODELS_BYTES: usize = 256 * 1024;
 pub struct PendingReq {
     pub request: Value,
     pub deadline: Instant,
+    /// True once any UI has opened a dialog for this request (S-048). A
+    /// surfaced request never expires silently: it lives until answered,
+    /// stopped, or bridge/child exit.
+    pub surfaced: bool,
+    /// True while parked by an explicit defer (S-048). A deferred request
+    /// never expires and is skipped while non-deferred requests remain;
+    /// when only deferred requests remain a new round clears the flags.
+    pub deferred: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -524,10 +532,20 @@ impl AgentState {
     }
 
     pub fn refresh_pending_approval(&mut self, events: &mut Vec<UiEvent>) {
+        // Round-robin (S-048): surface the first non-deferred request. A
+        // deferred request is skipped while other non-deferred requests
+        // remain; when only deferred requests remain a new round clears
+        // their flags and the first is surfaced again.
+        if !self.pending_requests.values().any(|p| !p.deferred) {
+            for p in self.pending_requests.values_mut() {
+                p.deferred = false;
+            }
+        }
         let next = self
             .pending_requests
             .values()
-            .next()
+            .find(|p| !p.deferred)
+            .or_else(|| self.pending_requests.values().next())
             .map(|p| p.request.clone());
         let changed = next != self.pending_approval;
         self.pending_approval = next;
@@ -540,11 +558,15 @@ impl AgentState {
     }
 
     pub fn expire_approvals(&mut self, events: &mut Vec<UiEvent>) -> Vec<Value> {
+        // Fail-closed expiry (S-048) applies ONLY to requests that were
+        // never surfaced to any UI: the safety valve for dead/unresponsive
+        // UIs. Surfaced and deferred requests never expire silently; they
+        // are cancelled only by explicit Reject/Stop/exit.
         let now = Instant::now();
         let expired: Vec<String> = self
             .pending_requests
             .iter()
-            .filter(|(_, p)| p.deadline <= now)
+            .filter(|(_, p)| !p.surfaced && !p.deferred && p.deadline <= now)
             .map(|(k, _)| k.clone())
             .collect();
         let mut lines = Vec::new();
@@ -558,7 +580,12 @@ impl AgentState {
         lines
     }
 
-    pub fn handle_ui_request(&mut self, value: &Value, events: &mut Vec<UiEvent>) {
+    pub fn handle_ui_request(&mut self, value: &Value, events: &mut Vec<UiEvent>) -> Vec<Value> {
+        // Returns an extension_ui_response line to write when the child is
+        // live (overflow cancel only). Never starts the child; caller decides
+        // whether to write. Mirrors the reject_all_requests/expire_approvals
+        // contract.
+        let mut lines = Vec::new();
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
         if !["select", "confirm", "input", "editor"].contains(&method) {
             if method == "notify" {
@@ -568,7 +595,7 @@ impl AgentState {
                     }
                 }
             }
-            return;
+            return lines;
         }
         if self.session_switching && method == "select" {
             self.busy = true;
@@ -580,7 +607,7 @@ impl AgentState {
             .unwrap_or("")
             .to_string();
         if id.is_empty() {
-            return;
+            return lines;
         }
         // Fail-closed on duplicate ids: never replace the displayed payload
         // under an id. The first request wins; a reused id (stale Pi
@@ -588,7 +615,7 @@ impl AgentState {
         // the visible dialog. Stale reuse across restarts is already fenced
         // by reject_all_requests() on exit, which clears the whole map.
         if self.pending_requests.contains_key(&id) {
-            return;
+            return lines;
         }
         let timeout_ms = value
             .get("timeout")
@@ -596,21 +623,59 @@ impl AgentState {
             .unwrap_or(APPROVAL_DEFAULT_MS)
             .min(APPROVAL_MAX_MS);
         let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        // Bound the approval queue sensibly.
+        // Bound the approval queue sensibly. Overflow is TOLD, not silent:
+        // answer immediately with the same cancelled line expire_approvals /
+        // reject_all_requests produce so the child's tool call never hangs.
+        // The refused id is never inserted, so expiry can never touch it.
         if self.pending_requests.len() >= 32 {
-            return;
+            lines.push(json!({"type": "extension_ui_response", "id": id, "cancelled": true}));
+            self.push_diagnostic(&format!("approval queue full; cancelled {id}"));
+            return lines;
         }
         self.pending_requests.insert(
             id,
             PendingReq {
                 request: value.clone(),
                 deadline,
+                surfaced: false,
+                deferred: false,
             },
         );
         if self.pending_approval.is_none() {
             self.pending_approval = Some(value.clone());
             events.push(UiEvent::new("uiRequest", vec![value.clone()]));
         }
+        lines
+    }
+
+    /// Mark a request as surfaced: a UI opened a dialog for it (S-048).
+    /// Returns false for unknown ids. A surfaced request never expires.
+    pub fn mark_surfaced(&mut self, request_id: &str, events: &mut Vec<UiEvent>) -> bool {
+        let Some(entry) = self.pending_requests.get_mut(request_id) else {
+            return false;
+        };
+        entry.surfaced = true;
+        self.refresh_pending_approval(events);
+        true
+    }
+
+    /// Park a request via an explicit defer (S-048): it is skipped while
+    /// other non-deferred requests remain and re-surfaces when the round
+    /// reaches it. Returns false for unknown ids. A deferred request never
+    /// expires; it is cancelled only by explicit Reject/Stop/exit.
+    pub fn defer_request(&mut self, request_id: &str, events: &mut Vec<UiEvent>) -> bool {
+        let Some(entry) = self.pending_requests.get_mut(request_id) else {
+            return false;
+        };
+        // Defer implies the request was visible, hence surfaced.
+        entry.surfaced = true;
+        entry.deferred = true;
+        self.refresh_pending_approval(events);
+        true
+    }
+
+    pub fn deferred_count(&self) -> usize {
+        self.pending_requests.values().filter(|p| p.deferred).count()
     }
 
     pub fn snapshot(&self) -> Value {
@@ -653,6 +718,7 @@ impl AgentState {
             "status": self.status,
             "pendingApproval": self.pending_approval.clone().unwrap_or(Value::Null),
             "pendingRequests": pending_requests,
+            "deferredCount": self.deferred_count(),
             "serial": self.serial,
             "generation": self.generation,
             "lastRequestId": self.last_request_id,
@@ -802,7 +868,8 @@ impl AgentState {
             return writes;
         }
         if vtype == "extension_ui_request" {
-            self.handle_ui_request(value, events);
+            let mut out = self.handle_ui_request(value, events);
+            writes.append(&mut out);
             return writes;
         }
         writes
@@ -2117,6 +2184,244 @@ mod tests {
             "displayed approval must stay identical exact fields"
         );
         assert_eq!(displayed, first);
+    }
+
+    // -- S-048: real deferral (surfaced/deferred never expire; round-robin) --
+
+    fn approval_value(id: &str) -> Value {
+        json!({"type":"extension_ui_request","id":id,"method":"confirm",
+            "message":format!("approve {id}?"),"timeout":60000})
+    }
+
+    fn force_past_deadline(s: &mut AgentState, id: &str) {
+        let entry = s.pending_requests.get_mut(id).expect("queued");
+        entry.deadline = Instant::now() - std::time::Duration::from_secs(1);
+    }
+
+    #[test]
+    fn unsurfaced_request_expires_fail_closed() {
+        // A request NEVER surfaced to any UI keeps today's deadline and is
+        // cancelled on expiry: the safety valve for dead UIs.
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        s.handle_ui_request(&approval_value("never-seen"), &mut events);
+        assert_eq!(s.snapshot()["deferredCount"], json!(0));
+        force_past_deadline(&mut s, "never-seen");
+        let lines = s.expire_approvals(&mut events);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["id"], json!("never-seen"));
+        assert_eq!(lines[0]["cancelled"], json!(true));
+        assert!(s.pending_requests.is_empty());
+        assert!(s.pending_approval.is_none());
+        assert!(events.iter().any(|e| e.name == "uiRequest"));
+    }
+
+    #[test]
+    fn surfaced_request_never_expires() {
+        // Once surfaced, no silent expiry: the request lives past its
+        // deadline until answered, stopped, or exit.
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        s.handle_ui_request(&approval_value("shown"), &mut events);
+        assert!(s.mark_surfaced("shown", &mut events));
+        assert!(!s.mark_surfaced("no-such-id", &mut events));
+        force_past_deadline(&mut s, "shown");
+        let lines = s.expire_approvals(&mut events);
+        assert!(lines.is_empty(), "surfaced request must not expire");
+        assert!(s.pending_requests.contains_key("shown"));
+        assert_eq!(
+            s.pending_approval.as_ref().and_then(|v| v.get("id")),
+            Some(&json!("shown"))
+        );
+        assert_eq!(s.snapshot()["deferredCount"], json!(0));
+    }
+
+    #[test]
+    fn defer_parks_round_robin_and_never_expires() {
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        s.handle_ui_request(&approval_value("a-first"), &mut events);
+        s.handle_ui_request(&approval_value("b-second"), &mut events);
+        // BTreeMap key order: a-first is displayed first.
+        assert_eq!(
+            s.pending_approval.as_ref().and_then(|v| v.get("id")),
+            Some(&json!("a-first"))
+        );
+        // Defer parks a-first: b-second surfaces, deferredCount reports it.
+        assert!(s.defer_request("a-first", &mut events));
+        assert!(!s.defer_request("no-such-id", &mut events));
+        assert_eq!(
+            s.pending_approval.as_ref().and_then(|v| v.get("id")),
+            Some(&json!("b-second"))
+        );
+        assert_eq!(s.snapshot()["deferredCount"], json!(1));
+        // Neither expires past the deadline, deferred or not-yet-surfaced.
+        force_past_deadline(&mut s, "a-first");
+        force_past_deadline(&mut s, "b-second");
+        // b-second was never explicitly surfaced, but the deferral round
+        // advanced to it; surface it as the displaying UI would.
+        assert!(s.mark_surfaced("b-second", &mut events));
+        let lines = s.expire_approvals(&mut events);
+        assert!(lines.is_empty(), "deferred/surfaced requests must not expire");
+        assert_eq!(s.pending_requests.len(), 2);
+        // Answering b-second starts a new round: the parked a-first is
+        // re-surfaced with its deferred flag cleared.
+        s.pending_requests.remove("b-second");
+        s.refresh_pending_approval(&mut events);
+        assert_eq!(
+            s.pending_approval.as_ref().and_then(|v| v.get("id")),
+            Some(&json!("a-first"))
+        );
+        assert_eq!(s.snapshot()["deferredCount"], json!(0));
+        // The re-surfaced request still never expires.
+        let lines = s.expire_approvals(&mut events);
+        assert!(lines.is_empty());
+        assert!(s.pending_requests.contains_key("a-first"));
+    }
+
+    #[test]
+    fn single_defer_starts_a_new_round_in_place() {
+        // Deferring the only request clears the flag via the new-round rule
+        // and keeps displaying it; nothing is lost and nothing expires.
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        s.handle_ui_request(&approval_value("only"), &mut events);
+        let shown = s.pending_approval.clone();
+        assert!(s.defer_request("only", &mut events));
+        assert_eq!(s.pending_approval, shown);
+        assert_eq!(s.snapshot()["deferredCount"], json!(0));
+        force_past_deadline(&mut s, "only");
+        assert!(s.expire_approvals(&mut events).is_empty());
+    }
+
+    #[test]
+    fn approval_queue_cap_and_duplicate_rule_unchanged() {
+        // 32-request cap and duplicate-id fail-closed rule are untouched by
+        // the deferral change.
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        for i in 0..32 {
+            s.handle_ui_request(&approval_value(&format!("q-{i:02}")), &mut events);
+        }
+        assert_eq!(s.pending_requests.len(), 32);
+        s.handle_ui_request(&approval_value("q-overflow"), &mut events);
+        assert_eq!(s.pending_requests.len(), 32);
+        assert!(!s.pending_requests.contains_key("q-overflow"));
+        let before = events.len();
+        s.handle_ui_request(
+            &json!({"type":"extension_ui_request","id":"q-00","method":"confirm",
+                "message":"EVIL-SWAP","timeout":60000}),
+            &mut events,
+        );
+        assert_eq!(events.len(), before);
+        assert_eq!(s.pending_requests["q-00"].request["message"], json!("approve q-00?"));
+    }
+
+    #[test]
+    fn queue_overflow_answers_cancelled_and_leaves_queue_intact() {
+        // Fill the queue to the 32-request cap, then submit a 33rd request:
+        // the overflow must be TOLD (cancelled line for the 33rd id), never
+        // silently swallowed, and the first 32 must be untouched.
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        for i in 0..32 {
+            let lines = s.handle_ui_request(&approval_value(&format!("q-{i:02}")), &mut events);
+            assert!(lines.is_empty(), "inserted requests owe no child line");
+        }
+        assert_eq!(s.pending_requests.len(), 32);
+        let approval_before = s.pending_approval.clone();
+        let snapshot_before = s.snapshot();
+        let events_before = events.len();
+
+        let overflow = approval_value("q-overflow");
+        let lines = s.handle_ui_request(&overflow, &mut events);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            json!({"type": "extension_ui_response", "id": "q-overflow", "cancelled": true})
+        );
+        // The refused id is never inserted: expiry can never touch it.
+        assert_eq!(s.pending_requests.len(), 32);
+        assert!(!s.pending_requests.contains_key("q-overflow"));
+        assert_eq!(s.pending_approval, approval_before);
+        assert_eq!(s.snapshot()["pendingRequests"].as_object().unwrap().len(), 32);
+        assert_eq!(
+            s.snapshot()["pendingRequests"],
+            snapshot_before["pendingRequests"]
+        );
+        assert_eq!(s.snapshot()["pendingApproval"], snapshot_before["pendingApproval"]);
+        assert_eq!(s.snapshot()["deferredCount"], json!(0));
+        // No new dialog is surfaced for the refused request.
+        assert_eq!(events.len(), events_before);
+        // The refusal is recorded through the bounded diagnostic tail.
+        assert!(s.diagnostic.contains("q-overflow"));
+    }
+
+    #[test]
+    fn parked_overflow_queue_keeps_deferral_round_robin() {
+        // The 32 parked requests are unaffected by a refused 33rd: defer one
+        // and advance a round with existing round-robin behavior intact.
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        for i in 0..32 {
+            s.handle_ui_request(&approval_value(&format!("q-{i:02}")), &mut events);
+        }
+        let refused = s.handle_ui_request(&approval_value("q-overflow"), &mut events);
+        assert_eq!(refused.len(), 1);
+        // Defer the displayed head; the next request surfaces instead.
+        assert!(s.defer_request("q-00", &mut events));
+        assert_eq!(
+            s.pending_approval.as_ref().and_then(|v| v.get("id")),
+            Some(&json!("q-01"))
+        );
+        assert_eq!(s.snapshot()["deferredCount"], json!(1));
+        assert_eq!(s.pending_requests.len(), 32);
+        assert!(!s.pending_requests.contains_key("q-overflow"));
+        // Answering everything else starts a new round: parked q-00
+        // re-surfaces with its deferred flag cleared.
+        for i in 1..32 {
+            s.pending_requests.remove(&format!("q-{i:02}"));
+        }
+        s.refresh_pending_approval(&mut events);
+        assert_eq!(
+            s.pending_approval.as_ref().and_then(|v| v.get("id")),
+            Some(&json!("q-00"))
+        );
+        assert_eq!(s.snapshot()["deferredCount"], json!(0));
+    }
+
+    #[test]
+    fn overflow_cancelled_line_matches_expiry_shape() {
+        // The overflow response must have exactly the same keys as the
+        // cancelled line expire_approvals produces (byte-for-byte shape).
+        let mut s = journal_state();
+        let mut events = Vec::new();
+        for i in 0..32 {
+            s.handle_ui_request(&approval_value(&format!("q-{i:02}")), &mut events);
+        }
+        let overflow = s.handle_ui_request(&approval_value("q-overflow"), &mut events);
+        assert_eq!(overflow.len(), 1);
+        // Reference shape from the fail-closed expiry valve.
+        let mut r = journal_state();
+        let mut revents = Vec::new();
+        r.handle_ui_request(&approval_value("ref"), &mut revents);
+        force_past_deadline(&mut r, "ref");
+        let expired = r.expire_approvals(&mut revents);
+        assert_eq!(expired.len(), 1);
+        let o_keys: Vec<&String> = overflow[0].as_object().unwrap().keys().collect();
+        let e_keys: Vec<&String> = expired[0].as_object().unwrap().keys().collect();
+        assert_eq!(o_keys, e_keys);
+        assert_eq!(overflow[0]["type"], expired[0]["type"]);
+        assert_eq!(overflow[0]["cancelled"], expired[0]["cancelled"]);
+        assert_eq!(overflow[0]["type"], json!("extension_ui_response"));
+        // Same construction as reject_all_requests: identical key order.
+        let mut j = journal_state();
+        let mut jevents = Vec::new();
+        j.handle_ui_request(&approval_value("rej"), &mut jevents);
+        let rejected = j.reject_all_requests(&mut jevents);
+        assert_eq!(rejected.len(), 1);
+        let r_keys: Vec<&String> = rejected[0].as_object().unwrap().keys().collect();
+        assert_eq!(o_keys, r_keys);
     }
 
     // -- palette (general) mode: same fencing, never scoped graph --

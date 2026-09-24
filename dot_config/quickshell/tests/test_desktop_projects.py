@@ -1435,24 +1435,25 @@ class PolicyCoherenceTests(unittest.TestCase):
     """Policy text and the tool_call gate agree on the desktop exception.
 
     Registration tests only prove tools exist; these prove every scope
-    allowlist (palette/journal/project) explicitly permits the seven
+    allowlist (palette/journal/project) explicitly permits the nine
     read-only desktop tools without weakening mutation restrictions.
     """
 
-    DESKTOP_SEVEN = ("desktop_current_context", "desktop_project_todos",
+    DESKTOP_NINE = ("desktop_current_context", "desktop_project_todos",
                      "desktop_project_logseq_context", "desktop_project_activity",
                      "desktop_current_session", "desktop_search_activity",
-                     "desktop_get_session", "desktop_resume_plan")
+                     "desktop_get_session", "desktop_resume_plan",
+                     "session_search")
 
     def test_system_scope_bullets_permit_desktop_exception(self):
         system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
-        for name in self.DESKTOP_SEVEN:
+        for name in self.DESKTOP_NINE:
             self.assertIn(name, system)
         # Palette and project bullets name the exception explicitly.
         self.assertGreaterEqual(
-            system.count("eight read-only desktop tools"), 2)
+            system.count("nine read-only desktop tools"), 2)
         # Journal bullet carries the same exception.
-        self.assertIn("eight-tool desktop read-only exception", system)
+        self.assertIn("nine-tool desktop read-only exception", system)
         # The exception never permits writes or skips approvals.
         self.assertIn("desktop exception never permits writes", system)
         # Mutation restrictions are unchanged.
@@ -1463,15 +1464,15 @@ class PolicyCoherenceTests(unittest.TestCase):
     def test_skill_inventories_permit_desktop_exception(self):
         skill = (ROOT / ".pi" / "skills" / "logseq-graph" / "SKILL.md"
                  ).read_text(encoding="utf-8")
-        for name in self.DESKTOP_SEVEN:
+        for name in self.DESKTOP_NINE:
             self.assertIn(name, skill)
         self.assertIn("exception in every scope", skill)
         self.assertIn("same list as above", skill)
         self.assertIn("read-only and changes no", skill)
 
-    def test_gate_returns_early_for_exactly_eight(self):
+    def test_gate_returns_early_for_exactly_nine(self):
         allowlist = EXTENSION.split("const DESKTOP_READ_TOOLS")[1].split("]")[0]
-        for name in self.DESKTOP_SEVEN:
+        for name in self.DESKTOP_NINE:
             self.assertIn(f'"{name}"', allowlist)
         self.assertNotIn("desktop_current_project", allowlist)
         self.assertIn(
@@ -1491,7 +1492,7 @@ class PolicyCoherenceTests(unittest.TestCase):
 
     @unittest.skipUnless(__import__("shutil").which("bun"), "bun required")
     def test_policy_gate_desktop_exception_every_scope(self):
-        """Executable gate check: 8 desktop tools pass in palette/project/
+        """Executable gate check: 9 desktop tools pass in palette/project/
         journal scopes while scoped denials still hold (policy text matches
         runtime behavior, not just registration)."""
         import shutil as _shutil
@@ -1513,7 +1514,7 @@ const lstatSync = () => { throw new Error("unused"); };
 const readFileSync = () => { throw new Error("unused"); };
 const realpathSync: any = { native: (value: string) => value };
 const SessionManager: any = {};
-const Type: any = { Object: (v: any) => v, String: () => ({}), Optional: (v: any) => v, Integer: () => ({}), Boolean: () => ({}) };
+const Type: any = { Object: (v: any) => v, String: () => ({}), Optional: (v: any) => v, Integer: () => ({}), Boolean: () => ({}), Any: () => ({}) };
 const tools: any = {}, hooks: any = {};
 function spawn(command: string, args: string[]) {
   const child: any = new EventEmitter();
@@ -1531,16 +1532,16 @@ const pi: any = { on(n: string, cb: any) { hooks[n] = cb; },
   registerTool(t: any) { tools[t.name] = t; }, registerCommand() {} };
 const assert = (v: any, m: string) => { if (!v) throw new Error(m); };
 const ctx: any = { cwd: "/work", hasUI: false, ui: {} };
-// Palette scope: all eight pass.
+// Palette scope: all nine pass.
 process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "";
 desktopAgent(pi);
 const gate = hooks.tool_call;
-const SEVEN = ["desktop_current_context", "desktop_project_todos", "desktop_project_logseq_context", "desktop_project_activity", "desktop_current_session", "desktop_search_activity", "desktop_get_session", "desktop_resume_plan"];
+const SEVEN = ["desktop_current_context", "desktop_project_todos", "desktop_project_logseq_context", "desktop_project_activity", "desktop_current_session", "desktop_search_activity", "desktop_get_session", "desktop_resume_plan", "session_search"];
 for (const name of SEVEN) {
   const r = await gate({ toolName: name, input: {} }, ctx);
   assert(!r?.block, name + " blocked in palette scope");
 }
-// Project scope: all eight pass, generic search still denied.
+// Project scope: all nine pass, generic search still denied.
 process.env.QS_PROJECT_PATH = "pages/Work.md"; process.env.QS_JOURNAL_MODE = "";
 for (const name of SEVEN) {
   const r = await gate({ toolName: name, input: {} }, ctx);
@@ -1548,7 +1549,7 @@ for (const name of SEVEN) {
 }
 const projDenied = await gate({ toolName: "logseq_search", input: { query: "x" } }, ctx);
 assert(projDenied?.block === true, "project scope no longer denies generic tools");
-// Journal scope: all eight pass, generic search still denied.
+// Journal scope: all nine pass, generic search still denied.
 process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "1";
 for (const name of SEVEN) {
   const r = await gate({ toolName: name, input: {} }, ctx);
@@ -1571,24 +1572,26 @@ console.log(JSON.stringify({ ok: true }));
 
 
 class ExtensionContractTests(unittest.TestCase):
-    def test_registers_eight_coherent_desktop_tools(self):
+    def test_registers_nine_coherent_desktop_tools(self):
         for name in ("desktop_current_context", "desktop_project_todos",
                      "desktop_project_logseq_context", "desktop_project_activity",
                      "desktop_current_session",
                      "desktop_search_activity",
-                     "desktop_get_session", "desktop_resume_plan"):
+                     "desktop_get_session", "desktop_resume_plan",
+                     "session_search"):
             self.assertIn(f'name: "{name}"', EXTENSION)
         # Overlapping low-level history tools are removed from Pi.
         for name in ("desktop_current_project", "desktop_project_resources",
                      "desktop_work_sessions", "desktop_session_resources",
                      "desktop_session_events"):
             self.assertNotIn(f'name: "{name}"', EXTENSION)
-        # Read allowlist covers exactly the eight coherent tools.
+        # Read allowlist covers exactly the nine coherent tools.
         allowlist = EXTENSION.split("const DESKTOP_READ_TOOLS")[1].split("]")[0]
         for name in ("desktop_current_context", "desktop_project_todos",
                      "desktop_project_logseq_context", "desktop_project_activity",
                      "desktop_current_session", "desktop_search_activity",
-                     "desktop_get_session", "desktop_resume_plan"):
+                     "desktop_get_session", "desktop_resume_plan",
+                     "session_search"):
             self.assertIn(name, allowlist)
         for name in ("desktop_current_project", "desktop_project_resources",
                      "desktop_work_sessions", "desktop_session_resources",
@@ -1688,8 +1691,14 @@ class ExtensionContractTests(unittest.TestCase):
     def test_protected_paths_cover_new_helper(self):
         self.assertIn("desktop_projects.py", EXTENSION)
         # Trusted registry import must be gated like the other helpers.
-        self.assertIn('"desktop_projects.py", "desktop_resume.py", "projects.py"', EXTENSION)
-        self.assertIn("desktop_projects|desktop_resume|projects", EXTENSION)
+        # Each helper is asserted individually: the protected list is one
+        # long union, so no adjacent-order substring is assumed.
+        for name in ('"desktop_projects.py"', '"desktop_resume.py"',
+                     '"projects.py"', '"project_folder.py"'):
+            self.assertIn(name, EXTENSION)
+        for name in ("desktop_projects", "desktop_resume", "projects",
+                     "project_folder"):
+            self.assertIn(name, EXTENSION)
 
     @unittest.skipUnless(__import__("shutil").which("bun"), "bun required")
     def test_coherent_tools_validate_and_route(self):
@@ -1700,7 +1709,7 @@ class ExtensionContractTests(unittest.TestCase):
         all structured filters and paired-range gates, and
         desktop_get_session 32-hex/resourceLimit/includeEvents/eventLimit
         gates. Spawn is stubbed to capture the Python argv; validation
-        failures must throw before any spawn, and all eight read tools stay
+        failures must throw before any spawn, and all nine read tools stay
         unblocked in scoped modes. Dynamic timezone wording is embedded in
         search descriptions.
         """
@@ -1723,7 +1732,7 @@ const lstatSync = () => { throw new Error("unused"); };
 const readFileSync = () => { throw new Error("unused"); };
 const realpathSync: any = { native: (value: string) => value };
 const SessionManager: any = {};
-const Type: any = { Object: (v: any) => v, String: () => ({}), Optional: (v: any) => v, Integer: () => ({}), Boolean: () => ({}) };
+const Type: any = { Object: (v: any) => v, String: () => ({}), Optional: (v: any) => v, Integer: () => ({}), Boolean: () => ({}), Any: () => ({}) };
 const tools: any = {}, hooks: any = {};
 const calls: any[] = [];
 function spawn(command: string, args: string[]) {
@@ -1746,15 +1755,15 @@ desktopAgent(pi);
 const assert = (v: any, m: string) => { if (!v) throw new Error(m); };
 const ctx: any = { cwd: "/work", hasUI: false, ui: {} };
 const names = Object.keys(tools).join(",");
-assert(names === "logseq_search,logseq_todos,logseq_append_journal,logseq_agenda_list,logseq_agenda_add,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "eight tools wrong: " + names);
-// All eight desktop tools stay unblocked in project + journal scopes.
+assert(names === "logseq_search,logseq_todos,logseq_append_journal,create_project,create_logseq_page,logseq_agenda_list,logseq_agenda_add,zotero_search,zotero_item,zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan,session_search", "nine tools wrong: " + names);
+// All nine desktop tools stay unblocked in project + journal scopes.
 process.env.QS_PROJECT_PATH = "pages/Work.md"; process.env.QS_JOURNAL_MODE = "";
-for (const name of ["desktop_current_context", "desktop_project_todos", "desktop_project_logseq_context", "desktop_project_activity", "desktop_current_session", "desktop_search_activity", "desktop_get_session", "desktop_resume_plan"]) {
+for (const name of ["desktop_current_context", "desktop_project_todos", "desktop_project_logseq_context", "desktop_project_activity", "desktop_current_session", "desktop_search_activity", "desktop_get_session", "desktop_resume_plan", "session_search"]) {
   const r = await hooks.tool_call({ toolName: name, input: {} }, ctx);
   assert(!r?.block, name + " blocked in project scope");
 }
 process.env.QS_PROJECT_PATH = ""; process.env.QS_JOURNAL_MODE = "1";
-for (const name of ["desktop_current_context", "desktop_search_activity", "desktop_get_session", "desktop_resume_plan"]) {
+for (const name of ["desktop_current_context", "desktop_search_activity", "desktop_get_session", "desktop_resume_plan", "session_search"]) {
   const r = await hooks.tool_call({ toolName: name, input: {} }, ctx);
   assert(!r?.block, name + " blocked in journal mode");
 }
@@ -1844,7 +1853,7 @@ const lstatSync = () => { throw new Error("unused"); };
 const readFileSync = () => { throw new Error("unused"); };
 const realpathSync: any = { native: (value: string) => value };
 const SessionManager: any = {};
-const Type: any = { Object: (v: any) => v, String: () => ({}), Optional: (v: any) => v, Integer: () => ({}), Boolean: () => ({}) };
+const Type: any = { Object: (v: any) => v, String: () => ({}), Optional: (v: any) => v, Integer: () => ({}), Boolean: () => ({}), Any: () => ({}) };
 const tools: any = {}, hooks: any = {};
 const calls: any[] = [];
 function spawn(command: string, args: string[]) {
@@ -1998,6 +2007,1017 @@ try {
                              completed.stderr + completed.stdout)
             self.assertEqual(
                 json.loads(completed.stdout.splitlines()[-1]), {"ok": True})
+
+
+class SeenMapperTests(unittest.TestCase):
+    SID1 = "a" * 32
+    SID2 = "b" * 32
+    GHOST = "00000000-0000-4000-8000-000000000000"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.reg = str(self.base / "projects.toml")
+        self.old_env = os.environ.get(projects.ENV_VAR)
+        os.environ.pop(projects.ENV_VAR, None)
+
+    def tearDown(self):
+        if self.old_env is None:
+            os.environ.pop(projects.ENV_VAR, None)
+        else:
+            os.environ[projects.ENV_VAR] = self.old_env
+        self.temp.cleanup()
+
+    def make_entry(self, name="Demo", logseq_path="pages/Demo.md"):
+        created = projects.create_project(
+            {"name": name, "logseq_path": logseq_path} if logseq_path else
+            {"name": name}, self.reg)
+        return created["project"]
+
+    def fake_current(self, project):
+        return {"available": True, "source": "hyprland",
+                "observed_at_ms": 1, "focused_window": None,
+                "workspace": None, "resource": None, "project": project}
+
+    def _payload(self, sessions, query="q"):
+        return {"query": {"project": None, "query": query, "limit": 20},
+                "sessions": sessions, "count": len(sessions)}
+
+    def _session(self, sid, matched, project, resources):
+        return {"session_id": sid, "device_id": "c" * 32,
+                "project": project, "start_ms": 1,
+                "end_ms": matched if isinstance(matched, int) else 1,
+                "event_count": 1, "status": "closed",
+                "matched_at_ms": matched, "applications": ["kitty"],
+                "resources": resources}
+
+    def _record(self, resource, last_seen, occurrence=1,
+                identity="portable:file:x"):
+        return {"session_id": self.SID1, "resource_key": "k",
+                "kind": "portable", "portable_identity": identity,
+                "local_identity": None, "resource": resource,
+                "occurrence_count": occurrence, "first_seen_ms": 1,
+                "last_seen_ms": last_seen, "first_activity_id": 1,
+                "last_activity_id": 2}
+
+    def _file_ctx(self, path="/repo/a/src/main.rs", root="/repo/a"):
+        return {"adapter": "nvim", "file": path, "cwd": root,
+                "git_root": root, "git_branch": None, "git_remote": None,
+                "url": None, "page": None, "title": None, "zotero": None}
+
+    def test_query_row_shape_and_kind_enum(self):
+        zotero = {"server_id": "srv12345", "library_type": "user",
+                  "library_id": "100", "item_key": "ABCD1234",
+                  "attachment_key": None, "collections": [],
+                  "ancestor_collections": [], "version": 3,
+                  "uri": "zotero://select/library/items/ABCD1234"}
+        resources = [
+            self._record(self._file_ctx(), 10),
+            self._record({"adapter": "zen",
+                          "url": "https://example.com/docs",
+                          "title": "Docs Page", "file": None, "cwd": None,
+                          "git_root": None, "page": None, "zotero": None},
+                         9, identity="portable:url:https://example.com/docs"),
+            self._record({"adapter": "zotero", "title": "Some Paper",
+                          "file": None, "cwd": None, "git_root": None,
+                          "url": None, "page": None, "zotero": zotero},
+                         8, identity="portable:zotero:x"),
+            self._record({"adapter": "kitty", "page": "nvim ~/notes",
+                          "file": None, "cwd": None, "git_root": None,
+                          "url": None, "title": None, "zotero": None},
+                         7, identity="portable:page:nvim ~/notes"),
+            self._record({"adapter": "kitty", "cwd": "/tmp/work",
+                          "file": None, "git_root": None, "url": None,
+                          "page": None, "title": None, "zotero": None},
+                         6, identity="local:cwd:/tmp/work"),
+            # Adapter-only: no location, skipped from the rows.
+            self._record({"adapter": "kitty", "file": None, "cwd": None,
+                          "git_root": None, "url": None, "page": None,
+                          "title": None, "zotero": None}, 5),
+        ]
+        project = {"id": self.GHOST, "name": "G"}
+        payload = self._payload(
+            [self._session(self.SID1, 10, project, resources)])
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.seen(
+                "q", None, None, self.reg, "/bin/x", None)
+        self.assertEqual(len(out["rows"]), 5)
+        self.assertEqual(out["total"], 5)
+        self.assertFalse(out["truncated"])
+        for row in out["rows"]:
+            self.assertEqual(
+                set(row), {"kind", "label", "identity", "project_id",
+                           "project_name", "session_id", "last_seen_ms",
+                           "occurrence_count"})
+            self.assertIn(row["kind"], ("file", "url", "zotero", "page"))
+            self.assertLessEqual(len(row["label"]), 160)
+            self.assertEqual(row["project_id"], self.GHOST)
+            self.assertEqual(row["project_name"], "G")
+            self.assertEqual(row["session_id"], self.SID1)
+        by_kind = {}
+        for row in out["rows"]:
+            by_kind.setdefault(row["kind"], []).append(row)
+        self.assertEqual(by_kind["file"][0]["label"], "src/main.rs")
+        self.assertEqual(by_kind["file"][1]["label"], "/tmp/work")
+        self.assertIn("Docs Page", by_kind["url"][0]["label"])
+        self.assertIn("example.com", by_kind["url"][0]["label"])
+        self.assertIn("Some Paper", by_kind["zotero"][0]["label"])
+        self.assertIn("zotero://", by_kind["zotero"][0]["label"])
+        self.assertEqual(by_kind["page"][0]["label"], "nvim ~/notes")
+        self.assertEqual(by_kind["file"][0]["identity"], "portable:file:x")
+        # Newest resource first within the session.
+        seen_ms = [row["last_seen_ms"] for row in out["rows"]]
+        self.assertEqual(seen_ms, sorted(seen_ms, reverse=True))
+
+    def test_query_orders_sessions_by_match(self):
+        old = self._session(self.SID1, 50, None,
+                            [self._record(self._file_ctx(), 50)])
+        new = self._session(self.SID2, 200, None,
+                            [self._record(self._file_ctx("/repo/a/b.py"), 60)])
+        payload = self._payload([old, new])
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.seen(
+                "q", None, None, self.reg, "/bin/x", None)
+        self.assertEqual(
+            [row["session_id"] for row in out["rows"]],
+            [self.SID2, self.SID1])
+        self.assertIsNone(out["rows"][0]["project_id"])
+        self.assertEqual(out["rows"][0]["project_name"], "")
+
+    def test_query_bounded_twenty_rows_and_labels(self):
+        resources = [self._record(self._file_ctx(f"/repo/a/f{i}.py"), i)
+                     for i in range(25)]
+        long_title = "t" * 200
+        resources.append(self._record(
+            {"adapter": "zen", "url": "https://example.com/x",
+             "title": long_title, "file": None, "cwd": None,
+             "git_root": None, "page": None, "zotero": None}, 1000))
+        payload = self._payload(
+            [self._session(self.SID1, 1000, None, resources)])
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.seen(
+                "q", None, 100, self.reg, "/bin/x", None)
+        self.assertEqual(len(out["rows"]), 20)
+        self.assertEqual(out["total"], 26)
+        self.assertTrue(out["truncated"])
+        for row in out["rows"]:
+            self.assertLessEqual(len(row["label"]), 160)
+
+    def test_empty_query_rejects_before_spawn(self):
+        for bad in ("", "   "):
+            with patch.object(desktop_projects, "_fetch_search") as fetch:
+                fetch.side_effect = AssertionError("must reject before spawn")
+                with self.assertRaises(desktop_projects.DesktopError):
+                    desktop_projects.seen(
+                        bad, None, None, self.reg, "/bin/x", None)
+            fetch.assert_not_called()
+
+    def test_query_scopes_to_explicit_project(self):
+        payload = self._payload([])
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload) as fetch:
+            desktop_projects.seen(
+                "q", self.GHOST, 5, self.reg, "/bin/x", None)
+        args = fetch.call_args[0]
+        self.assertEqual(args[2], self.GHOST)
+        self.assertEqual(args[6], "q")
+
+    def test_bare_defaults_to_current_project(self):
+        entry = self.make_entry(name="H", logseq_path="pages/H.md")
+        report = {"id": entry["id"], "name": "H", "matched_by": "file"}
+        items = [{"resource": self._file_ctx(), "observed_at_ms": 42,
+                  "activity_id": 9}]
+        with patch.object(desktop_projects, "_fetch_current",
+                          return_value=self.fake_current(report)):
+            with patch.object(desktop_projects, "_fetch_resources",
+                              return_value=items) as res:
+                with patch.object(desktop_projects, "_fetch_search") as fetch:
+                    fetch.side_effect = AssertionError("bare uses resources")
+                    out = desktop_projects.seen(
+                        None, None, None, self.reg, "/bin/x", None)
+        args = res.call_args[0]
+        self.assertEqual(args[2], entry["id"])
+        # One-row truncation probe behind the 20-row cap.
+        self.assertEqual(args[3], 21)
+        self.assertEqual(len(out["rows"]), 1)
+        row = out["rows"][0]
+        self.assertEqual(row["kind"], "file")
+        self.assertEqual(row["label"], "src/main.rs")
+        self.assertEqual(row["identity"], "file:src/main.rs")
+        self.assertEqual(row["project_id"], entry["id"])
+        self.assertEqual(row["project_name"], "H")
+        self.assertIsNone(row["session_id"])
+        self.assertEqual(row["last_seen_ms"], 42)
+        self.assertEqual(row["occurrence_count"], 1)
+        self.assertFalse(out["truncated"])
+        self.assertEqual(out["total"], 1)
+
+    def test_bare_explicit_project_skips_current(self):
+        items = [{"resource": self._file_ctx(), "observed_at_ms": 7,
+                  "activity_id": 1}]
+        with patch.object(desktop_projects, "_fetch_current") as cur:
+            cur.side_effect = AssertionError("explicit must not fetch current")
+            with patch.object(desktop_projects, "_fetch_resources",
+                              return_value=items):
+                out = desktop_projects.seen(
+                    None, self.GHOST, None, self.reg, "/bin/x", None)
+        self.assertEqual(out["rows"][0]["project_id"], self.GHOST)
+
+    def test_bare_no_current_needs_no_db_query(self):
+        with patch.object(desktop_projects, "_fetch_current",
+                          return_value=self.fake_current(None)):
+            with patch.object(desktop_projects, "_fetch_resources") as res:
+                res.side_effect = AssertionError("no DB query")
+                out = desktop_projects.seen(
+                    None, None, None, self.reg, "/bin/x", None)
+        self.assertEqual(out["rows"], [])
+        self.assertEqual(out["total"], 0)
+        self.assertFalse(out["truncated"])
+
+    def test_bare_truncation_probe(self):
+        entry = self.make_entry(name="H", logseq_path="pages/H.md")
+        report = {"id": entry["id"], "name": "H", "matched_by": "file"}
+        items = [{"resource": self._file_ctx(f"/repo/a/f{i}.py"), "observed_at_ms": i,
+                  "activity_id": i} for i in range(21)]
+        with patch.object(desktop_projects, "_fetch_current",
+                          return_value=self.fake_current(report)):
+            with patch.object(desktop_projects, "_fetch_resources",
+                              return_value=items):
+                out = desktop_projects.seen(
+                    None, None, None, self.reg, "/bin/x", None)
+        self.assertEqual(len(out["rows"]), 20)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["total"], 20)
+
+    def test_seen_cli_gates(self):
+        with patch.object(desktop_projects, "_run_desktop_cli") as run:
+            run.side_effect = AssertionError("must reject before spawn")
+            self.assertEqual(
+                desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "seen", "--session",
+                     self.SID1]), 1)
+            self.assertEqual(
+                desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "seen", "--query", ""]), 1)
+            self.assertEqual(
+                desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "seen", "--days", "7"]), 1)
+
+    def test_seen_cli_query_happy_path(self):
+        payload = self._payload(
+            [self._session(self.SID1, 10, None,
+                           [self._record(self._file_ctx(), 10)])])
+        with patch.object(desktop_projects, "_run_desktop_cli",
+                          return_value=json.dumps(payload).encode()):
+            buf = io.StringIO()
+            with unittest.mock.patch("sys.stdout", buf):
+                rc = desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "seen", "--query", "main"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["total"], 1)
+        self.assertEqual(out["rows"][0]["kind"], "file")
+
+
+class UnmappedFoldersTests(unittest.TestCase):
+    SID1 = "a" * 32
+    SID2 = "b" * 32
+    RECENT = 9999999999999
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.reg = str(self.base / "projects.toml")
+        self.old_env = os.environ.get(projects.ENV_VAR)
+        os.environ.pop(projects.ENV_VAR, None)
+
+    def tearDown(self):
+        if self.old_env is None:
+            os.environ.pop(projects.ENV_VAR, None)
+        else:
+            os.environ[projects.ENV_VAR] = self.old_env
+        self.temp.cleanup()
+
+    def _payload(self, sessions):
+        return {"query": {"project": None, "limit": 200},
+                "sessions": sessions, "count": len(sessions)}
+
+    def _session(self, sid, end_ms, resources):
+        return {"session_id": sid, "device_id": "c" * 32,
+                "project": None, "start_ms": 1, "end_ms": end_ms,
+                "event_count": 1, "status": "closed",
+                "matched_at_ms": None, "applications": ["kitty"],
+                "resources": resources}
+
+    def _record(self, resource, last_seen, occurrence=1):
+        return {"session_id": self.SID1, "resource_key": "k",
+                "kind": "portable", "portable_identity": "portable:x",
+                "local_identity": None, "resource": resource,
+                "occurrence_count": occurrence, "first_seen_ms": 1,
+                "last_seen_ms": last_seen, "first_activity_id": 1,
+                "last_activity_id": 2}
+
+    def _folder_ctx(self, folder, cwd=None):
+        return {"adapter": "kitty", "file": None,
+                "cwd": cwd if cwd is not None else folder,
+                "git_root": folder, "git_branch": None, "git_remote": None,
+                "url": None, "page": None, "title": None, "zotero": None}
+
+    def test_ranking_prefers_count_then_recency(self):
+        sessions = [self._session(self.SID1, self.RECENT, [
+            self._record(self._folder_ctx("/repo/side"), 100, 5),
+            self._record({"adapter": "kitty", "file": None,
+                          "cwd": "/tmp/work", "git_root": None,
+                          "git_branch": None, "git_remote": None,
+                          "url": None, "page": None, "title": None,
+                          "zotero": None}, 50, 2),
+            self._record(self._folder_ctx("/repo/other", "/repo/other/sub"),
+                         150, 4),
+        ]), self._session(self.SID2, self.RECENT, [
+            self._record(self._folder_ctx("/repo/side"), 200, 1),
+        ])]
+        payload = self._payload(sessions)
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.unmapped_folders(
+                None, None, self.reg, "/bin/x", None)
+        self.assertEqual(
+            [(row["git_root_or_cwd"], row["observation_count"],
+              row["last_seen_ms"]) for row in out["rows"]],
+            [("/repo/side", 6, 200), ("/repo/other", 4, 150),
+             ("/tmp/work", 2, 50)])
+        self.assertFalse(out["truncated"])
+        # git_root wins over cwd when both are present.
+        self.assertNotIn("/repo/other/sub",
+                         [row["git_root_or_cwd"] for row in out["rows"]])
+
+    def test_mapped_folders_and_stale_sessions_excluded(self):
+        projects.create_project(
+            {"name": "Claimed", "local_folder": "/repo/claimed"}, self.reg)
+        sessions = [self._session(self.SID1, self.RECENT, [
+            self._record(self._folder_ctx("/repo/claimed"), 300, 9),
+            self._record(self._folder_ctx("/repo/free"), 10, 1),
+        ]), self._session(self.SID2, 1, [
+            self._record(self._folder_ctx("/repo/ancient"), 2, 99),
+        ])]
+        payload = self._payload(sessions)
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.unmapped_folders(
+                None, None, self.reg, "/bin/x", None)
+        folders = [row["git_root_or_cwd"] for row in out["rows"]]
+        self.assertEqual(folders, ["/repo/free"])
+        self.assertFalse(out["truncated"])
+
+    def test_home_relative_registry_match(self):
+        home = os.path.expanduser("~")
+        projects.create_project(
+            {"name": "Home", "local_folder": "~/work/app"}, self.reg)
+        sessions = [self._session(self.SID1, self.RECENT, [
+            self._record(self._folder_ctx(f"{home}/work/app"), 10, 3),
+            self._record(self._folder_ctx(f"{home}/work/other"), 11, 1),
+        ])]
+        payload = self._payload(sessions)
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.unmapped_folders(
+                None, None, self.reg, "/bin/x", None)
+        self.assertEqual(
+            [row["git_root_or_cwd"] for row in out["rows"]],
+            [f"{home}/work/other"])
+
+    def test_capped_at_ten_rows(self):
+        resources = [self._record(self._folder_ctx(f"/repo/r{i}"), i, 1)
+                     for i in range(12)]
+        payload = self._payload([self._session(self.SID1, self.RECENT,
+                                               resources)])
+        with patch.object(desktop_projects, "_fetch_search",
+                          return_value=payload):
+            out = desktop_projects.unmapped_folders(
+                None, None, self.reg, "/bin/x", None)
+            capped = desktop_projects.unmapped_folders(
+                None, 3, self.reg, "/bin/x", None)
+        self.assertEqual(len(out["rows"]), 10)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(len(capped["rows"]), 3)
+        self.assertTrue(capped["truncated"])
+
+    def test_days_validation_and_window(self):
+        for bad in (0, 366, "x", True):
+            with self.assertRaises(desktop_projects.DesktopError):
+                desktop_projects.unmapped_folders(
+                    bad, None, self.reg, "/bin/x", None)
+        self.assertEqual(
+            desktop_projects._validate_days(None), 30)
+        self.assertEqual(
+            desktop_projects._validate_days("7"), 7)
+
+    def test_unmapped_cli_gates_and_happy_path(self):
+        with patch.object(desktop_projects, "_run_desktop_cli") as run:
+            run.side_effect = AssertionError("must reject before spawn")
+            self.assertEqual(
+                desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "unmapped-folders",
+                     "--project", SeenMapperTests.GHOST]), 1)
+            self.assertEqual(
+                desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "unmapped-folders",
+                     "--query", "x"]), 1)
+            self.assertEqual(
+                desktop_projects.main(
+                    ["--desktop-bin", "/bin/x", "unmapped-folders",
+                     "--days", "0"]), 1)
+        payload = self._payload([self._session(
+            self.SID1, self.RECENT,
+            [self._record(self._folder_ctx("/repo/free"), 10, 2)])])
+        with patch.object(desktop_projects, "_run_desktop_cli",
+                          return_value=json.dumps(payload).encode()):
+            buf = io.StringIO()
+            with unittest.mock.patch("sys.stdout", buf):
+                rc = desktop_projects.main(
+                    ["--desktop-bin", "/bin/x",
+                     "--projects-file", self.reg,
+                     "unmapped-folders", "--days", "7"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["rows"][0]["git_root_or_cwd"], "/repo/free")
+        self.assertFalse(out["truncated"])
+
+
+def _watch_child_pids(pid):
+    """Pids of live ``qs-desktop-context watch`` children of ``pid``."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=,args=", "--ppid", str(pid)],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in (out.stdout or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            child = int(parts[0])
+        except ValueError:
+            continue
+        if "qs-desktop-context" in parts[1] and "watch" in parts[1]:
+            pids.append(child)
+    return pids
+
+
+def _pid_cmd(pid):
+    """Full command line for ``pid`` ("" when gone/unreadable)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (out.stdout or "").strip()
+
+
+def _pid_dead(pid):
+    """True when ``pid`` is gone — or a zombie awaiting init reap.
+
+    A SIGKILLed bridge reparents its Rust child to init (PPID 1); if that
+    init never reaps, the child lingers as a zombie, which still proves the
+    cascade killed it.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stat = (out.stdout or "").strip().split()
+    if not stat:
+        return True  # ps knows no such pid
+    return stat[0].startswith("Z")
+
+
+def _reap_bridge_and_child(proc, rust_pids):
+    """addCleanup backstop: never leave a bridge or Rust child behind.
+
+    Terminates + reaps the bridge, closes its pipes, then SIGKILLs any
+    tracked Rust child that survived — but only when its command line still
+    matches (never touch a reused pid).
+    """
+    try:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+    finally:
+        for stream in (getattr(proc, "stdout", None),
+                       getattr(proc, "stderr", None),
+                       getattr(proc, "stdin", None)):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        for pid in list(rust_pids):
+            if _pid_dead(pid):
+                continue
+            cmd = _pid_cmd(pid)
+            if "qs-desktop-context" not in cmd or "watch" not in cmd:
+                continue  # pid reused by something else: leave it alone
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+
+
+class WatchBridgeTests(unittest.TestCase):
+    """Resident ``watch`` bridge: one raw-source child, in-process mapping.
+
+    The bridge resolves the binary exactly like the one-shot path
+    (``--desktop-bin`` > ``QS_DESKTOP_CONTEXT_BIN`` > repo default, with the
+    child-only registry override), spawns ``qs-desktop-context watch`` ONCE
+    per bridge lifetime, maps each raw line through the shared single-owner
+    mapping (no fork per line), and prints the tagged ``current-project``
+    shape change-only. Child exit/stream end => non-zero exit (DesktopError
+    in-process) so the supervisor restarts the pair.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.reg = str(self.base / "projects.toml")
+        Path(self.reg).write_text("version = 1\n", encoding="utf-8")
+        self.missing_db = str(self.base / "missing.db")
+        self.old_bin = os.environ.get(desktop_projects.BIN_ENV)
+        self.old_reg = os.environ.get(projects.ENV_VAR)
+        os.environ.pop(desktop_projects.BIN_ENV, None)
+        os.environ.pop(projects.ENV_VAR, None)
+
+    def tearDown(self):
+        for key, value in ((desktop_projects.BIN_ENV, self.old_bin),
+                           (projects.ENV_VAR, self.old_reg)):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.temp.cleanup()
+
+    def _raw(self, project, ts=1):
+        return {"available": True, "source": "hyprland",
+                "observed_at_ms": ts, "focused_window": None,
+                "workspace": None, "resource": None, "project": project}
+
+    def _watch_proc(self, lines):
+        proc = unittest.mock.MagicMock()
+        proc.stdout.readline.side_effect = list(lines)
+        proc.poll.return_value = 0
+        proc.stderr = None
+        return proc
+
+    def _run_watch_capture(self, proc, registry_file=None):
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["env"] = kwargs.get("env")
+            return proc
+
+        buf = io.BytesIO()
+        fake_stdout = unittest.mock.MagicMock()
+        fake_stdout.buffer = buf
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            with patch.object(sys, "stdout", fake_stdout):
+                with self.assertRaises(desktop_projects.DesktopError) as ctx:
+                    desktop_projects.watch_current_project(
+                        registry_file, "/bin/x", None)
+        self.assertIn("watch source ended", str(ctx.exception))
+        return captured, buf.getvalue()
+
+    def test_watch_uses_shared_mapping_startup_and_change_only(self):
+        entry = projects.create_project(
+            {"name": "Demo", "logseq_path": "pages/Demo.md"},
+            self.reg)["project"]
+        null_a = self._raw(None, ts=1)
+        null_b = self._raw(None, ts=2)  # timestamp-only churn: no re-emit
+        assoc = self._raw({"id": entry["id"], "name": "Stale",
+                           "matched_by": "cwd"}, ts=3)
+        assoc_dup = self._raw({"id": entry["id"], "name": "Stale",
+                               "matched_by": "cwd"}, ts=4)
+        lines = [(json.dumps(v) + "\n").encode() for v in
+                 (null_a, null_b, assoc, assoc_dup)] + [b""]
+        proc = self._watch_proc(lines)
+        captured, raw_out = self._run_watch_capture(proc, self.reg)
+        # One child for the whole stream (no fork per line); watch subcommand.
+        self.assertEqual(captured["argv"], ["/bin/x", "watch"])
+        self.assertEqual(proc.stdout.readline.call_count, len(lines))
+        # Startup line + one line per state change only.
+        out_lines = raw_out.decode("utf-8").splitlines()
+        self.assertEqual(len(out_lines), 2)
+        first = json.loads(out_lines[0])
+        second = json.loads(out_lines[1])
+        self.assertEqual(first["type"], "current-project")
+        self.assertEqual(first["status"], "unassociated")
+        self.assertIsNone(first["project"])
+        self.assertEqual(second["type"], "current-project")
+        self.assertEqual(second["status"], "associated")
+        self.assertEqual(second["project"]["id"], entry["id"])
+        # Current registry mapping wins, like the one-shot path.
+        self.assertEqual(second["project"]["name"], "Demo")
+        self.assertTrue(second["has_logseq_linkage"])
+        # Shared single-owner mapping: the watch payload (minus the tag) is
+        # byte-identical to what the one-shot command produces for the same
+        # raw input.
+        with patch.object(desktop_projects, "_fetch_current",
+                          return_value=assoc):
+            one_shot = desktop_projects.current_project(
+                self.reg, "/bin/x", None)
+        tagged = dict(one_shot)
+        tagged["type"] = "current-project"
+        self.assertEqual(
+            json.loads(out_lines[1]),
+            json.loads(json.dumps(tagged, ensure_ascii=False,
+                                  separators=(",", ":"))))
+        with patch.object(desktop_projects, "_fetch_current",
+                          return_value=null_a):
+            one_shot_null = desktop_projects.current_project(
+                self.reg, "/bin/x", None)
+        tagged_null = dict(one_shot_null)
+        tagged_null["type"] = "current-project"
+        # Timestamps ride along verbatim in the payload even though they do
+        # not defeat the dedup key: normalize before comparing.
+        for payload in (first, tagged_null):
+            payload["context"].pop("observed_at_ms", None)
+        self.assertEqual(first, tagged_null)
+
+    def test_watch_forwards_registry_override_child_only(self):
+        captured, _ = self._run_watch_capture(
+            self._watch_proc([b""]), self.reg)
+        self.assertEqual(captured["argv"], ["/bin/x", "watch"])
+        self.assertIsNotNone(captured.get("env"))
+        self.assertEqual(
+            captured["env"].get(projects.ENV_VAR),
+            str(projects.resolve_registry_file(self.reg)))
+        # No global mutation.
+        self.assertNotIn(projects.ENV_VAR, os.environ)
+        captured2, _ = self._run_watch_capture(
+            self._watch_proc([b""]), None)
+        self.assertIsNone(captured2.get("env"))
+
+    def test_watch_skips_bad_lines_on_stderr_keeps_stdout_pure(self):
+        good = self._raw(None, ts=1)
+        lines = [b"\n",
+                 (json.dumps(good) + "\n").encode(),
+                 b"not json\n",
+                 b"[1, 2]\n",
+                 b"\xff\xfe\n",
+                 b""]
+        proc = self._watch_proc(lines)
+        buf = io.BytesIO()
+        fake_stdout = unittest.mock.MagicMock()
+        fake_stdout.buffer = buf
+        err = io.StringIO()
+        with patch("subprocess.Popen", return_value=proc):
+            with patch.object(sys, "stdout", fake_stdout):
+                with unittest.mock.patch("sys.stderr", err):
+                    with self.assertRaises(desktop_projects.DesktopError):
+                        desktop_projects.watch_current_project(
+                            self.reg, "/bin/x", None)
+        out_lines = buf.getvalue().decode("utf-8").splitlines()
+        self.assertEqual(len(out_lines), 1)
+        parsed = json.loads(out_lines[0])
+        self.assertEqual(parsed["type"], "current-project")
+        diagnostics = err.getvalue()
+        self.assertIn("not valid JSON", diagnostics)
+        self.assertIn("must be an object", diagnostics)
+        self.assertIn("not valid UTF-8", diagnostics)
+
+    def test_watch_missing_binary_is_clear_no_build(self):
+        with self.assertRaises(desktop_projects.DesktopError) as ctx:
+            desktop_projects.watch_current_project(
+                self.reg, "/nonexistent-qs-watch-12345", None)
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_watch_cli_child_death_exits_nonzero_stdout_pure(self):
+        fake = self.base / "fake-watch-bin.sh"
+        ghost = "00000000-0000-4000-8000-000000000000"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "echo '{\"available\":true,\"source\":\"hyprland\","
+            "\"observed_at_ms\":1,\"focused_window\":null,"
+            "\"workspace\":null,\"resource\":null,\"project\":null}'\n"
+            "echo '{\"available\":true,\"source\":\"hyprland\","
+            "\"observed_at_ms\":2,\"focused_window\":null,"
+            "\"workspace\":null,\"resource\":null,\"project\":null}'\n"
+            "echo '{\"available\":true,\"source\":\"hyprland\","
+            "\"observed_at_ms\":3,\"focused_window\":null,"
+            "\"workspace\":null,\"resource\":null,"
+            "\"project\":{\"id\":\"" + ghost + "\",\"name\":\"Ghost\","
+            "\"matched_by\":\"cwd\"}}'\n"
+            "echo 'fake child diagnostics' >&2\n",
+            encoding="utf-8")
+        fake.chmod(0o755)
+        completed = run_cli(
+            ["--projects-file", self.reg, "--db", self.missing_db,
+             "--desktop-bin", str(fake), "watch"])
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("watch source ended", completed.stderr)
+        self.assertIn("fake child diagnostics", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        out_lines = completed.stdout.splitlines()
+        # Null, null-ts-churn (deduped), ghost => two bridge lines.
+        self.assertEqual(len(out_lines), 2)
+        first = json.loads(out_lines[0])
+        second = json.loads(out_lines[1])
+        for parsed in (first, second):
+            self.assertEqual(parsed["type"], "current-project")
+        self.assertEqual(first["status"], "unassociated")
+        self.assertIsNone(first["project"])
+        self.assertEqual(second["status"], "stale-removed")
+        self.assertIsNone(second["project"])
+        self.assertEqual(second["reported_project"]["id"], ghost)
+        self.assertFalse(Path(self.missing_db).exists())
+
+    def test_watch_cli_rejects_one_shot_flags(self):
+        for extra in (["--limit", "5"],
+                      ["--project",
+                       "00000000-0000-4000-8000-000000000000"],
+                      ["--query", "x"]):
+            completed = run_cli(
+                ["--projects-file", self.reg,
+                 "--desktop-bin", "/bin/x", "watch", *extra])
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("does not accept", completed.stderr)
+            self.assertEqual(completed.stdout, "")
+            self.assertNotIn("Traceback", completed.stderr)
+
+    def test_spawn_watch_child_holds_stdin_pipe(self):
+        # The bridge must hold the Rust child's stdin write end for life:
+        # ANY bridge death (including SIGKILL) closes it and the Rust
+        # stdin-EOF watchdog exits the orphan on its own.
+        captured = {}
+        proc = unittest.mock.MagicMock()
+        proc.stdout = unittest.mock.MagicMock()
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured.update(kwargs)
+            return proc
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            got = desktop_projects._spawn_watch_child(
+                Path("/bin/x"), None)
+        self.assertIs(got, proc)
+        self.assertEqual(captured["argv"], ["/bin/x", "watch"])
+        self.assertEqual(captured.get("stdin"), subprocess.PIPE)
+        desktop_projects._unregister_child(proc)
+
+
+class WatchRealBinaryTests(unittest.TestCase):
+    """Bridge over the real release binary: one line, tagged shape, no hang.
+
+    Requires the release binary (same gate as ``RealBinaryBoundaryTests``).
+    A bogus ``HYPRLAND_INSTANCE_SIGNATURE`` forces the unavailable object so
+    the expectation is deterministic even on a live desktop.
+    """
+
+    BIN = ROOT / "services" / "agent-orchestrator" / "target" / "release" / "qs-desktop-context"
+
+    def setUp(self):
+        if not (self.BIN.is_file() and os.access(self.BIN, os.X_OK)):
+            self.skipTest("real qs-desktop-context binary not built")
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.reg = str(self.base / "empty.toml")
+        Path(self.reg).write_text("version = 1\n", encoding="utf-8")
+        self.missing_db = str(self.base / "missing.db")
+        self.old_reg = os.environ.get(projects.ENV_VAR)
+        os.environ.pop(projects.ENV_VAR, None)
+
+    def tearDown(self):
+        if self.old_reg is None:
+            os.environ.pop(projects.ENV_VAR, None)
+        else:
+            os.environ[projects.ENV_VAR] = self.old_reg
+        self.temp.cleanup()
+
+    def test_real_watch_bridge_startup_line_then_terminate(self):
+        import queue
+        import signal as _signal
+        import threading
+        import time as _time
+        env = dict(os.environ)
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = "qs-watch-test-nonexistent"
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(ROOT / "scripts" / "desktop_projects.py"),
+             "--projects-file", self.reg, "--db", self.missing_db,
+             "--desktop-bin", str(self.BIN), "watch"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, env=env)
+        rust_pid: list = []
+        self.addCleanup(_reap_bridge_and_child, proc, rust_pid)
+        try:
+            lines: queue.Queue = queue.Queue()
+            stop = threading.Event()
+
+            def pump():
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    lines.put(raw)
+                    if stop.is_set():
+                        return
+
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            try:
+                raw_first = lines.get(timeout=25)
+            except queue.Empty:
+                self.fail("watch bridge emitted no startup line")
+            first = json.loads(raw_first.decode("utf-8"))
+            self.assertEqual(first["type"], "current-project")
+            self.assertIn(first["status"],
+                          ("unassociated", "stale-removed"))
+            self.assertIsNone(first["project"])
+            self.assertIsInstance(first["context"], dict)
+            # Remember the Rust grandchild now (proves the bridge spawned
+            # exactly one): cleanup kills it if the bridge didn't.
+            rust_pid.extend(_watch_child_pids(proc.pid))
+            # No second line while the (unavailable) state is unchanged.
+            with self.assertRaises(queue.Empty):
+                lines.get(timeout=5)
+        finally:
+            stop.set()
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+            self.assertIsNotNone(proc.returncode)
+        _, stderr = proc.communicate(timeout=10)
+        self.assertNotIn("Traceback", stderr.decode("utf-8", "replace"))
+        self.assertFalse(Path(self.missing_db).exists())
+
+
+class WatchSupervisionTests(unittest.TestCase):
+    """Leak regression: the supervision chain cascades on ANY parent death.
+
+    quickshell --(stdin pipe)--> ``desktop_projects.py watch``
+    --(stdin pipe)--> ``qs-desktop-context watch``. A death at any level
+    EOFs the level below (the kernel closes the dead process's pipe ends),
+    so SIGKILL at any level cannot orphan a resident 2 s recheck loop.
+
+    Requires the release binary (same gate as ``RealBinaryBoundaryTests``).
+    A bogus ``HYPRLAND_INSTANCE_SIGNATURE`` forces the unavailable object
+    so expectations are deterministic even on a live desktop.
+    """
+
+    BIN = ROOT / "services" / "agent-orchestrator" / "target" / "release" / "qs-desktop-context"
+
+    def setUp(self):
+        if not (self.BIN.is_file() and os.access(self.BIN, os.X_OK)):
+            self.skipTest("real qs-desktop-context binary not built")
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.reg = str(self.base / "empty.toml")
+        Path(self.reg).write_text("version = 1\n", encoding="utf-8")
+        self.missing_db = str(self.base / "missing.db")
+        self.old_reg = os.environ.get(projects.ENV_VAR)
+        os.environ.pop(projects.ENV_VAR, None)
+
+    def tearDown(self):
+        if self.old_reg is None:
+            os.environ.pop(projects.ENV_VAR, None)
+        else:
+            os.environ[projects.ENV_VAR] = self.old_reg
+        self.temp.cleanup()
+
+    def _spawn_bridge(self):
+        import signal as _signal  # noqa: F401 (documents SIGKILL below)
+        env = dict(os.environ)
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = "qs-watch-test-nonexistent"
+        # stdin=PIPE simulates quickshell holding the bridge's stdin open.
+        return subprocess.Popen(
+            [sys.executable, "-u", str(ROOT / "scripts" / "desktop_projects.py"),
+             "--projects-file", self.reg, "--db", self.missing_db,
+             "--desktop-bin", str(self.BIN), "watch"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, env=env)
+
+    def _startup_line(self, bridge):
+        import queue
+        import threading
+        lines: queue.Queue = queue.Queue()
+        stop = threading.Event()
+
+        def pump():
+            assert bridge.stdout is not None
+            for raw in bridge.stdout:
+                lines.put(raw)
+                if stop.is_set():
+                    return
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        try:
+            raw_first = lines.get(timeout=25)
+        except queue.Empty:
+            self.fail("watch bridge emitted no startup line")
+        first = json.loads(raw_first.decode("utf-8"))
+        self.assertEqual(first["type"], "current-project")
+        self.assertIn(first["status"], ("unassociated", "stale-removed"))
+        self.assertIsNone(first["project"])
+        return stop
+
+    def test_sigkill_bridge_cascades_to_rust_child(self):
+        import time as _time
+        bridge = self._spawn_bridge()
+        rust_pids: list = []
+        self.addCleanup(_reap_bridge_and_child, bridge, rust_pids)
+        stop = self._startup_line(bridge)
+        children = _watch_child_pids(bridge.pid)
+        self.assertEqual(len(children), 1,
+                         f"bridge must own exactly one Rust watch child, got {children}")
+        rust = children[0]
+        rust_pids.append(rust)
+        # No signal is ever sent to the Rust child: SIGKILL the bridge and
+        # the stdin-pipe cascade must reap the orphan on its own.
+        stop.set()
+        bridge.kill()  # SIGKILL: no handler in the bridge can run
+        try:
+            bridge.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("SIGKILLed bridge did not die")
+        self.assertIsNotNone(bridge.returncode)
+        start = _time.monotonic()
+        deadline = start + 10.0
+        while not _pid_dead(rust):
+            if _time.monotonic() >= deadline:
+                self.fail(
+                    f"orphaned qs-desktop-context watch (pid {rust}) still "
+                    "alive 10 s after bridge SIGKILL (expected ~5 s)")
+            _time.sleep(0.1)
+        elapsed = _time.monotonic() - start
+        self.assertLess(
+            elapsed, 5.0,
+            f"orphaned Rust child took {elapsed:.1f} s to exit (expected ~5 s)")
+        self.assertFalse(Path(self.missing_db).exists())
+
+    def test_closing_bridge_stdin_kills_rust_child_and_exits_bridge(self):
+        import time as _time
+        bridge = self._spawn_bridge()
+        rust_pids: list = []
+        self.addCleanup(_reap_bridge_and_child, bridge, rust_pids)
+        stop = self._startup_line(bridge)
+        children = _watch_child_pids(bridge.pid)
+        self.assertEqual(len(children), 1,
+                         f"bridge must own exactly one Rust watch child, got {children}")
+        rust = children[0]
+        rust_pids.append(rust)
+        # Simulate quickshell teardown: close our write end of the bridge's
+        # stdin. The bridge's EOF thread must SIGTERM its Rust child, see
+        # stream end, and exit non-zero on its own.
+        stop.set()
+        assert bridge.stdin is not None
+        bridge.stdin.close()
+        try:
+            code = bridge.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("bridge did not exit after its stdin EOF")
+        self.assertNotEqual(code, 0)
+        deadline = _time.monotonic() + 5.0
+        while not _pid_dead(rust):
+            if _time.monotonic() >= deadline:
+                self.fail(
+                    f"Rust watch child (pid {rust}) still alive after "
+                    "bridge stdin EOF")
+            _time.sleep(0.1)
+        try:
+            _, stderr = bridge.communicate(timeout=10)
+        except Exception:
+            stderr = b""
+        self.assertIn("watch source ended",
+                      stderr.decode("utf-8", "replace"))
+        self.assertFalse(Path(self.missing_db).exists())
 
 
 if __name__ == "__main__":

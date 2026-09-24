@@ -4,93 +4,45 @@ import Quickshell
 import Quickshell.Services.Notifications
 import "../theme"
 
+// View over the shell-level NotificationHistory store (S-002): badge count,
+// popup list, Clear All, and row actions. All tracking, eviction, and
+// closed-handler logic lives in widgets/NotificationHistory.qml so bells on
+// different monitors share one history.
 Item {
     id: root
     implicitWidth: 32
     implicitHeight: 32
-    
+
+    // Shell-level owner (required). Kept for backcompat wiring; the history
+    // store already holds the server.
     property var notifServer: null
+    property var history: null
     property bool expanded: false
 
-    ListModel {
-        id: notifModel
-    }
-
-    Connections {
-        target: root.notifServer
-        enabled: !!root.notifServer
-        
-        function onNotification(n) {
-            // Check if it's an update to an existing notification
-            for (let i = 0; i < notifModel.count; i++) {
-                if (notifModel.get(i).notifId === n.id) {
-                    notifModel.setProperty(i, "summary", n.summary);
-                    notifModel.setProperty(i, "body", n.body);
-                    notifModel.setProperty(i, "appName", n.appName);
-                    return;
-                }
-            }
-            
-            // New notification: history is the sole tracking owner. Banners
-            // hold bare references and never set tracked (tracked=false is
-            // equivalent to dismiss()).
-            n.tracked = true;
-            n.closed.connect((reason) => {
-                // Sole-closure path: remote close or our own dismiss() lands
-                // here. Remove model-only; never touch tracked (already
-                // closed). No-op if an explicit action already removed it.
-                for (let i = 0; i < notifModel.count; i++) {
-                    if (notifModel.get(i).notifId === n.id) {
-                        notifModel.remove(i);
-                        break;
-                    }
-                }
-            });
-
-            console.log("New notification: " + n.summary);
-            
-            notifModel.insert(0, {
-                "notifId": n.id,
-                "summary": n.summary,
-                "body": n.body,
-                "appName": n.appName,
-                "notifObj": n
-            });
-            
-            if (notifModel.count > 10) {
-                // Evict oldest: capture the tracked object BEFORE removal
-                // (the row dict is invalid after remove), remove from the
-                // model first, then release tracking. The closed handler
-                // then finds nothing (no double remove of a shifted index).
-                var evictObj = notifModel.get(10).notifObj;
-                notifModel.remove(10);
-                if (evictObj) evictObj.dismiss();
-            }
-        }
-    }
+    readonly property int historyCount: root.history ? root.history.count : 0
 
     Rectangle {
         id: bellContainer
          height: 32; width: 32; radius: Theme.controlRadius; color: Theme.mantle
          border.color: Theme.border
          border.width: 1
-        
+
         Text {
             anchors.centerIn: parent
             text: "󰂚"
-            color: notifModel.count > 0 ? Theme.text : Theme.subtext1
+            color: root.historyCount > 0 ? Theme.text : Theme.subtext1
             font.family: Theme.iconFontFamily
-            font.pixelSize: 18
+            font.pixelSize: Theme.iconSizeSmall
         }
-        
+
         Rectangle {
-            visible: notifModel.count > 0
-             width: 14; height: 14; radius: 7; color: Theme.surface2
+            visible: root.historyCount > 0
+             width: 14; height: 14; radius: Theme.chipRadius; color: Theme.surface2
             anchors.top: parent.top; anchors.right: parent.right
             anchors.topMargin: -2; anchors.rightMargin: -2
-            
+
             Text {
-                text: notifModel.count
+                text: root.historyCount
                  color: Theme.text
                 font.pixelSize: 9
                 font.bold: true
@@ -108,30 +60,30 @@ Item {
     PopupWindow {
         id: popup
         visible: root.expanded
-        
+
         anchor {
             window: QsWindow.window
             rect: Qt.rect(bellContainer.mapToGlobal(0, 0).x, bellContainer.mapToGlobal(0, 0).y + bellContainer.height + 8, bellContainer.width, 1)
             gravity: Edges.Bottom
         }
-        
+
         implicitWidth: 350
         implicitHeight: Math.min(500, mainLayout.implicitHeight + 20)
-        color: "transparent"
-        
+        color: Theme.transparent
+
         Rectangle {
             anchors.fill: parent
             color: Theme.base
              radius: Theme.cardRadius
              border.color: Theme.border
             border.width: 1
-            
+
             ColumnLayout {
                 id: mainLayout
                 anchors.fill: parent
                 anchors.margins: 10
                 spacing: 10
-                
+
                 RowLayout {
                     Text {
                         text: "Notifications"
@@ -140,33 +92,21 @@ Item {
                         font.pixelSize: 16
                         Layout.fillWidth: true
                     }
-                    
+
                     Text {
                         text: "Clear All"
                         color: Theme.text
                         font.pixelSize: 12
-                        
+
                         MouseArea {
                             anchors.fill: parent
                             onClicked: {
-                                // Collect first, clear the model, then dismiss:
-                                // each dismiss() re-enters the closed handler,
-                                // which finds nothing (no double remove, no
-                                // skipped untracked rows).
-                                let pending = [];
-                                for (let i = 0; i < notifModel.count; ++i) {
-                                    let item = notifModel.get(i);
-                                    if (item && item.notifObj) pending.push(item.notifObj);
-                                }
-                                notifModel.clear();
-                                for (let j = 0; j < pending.length; ++j) {
-                                    pending[j].dismiss();
-                                }
+                                if (root.history) root.history.clearAll();
                             }
                         }
                     }
                 }
-                
+
                 ListView {
                     id: listView
                     Layout.fillWidth: true
@@ -174,8 +114,8 @@ Item {
                     Layout.maximumHeight: 400
                     spacing: 8
                     clip: true
-                    model: notifModel
-                    
+                    model: root.history ? root.history.model : null
+
                     delegate: Rectangle {
                         width: listView.width
                         height: innerLayout.implicitHeight + 20
@@ -183,13 +123,13 @@ Item {
                          radius: Theme.controlRadius
                          border.color: Theme.border
                          border.width: 1
-                        
+
                         ColumnLayout {
                             id: innerLayout
                             anchors.fill: parent
                             anchors.margins: 10
                             spacing: 4
-                            
+
                             RowLayout {
                                 Text {
                                     text: summary
@@ -204,7 +144,7 @@ Item {
                                     font.pixelSize: 10
                                 }
                             }
-                            
+
                             Text {
                                 text: body
                                 color: Theme.text
@@ -215,56 +155,29 @@ Item {
                                 elide: Text.ElideRight
                             }
                         }
-                        
+
                         MouseArea {
                             anchors.fill: parent
                             acceptedButtons: Qt.LeftButton | Qt.RightButton
                             onClicked: (mouse) => {
+                                if (!root.history) return;
                                 if (mouse.button === Qt.RightButton) {
                                     console.log("Dismissing notification: " + summary);
-                                    // Explicit dismissal: capture first, remove,
-                                    // then dismiss so closed finds nothing.
-                                    var dismissTarget = notifObj;
-                                    notifModel.remove(index);
-                                    if (dismissTarget) dismissTarget.dismiss();
+                                    root.history.dismissAt(index);
                                 } else {
                                     console.log("Activating notification: " + summary);
-                                    // Capture everything BEFORE invoking: the
-                                    // action may synchronously close (and
-                                    // destroy) the notification, which removes
-                                    // the row via closed. Touching index or
-                                    // target afterwards would double-remove or
-                                    // use a destroyed object.
-                                    var activateTarget = notifObj;
-                                    var defaultAction = null;
-                                    var isResident = activateTarget && activateTarget.resident === true;
-                                    if (activateTarget && activateTarget.actions) {
-                                        for (let i = 0; i < activateTarget.actions.length; i++) {
-                                            if (activateTarget.actions[i].identifier === "default") {
-                                                defaultAction = activateTarget.actions[i];
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (defaultAction) {
-                                        // Activation, not dismissal: invoke and
-                                        // let closed remove nonresident rows;
-                                        // resident rows persist by design.
-                                        defaultAction.invoke();
-                                        root.expanded = false;
-                                    } else {
-                                        // No default action: explicit dismiss,
-                                        // remove-first so closed is a no-op.
-                                        notifModel.remove(index);
-                                        root.expanded = false;
-                                        if (activateTarget) activateTarget.dismiss();
-                                    }
+                                    var outcome = root.history.activateAt(index);
+                                    // The view only collapses the popup;
+                                    // removal/retention is the store's job
+                                    // (closed removes nonresident rows;
+                                    // resident rows persist by design).
+                                    if (outcome === "invoked" || outcome === "dismissed") root.expanded = false;
                                 }
                             }
                         }
                     }
                 }
-                
+
                 Text {
                     visible: listView.count === 0
                     text: "No new notifications"
@@ -274,7 +187,7 @@ Item {
                 }
             }
         }
-        
+
         Shortcut {
             sequence: "Escape"
             onActivated: root.expanded = false

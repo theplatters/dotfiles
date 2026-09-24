@@ -428,6 +428,9 @@ def main():
             elif "approve-me" in msg:
                 emit({"type": "extension_ui_request", "id": "appr-1", "method": "confirm",
                       "message": "approve?", "timeout": 60000})
+            elif "approve-two" in msg:
+                emit({"type": "extension_ui_request", "id": "appr-2", "method": "confirm",
+                      "message": "approve second?", "timeout": 60000})
             elif "expire-me" in msg:
                 emit({"type": "extension_ui_request", "id": "exp-1", "method": "confirm",
                       "message": "expire?", "timeout": 1200})
@@ -438,10 +441,10 @@ def main():
                       "message": {"role": "assistant", "content": "hello world"}})
                 emit({"type": "agent_end"})
                 emit({"type": "agent_settled"})
-                if "approve-me" in msg or "expire-me" in msg:
+                if "approve-me" in msg or "expire-me" in msg or "approve-two" in msg:
                     pass
             # Settle ordinary approval prompts too so busy clears deterministically.
-            if "approve-me" in msg or "expire-me" in msg:
+            if "approve-me" in msg or "expire-me" in msg or "approve-two" in msg:
                 emit({"type": "agent_end"})
                 emit({"type": "agent_settled"})
         elif rtype == "new_session":
@@ -1081,6 +1084,85 @@ class ScopedOrchestratorHarness(unittest.TestCase):
         bridge.wait_ack(sid, timeout=5.0)
         bridge.wait_exit(timeout=8.0)
 
+    def test_surface_and_defer_round_robin_end_to_end(self):
+        # S-048 over the real binary: surfaceRequest marks a request seen
+        # (no silent expiry); deferRequest parks it round-robin with a
+        # truthful deferredCount; a surfaced short-timeout request never
+        # expires; unknown ids refuse without side effects.
+        bridge = self.make_bridge(mode="project")
+        self.start_and_wait_ready(bridge)
+
+        aid = bridge.send("prompt", {"message": "please approve-me now"})
+        bridge.wait_ack(aid, timeout=10.0)
+        bridge.wait_state(
+            lambda s, u: (s.get("pendingApproval") or {}).get("id") == "appr-1",
+            timeout=10.0,
+        )
+        bid = bridge.send("prompt", {"message": "please approve-two now"})
+        bridge.wait_ack(bid, timeout=10.0)
+        both = bridge.wait_state(
+            lambda s, u: len(s.get("pendingRequests") or {}) == 2,
+            timeout=10.0,
+        )
+        self.assertIn("deferredCount", both["state"])
+        self.assertEqual(both["state"]["deferredCount"], 0)
+
+        unk = bridge.send("surfaceRequest", {"requestId": "no-such-id"})
+        self.assertEqual(bridge.wait_ack(unk, timeout=10.0).get("accepted"), False)
+        unk2 = bridge.send("deferRequest", {"requestId": "no-such-id"})
+        self.assertEqual(bridge.wait_ack(unk2, timeout=10.0).get("accepted"), False)
+
+        sid = bridge.send("surfaceRequest", {"requestId": "appr-1"})
+        sack = bridge.wait_ack(sid, timeout=10.0)
+        self.assertEqual(sack.get("accepted"), True)
+        # Surfacing alone never moves the display.
+        self.assertEqual((sack["state"].get("pendingApproval") or {}).get("id"), "appr-1")
+
+        did = bridge.send("deferRequest", {"requestId": "appr-1"})
+        dack = bridge.wait_ack(did, timeout=10.0)
+        self.assertEqual(dack.get("accepted"), True)
+        # The ack update already carries the parked round-robin state.
+        self.assertEqual((dack["state"].get("pendingApproval") or {}).get("id"), "appr-2")
+        self.assertEqual(dack["state"]["deferredCount"], 1)
+
+        rid = bridge.send("respond", {"requestId": "appr-2", "fields": {"confirmed": True}})
+        rack = bridge.wait_ack(rid, timeout=10.0)
+        self.assertEqual(rack.get("accepted"), True)
+        # Answering appr-2 starts a new round: appr-1 returns, flags cleared.
+        self.assertEqual((rack["state"].get("pendingApproval") or {}).get("id"), "appr-1")
+        self.assertEqual(rack["state"]["deferredCount"], 0)
+
+        rid1 = bridge.send("respond", {"requestId": "appr-1", "fields": {"confirmed": True}})
+        rack1 = bridge.wait_ack(rid1, timeout=10.0)
+        self.assertEqual(rack1.get("accepted"), True)
+        self.assertIsNone(rack1["state"].get("pendingApproval"))
+
+        # A surfaced short-timeout request never expires silently.
+        eid = bridge.send("prompt", {"message": "please expire-me now"})
+        bridge.wait_ack(eid, timeout=10.0)
+        bridge.wait_state(
+            lambda s, u: (s.get("pendingApproval") or {}).get("id") == "exp-1",
+            timeout=10.0,
+        )
+        esid = bridge.send("surfaceRequest", {"requestId": "exp-1"})
+        self.assertEqual(bridge.wait_ack(esid, timeout=10.0).get("accepted"), True)
+        count_before = len(self.fake_inputs())
+        time.sleep(3.0)
+        survivors = [
+            e for e in self.fake_inputs()[count_before:]
+            if e.get("type") == "extension_ui_response" and e.get("id") == "exp-1"
+        ]
+        self.assertEqual(survivors, [])
+        # Still queued afterwards: re-surfacing is idempotent and the
+        # snapshot still shows exp-1 with nothing cancelled.
+        esid2 = bridge.send("surfaceRequest", {"requestId": "exp-1"})
+        esack2 = bridge.wait_ack(esid2, timeout=10.0)
+        self.assertEqual(esack2.get("accepted"), True)
+        self.assertEqual((esack2["state"].get("pendingApproval") or {}).get("id"), "exp-1")
+        sid = bridge.send("shutdown", {})
+        bridge.wait_ack(sid, timeout=5.0)
+        bridge.wait_exit(timeout=8.0)
+
     # -- 6: malformed UI framing -------------------------------------------
     def test_malformed_framing_rejected_without_side_effects(self):
         bridge = self.make_bridge(mode="project")
@@ -1647,6 +1729,58 @@ class ScopedAgentAdapterTests(unittest.TestCase):
         self.assertIn("dropPendingNoReplay()", self.source)
         self.assertIn("handleBridgeDead()", self.source)
         self.assertIn("handleFailedToStart()", self.source)
+
+
+class ScopedCapabilityMatrixTests(unittest.TestCase):
+    """Phase 1 §2.2: static matrix pins from the scoped (project/journal) side.
+
+    No bridge/pi is launched: these assert allow/deny per scope directly
+    on the extension source plus the §8.2 invariants that must not break.
+    """
+
+    EXTENSION = (REPO_ROOT / ".pi" / "extensions" / "desktop-agent.ts").read_text(encoding="utf-8")
+
+    def test_project_mode_permits_agenda_denies_journal_tools(self):
+        allow = self.EXTENSION[self.EXTENSION.index("if (projectMode() && !["):]
+        allow = allow[:allow.index("].includes")]
+        for name in ("logseq_agenda_list", "logseq_agenda_add",
+                     "logseq_project_read", "logseq_project_update",
+                     "project_folder_write"):
+            self.assertIn(f'"{name}"', allow)
+        self.assertNotIn('"logseq_journal_context"', allow)
+        self.assertNotIn('"logseq_journal_append"', allow)
+
+    def test_journal_mode_permits_only_journal_tools_plus_reads(self):
+        gate = 'if (journalMode() && !["logseq_journal_context", "logseq_journal_append"].includes(event.toolName))'
+        self.assertIn(gate, self.EXTENSION)
+        # Desktop reads stay available as an exception in every scope.
+        marker = 'if ((DESKTOP_READ_TOOLS as string[]).includes(event.toolName)) return;'
+        self.assertIn(marker, self.EXTENSION)
+
+    def test_agenda_guards_deny_journal_only(self):
+        self.assertNotIn("agenda list is palette-only", self.EXTENSION)
+        self.assertNotIn("agenda add is palette-only", self.EXTENSION)
+        self.assertIn('if (journalMode()) throw new Error("agenda list is unavailable in journal mode")',
+                      self.EXTENSION)
+        self.assertIn('if (journalMode()) throw new Error("agenda add is unavailable in journal mode")',
+                      self.EXTENSION)
+
+    def test_no_silent_writes_ui_confirm_preserved(self):
+        # §8.2: every markdown write stays prepare → exact preview →
+        # Confirm → apply with UI approval.
+        for marker in ("Approve add to daily todos",
+                       "Approve Logseq journal append",
+                       "Approve selected project page update",
+                       "Approve linked folder file write",
+                       "UI confirmation unavailable"):
+            self.assertIn(marker, self.EXTENSION)
+
+    def test_untrusted_and_bounded_conventions_preserved(self):
+        # §8.2: untrusted-data rule, bounded helpers, sensitive paths.
+        self.assertIn("untrusted data", self.EXTENSION)
+        self.assertIn("exceeds 1 MiB", self.EXTENSION)
+        self.assertIn(".ssh", self.EXTENSION)
+        self.assertIn("ScopedAgent.qml", self.EXTENSION)
 
 
 if __name__ == "__main__":

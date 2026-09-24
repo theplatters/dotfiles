@@ -14,7 +14,6 @@ Item {
     height: implicitHeight
 
     property bool compact: false
-    property var networkPopup: null
     property var controlCenter: null
     // Bar label budget: the SSID text never occupies more than this in the
     // bar (elided). The full name stays available in the ControlCenter
@@ -116,8 +115,6 @@ Item {
         onClicked: {
             if (root.controlCenter) {
                 root.controlCenter.toggleSection(1);
-            } else if (root.networkPopup) {
-                root.networkPopup.toggle(root.parent);
             }
         }
     }

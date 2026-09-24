@@ -1,3 +1,5 @@
+import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -53,10 +55,14 @@ class ControlCenterIntegrationTests(unittest.TestCase):
         self.assertNotIn("id: batteryContainer", bar)
         self.assertNotIn("id: trayContainer", bar)
         self.assertIn("if (bar.controlCenter) bar.controlCenter.toggle()", bar)
-        # Fallback popup props survive for headless/offline use.
-        self.assertIn("property var audioPopup", bar)
-        self.assertIn("property var networkPopup", bar)
-        self.assertIn("property var batteryPopup", bar)
+        # Legacy fallback popup props are deleted (D1): one wired path per
+        # control, straight into ControlCenter.
+        self.assertNotIn("property var audioPopup", bar)
+        self.assertNotIn("property var networkPopup", bar)
+        self.assertNotIn("property var batteryPopup", bar)
+        self.assertNotIn("audioPopup", bar)
+        self.assertNotIn("networkPopup", bar)
+        self.assertNotIn("batteryPopup", bar)
 
     def test_modules_route_into_cc_tabs_and_preserve_tray_actions(self):
         audio = read("AudioModule.qml")
@@ -131,8 +137,12 @@ class UnifiedTrayStructureTests(unittest.TestCase):
         bar = read("Bar.qml")
         capsule = self._capsule(bar)
         for marker in ("id: trayRow", "id: trayToggle", "id: audioModule",
-                       "id: networkModule", "id: batteryModule", "id: trayModule"):
+                       "id: networkModule", "id: batteryModule"):
             self.assertIn(marker, capsule, marker)
+        # SNI tray lives in its own right-slot capsule (never overlapped by
+        # CurrentProjectModule in the unified tray).
+        self.assertIn("id: sysTrayModule", bar)
+        self.assertNotIn("id: trayModule", capsule)
         # One outer border/background: subtle separators, not per-status pills.
         self.assertIn("Theme.mantle", capsule)
         self.assertIn("Theme.surface0", capsule)
@@ -151,26 +161,36 @@ class UnifiedTrayStructureTests(unittest.TestCase):
         self.assertNotIn("Qt.LeftButton", capsule)
         self.assertNotIn("Qt.RightButton", capsule)
         self.assertNotIn("Qt.MiddleButton", capsule)
-        self.assertIn("acceptedButtons: Qt.NoButton", capsule)
-        self.assertIn("onWheel", capsule)
+        # Wheel-only tray scroller lives in the separate right-slot sysTray
+        # capsule (same NoButton idiom, never steals clicks).
+        self.assertIn("acceptedButtons: Qt.NoButton", bar)
+        self.assertIn("onWheel", bar)
         tray = read("TrayModule.qml")
         self.assertIn("modelData.activate()", tray)
         self.assertIn("modelData.secondaryActivate()", tray)
-        # Battery only occupies the row when a battery exists; tray slot and
-        # its separator hide when the tray is empty.
+        # Battery only occupies the row when a battery exists; sysTray slot
+        # hides when the tray is empty.
         self.assertIn("UPower.displayDevice.type === 2", capsule)
-        self.assertIn("visible: implicitWidth > 0", capsule)
+        self.assertIn("visible: sysTrayModule.implicitWidth > 0", bar)
+        self.assertIn("id: sysTrayModule", bar)
 
     def test_modules_keep_full_height_hit_areas_and_fallbacks(self):
         bar = read("Bar.qml")
         capsule = self._capsule(bar)
-        for module in ("audioModule", "networkModule", "batteryModule", "trayModule"):
+        for module in ("audioModule", "networkModule", "batteryModule"):
             section = capsule[capsule.index("id: " + module):capsule.index("id: " + module) + 400]
             self.assertIn("height: 32", section, module)
             self.assertIn("anchors.verticalCenter", section, module)
-        self.assertIn("audioPopup: bar.audioPopup", capsule)
-        self.assertIn("networkPopup: bar.networkPopup", capsule)
-        self.assertIn("batteryPopup: bar.batteryPopup", capsule)
+        # SNI tray lives in its own right-slot capsule at full height.
+        sys_section = bar[bar.index("id: sysTrayModule"):bar.index("id: sysTrayModule") + 400]
+        self.assertIn("height: 32", sys_section, "sysTrayModule")
+        self.assertIn("anchors.verticalCenter", sys_section, "sysTrayModule")
+        self.assertNotIn("audioPopup: bar.audioPopup", capsule)
+        self.assertNotIn("networkPopup: bar.networkPopup", capsule)
+        self.assertNotIn("batteryPopup: bar.batteryPopup", capsule)
+        self.assertNotIn("audioPopup", capsule)
+        self.assertNotIn("networkPopup", capsule)
+        self.assertNotIn("batteryPopup", capsule)
 
     def test_notifications_clock_screenshot_stats_keep_places(self):
         bar = read("Bar.qml")
@@ -214,7 +234,10 @@ class BarSizingTests(unittest.TestCase):
         self.assertNotIn("implicitWidth", compact_line[0])
         # Decided from the budgeted remainder (workspace-first), which itself
         # derives from measured side widths, never the module's own width.
+        # No hard width gate: pure measured-budget logic.
         self.assertIn("mediaFitsFull", compact_line[0])
+        self.assertNotIn("1400", compact_line[0])
+        self.assertNotIn("bar.width", compact_line[0])
         remainder = [line for line in bar.splitlines() if "readonly property real mediaRemainder" in line]
         self.assertTrue(remainder)
         self.assertIn("availableCenterSpace", remainder[0])
@@ -253,11 +276,11 @@ class OverflowSafetyTests(unittest.TestCase):
 
     def test_tray_viewport_capped_and_scrollable(self):
         bar = read("Bar.qml")
-        self.assertIn("id: trayFlick", bar)
-        decl = bar[bar.index("id: trayFlick") - 250:bar.index("id: trayFlick") + 30]
+        self.assertIn("id: sysTrayFlick", bar)
+        decl = bar[bar.index("id: sysTrayFlick") - 250:bar.index("id: sysTrayFlick") + 30]
         self.assertIn("Flickable", decl)
-        flick = bar[bar.index("id: trayFlick"):bar.index("id: trayFlick") + 1400]
-        self.assertIn("Math.min(trayModule.implicitWidth + 4, 148)", flick)
+        flick = bar[bar.index("id: sysTrayFlick"):bar.index("id: sysTrayFlick") + 1400]
+        self.assertIn("Math.min(sysTrayModule.implicitWidth + 4, 148)", flick)
         self.assertIn("flickableDirection: Flickable.HorizontalFlick", flick)
         self.assertIn("boundsBehavior: Flickable.StopAtBounds", flick)
         self.assertIn("acceptedButtons: Qt.NoButton", flick)
@@ -371,9 +394,9 @@ class ControlCenterMotionTests(unittest.TestCase):
 
 
 class ControlCenterPanelExtractionTests(unittest.TestCase):
-    def test_audio_panel_is_embeddable_and_popup_is_thin_wrapper(self):
+    def test_audio_panel_is_embeddable_and_legacy_wrapper_is_deleted(self):
         panel = read("AudioPanel.qml")
-        wrapper = read("AudioPopup.qml")
+        self.assertFalse((ROOT / "widgets" / "AudioPopup.qml").exists())
         self.assertTrue(panel.lstrip().startswith("import QtQuick"))
         self.assertIn("Item {", panel.split("import", 1)[0] if False else panel)
         # Functional audio content lives in the panel.
@@ -385,15 +408,10 @@ class ControlCenterPanelExtractionTests(unittest.TestCase):
         # No popup chrome in the panel.
         self.assertNotIn("PopupWindow {", panel)
         self.assertNotIn("requestedOpen", panel)
-        # Wrapper reuses the panel without duplicating device logic.
-        self.assertIn("PopupWindow {", wrapper)
-        self.assertIn("AudioPanel {", wrapper)
-        self.assertNotIn("Pipewire.nodes", wrapper)
-        self.assertNotIn("function setVolume(", wrapper)
 
-    def test_network_panel_is_embeddable_and_popup_is_thin_wrapper(self):
+    def test_network_panel_is_embeddable_and_legacy_wrapper_is_deleted(self):
         panel = read("NetworkPanel.qml")
-        wrapper = read("NetworkPopup.qml")
+        self.assertFalse((ROOT / "widgets" / "NetworkPopup.qml").exists())
         self.assertIn("Item {", panel)
         for marker in ("wifiDevice", "wiredDevice", "bluetoothAdapter",
                        "function connectNetwork(", "function disconnectNetwork(",
@@ -404,11 +422,6 @@ class ControlCenterPanelExtractionTests(unittest.TestCase):
             self.assertIn(marker, panel, marker)
         self.assertNotIn("PopupWindow {", panel)
         self.assertNotIn("requestedOpen", panel)
-        self.assertIn("NetworkPanel {", wrapper)
-        # Wrapper delegates discovery instead of duplicating nmcli/Bluetooth.
-        self.assertIn("panel.syncDiscovery()", wrapper)
-        self.assertNotIn("nmcli", wrapper)
-        self.assertNotIn("device.pair()", wrapper)
 
     def test_panels_persist_inside_control_center(self):
         cc = read("ControlCenter.qml")
@@ -475,7 +488,12 @@ class ControlCenterDndTests(unittest.TestCase):
     def test_shell_notif_server_has_inhibit_flag(self):
         shell = (ROOT / "shell.qml").read_text(encoding="utf-8")
         self.assertIn("property bool inhibit", shell)
-        self.assertIn("notifServer: notifServer", shell)
+        # Unqualified same-name bindings resolve to the child's own null
+        # property inside the per-screen delegate, so consumers go through
+        # the delegate-root qualified refs.
+        self.assertIn(
+            "readonly property var notifServerRef: notifServer", shell)
+        self.assertIn("notifServer: barWindow.notifServerRef", shell)
 
     def test_cc_toggles_inhibit_and_popout_suppresses_banners(self):
         cc = read("ControlCenter.qml")
@@ -493,6 +511,7 @@ class ControlCenterDndTests(unittest.TestCase):
 
     def test_banner_never_tracks_and_history_is_sole_owner(self):
         popout = read("NotificationPopout.qml")
+        history = read("NotificationHistory.qml")
         module = read("NotificationModule.qml")
         # Banner holds bare references: no tracked writes and no expire.
         # Strip // comments so explanatory notes don't trip the check.
@@ -501,9 +520,18 @@ class ControlCenterDndTests(unittest.TestCase):
         self.assertNotIn("tracked = false", code)
         self.assertNotIn("tracked=false", code)
         self.assertNotIn(".expire()", code)
-        # History owns tracking and closure.
-        self.assertIn("n.tracked = true", module)
-        self.assertIn("n.closed.connect", module)
+        # History owns tracking and closure in the shell-level store.
+        self.assertIn("n.tracked = true", history)
+        self.assertIn("n.closed.connect", history)
+        # The per-bar bell is a view: no tracking of its own.
+        view_code = "\n".join(line.split("//", 1)[0] for line in module.splitlines())
+        self.assertNotIn("n.tracked", view_code)
+        self.assertNotIn("tracked = true", view_code)
+        self.assertNotIn("ListModel {", module)
+        self.assertNotIn("onNotification", module)
+        self.assertIn("history.clearAll()", module)
+        self.assertIn("history.dismissAt(", module)
+        self.assertIn("history.activateAt(", module)
         # Explicit banner actions dismiss (history closes too); expiry and
         # DND hiding are model-only.
         self.assertIn("function userDismiss(", popout)
@@ -517,9 +545,12 @@ class ControlCenterDndTests(unittest.TestCase):
         self.assertNotIn("dismiss()", clear)
 
     def test_history_still_collects_while_dnd(self):
+        history = read("NotificationHistory.qml")
         module = read("NotificationModule.qml")
-        self.assertIn("notifModel", module)
-        # History module must not consult the DND flag.
+        self.assertIn("historyModel", history)
+        # The shell-level history store must not consult the DND flag, and
+        # neither must the bell view.
+        self.assertNotIn("inhibit", history)
         self.assertNotIn("inhibit", module)
 
 
@@ -815,9 +846,9 @@ ShellRoot {
                 var bar = barLoader.item;
                 if (!bar) { console.log("GEO-FAIL no-bar"); win.failed = true; win.finish(); return; }
                 var w = win.testWidths[win.step];
-                var names = ["leftSlot", "rightSlot", "unifiedTray", "clockContainer", "statsContainer", "networkModule", "trayFlick"];
+                var names = ["leftSlot", "rightSlot", "unifiedTray", "clockContainer", "statsContainer", "networkModule", "sysTrayFlick"];
                 for (var i = 0; i < names.length; i++) win.insideBar(win.findByName(bar, names[i]), bar, names[i] + "@" + w);
-                var tray = win.findByName(bar, "trayFlick");
+                var tray = win.findByName(bar, "sysTrayFlick");
                 if (tray && tray.visible && tray.width > 149) { win.failed = true; console.log("GEO-FAIL trayCap w=" + tray.width); }
                 var net = win.findByName(bar, "networkModule");
                 if (net && net.width > 280) { win.failed = true; console.log("GEO-FAIL netCap w=" + net.width); }
@@ -1615,27 +1646,428 @@ class BarGeometryLiveTests(unittest.TestCase):
 
 class NotificationHistoryOwnershipTests(unittest.TestCase):
     def test_eviction_captures_object_before_removal(self):
-        module = read("NotificationModule.qml")
-        self.assertIn("var evictObj = notifModel.get(10).notifObj;", module)
-        self.assertIn("notifModel.remove(10);", module)
-        self.assertIn("if (evictObj) evictObj.dismiss();", module)
-        self.assertNotIn("removed.notifObj", module)
+        history = read("NotificationHistory.qml")
+        self.assertIn("var evictObj = historyModel.get(10).notifObj;", history)
+        self.assertIn("historyModel.remove(10);", history)
+        self.assertIn("if (evictObj) evictObj.dismiss();", history)
+        self.assertNotIn("removed.notifObj", history)
 
     def test_activation_separated_from_dismissal_with_resident_preserved(self):
-        module = read("NotificationModule.qml")
-        self.assertIn("var defaultAction = null;", module)
-        self.assertIn("activateTarget.resident === true", module)
-        self.assertIn("defaultAction.invoke();", module)
-        # Action branch collapses only; removal happens via closed for
+        history = read("NotificationHistory.qml")
+        self.assertIn("var defaultAction = null;", history)
+        # Resident preservation is structural: activation only invokes, and
+        # removal happens exclusively through the notification's closed
+        # handler (resident notifications never close).
+        self.assertIn("n.closed.connect", history)
+        self.assertIn("defaultAction.invoke();", history)
+        # Action branch only invokes; removal happens via closed for
         # nonresident, resident rows persist.
-        action_branch = module[module.index("if (defaultAction) {"):module.index("No default action")]
-        self.assertIn("root.expanded = false;", action_branch)
-        self.assertNotIn("notifModel.remove(", action_branch)
+        action_branch = history[history.index("if (defaultAction) {"):history.index('return "invoked";')]
+        self.assertNotIn("historyModel.remove(", action_branch)
         self.assertNotIn(".dismiss()", action_branch)
         # No-action branch is the safe explicit dismiss (remove then dismiss).
-        no_action = module[module.index("No default action"):module.index("No default action") + 600]
-        self.assertIn("notifModel.remove(index);", no_action)
+        no_action = history[history.index('return "invoked";'):history.index('return "dismissed";') + 30]
+        self.assertIn("historyModel.remove(index);", no_action)
         self.assertIn("activateTarget.dismiss();", no_action)
+        # Clear All collects first, clears, then dismisses (no double remove).
+        clear = history[history.index("function clearAll()"):history.index("function dismissAt(")]
+        self.assertIn("historyModel.clear();", clear)
+        self.assertIn(".dismiss();", clear)
+
+    def test_single_shell_owner_fans_out_to_every_bar(self):
+        shell = (ROOT / "shell.qml").read_text(encoding="utf-8")
+        bar = read("Bar.qml")
+        # One store outside the per-screen delegate, fanned out through a
+        # qualified delegate-root ref (unqualified same-name bindings would
+        # resolve to the child's own null property).
+        self.assertIn("NotificationHistory {", shell)
+        self.assertIn("id: notifHistory", shell)
+        self.assertIn("readonly property var notifHistoryRef: notifHistory", shell)
+        self.assertIn("notifHistory: barWindow.notifHistoryRef", shell)
+        self.assertIn("property var notifHistory", bar)
+        self.assertIn("history: bar.notifHistory", bar)
+
+
+class MediaClickOwnershipTests(unittest.TestCase):
+    def test_capsule_toggle_sits_below_module_controls(self):
+        bar = read("Bar.qml")
+        media = read("MediaModule.qml")
+        capsule = bar[bar.index("id: mediaContainer"):bar.index("id: mediaMini")]
+        # Background toggle is declared BEFORE the module, so the module's
+        # transport/title MouseAreas sit above it and win clicks.
+        self.assertLess(capsule.index("id: mediaBgMouse"),
+                        capsule.index("MediaModule {"))
+        self.assertIn("mediaPopout.toggle(mediaContainer)", capsule)
+        # Flicker-free highlight: capsule color follows both the background
+        # hover and the module's control hover.
+        self.assertIn("mediaBgMouse.containsMouse", capsule)
+        self.assertIn("mediaModule.hovered", capsule)
+        self.assertNotIn("onEntered: mediaContainer.color", capsule)
+        # Module exposes one hovered bit over all four control targets, and
+        # transports act (never toggle the popout).
+        self.assertIn("readonly property bool hovered", media)
+        for target in ("titleMouse", "prevMouse", "playMouse", "nextMouse"):
+            self.assertIn("id: " + target, media)
+        self.assertIn('root.control("previous")', media)
+        self.assertIn('root.control("play-pause")', media)
+        self.assertIn('root.control("next")', media)
+
+    def test_stats_capsule_has_no_dead_hover_affordance(self):
+        bar = read("Bar.qml")
+        stats = bar[bar.index("id: statsContainer"):]
+        self.assertNotIn("MouseArea", stats)
+        self.assertNotIn("onEntered", stats)
+        self.assertIn("color: Theme.mantle", stats)
+
+
+class SharedPollingTests(unittest.TestCase):
+    def test_stats_one_shell_source_fans_out_to_views(self):
+        source = read("SystemStats.qml")
+        module = read("StatModule.qml")
+        shell = (ROOT / "shell.qml").read_text(encoding="utf-8")
+        bar = read("Bar.qml")
+        # S-053 native sampling: mem/cpu read /proc in-process (zero forks);
+        # disk keeps exactly one bounded fork on its own slow timer.
+        # Values fan out to per-bar views.
+        self.assertEqual(source.count("Process {"), 1)
+        self.assertEqual(source.count("FileView {"), 2)
+        self.assertEqual(source.count("Timer {"), 2)
+        self.assertIn("interval: 5000", source)
+        self.assertIn("objectName: \"systemStatsPoll\"", source)
+        for value in ("memValue", "cpuValue", "diskValue"):
+            self.assertIn(value, source)
+        self.assertIn("function valueFor(", source)
+        # mem/cpu sample /proc via FileView, reloaded on the 5 s tick
+        # (procfs watches are unreliable, so watchChanges stays off).
+        self.assertIn("/proc/meminfo", source)
+        self.assertIn("/proc/stat", source)
+        self.assertIn("watchChanges: false", source)
+        self.assertIn(".reload()", source)
+        self.assertIn("parseMemUsedPercent", source)
+        self.assertIn("MemAvailable", source)
+        self.assertIn("parseCpuPercent", source)
+        # No per-tick shell forks for mem/cpu remain.
+        self.assertNotIn('"sh"', source)
+        self.assertNotIn("free |", source)
+        self.assertNotIn("top -bn1", source)
+        self.assertEqual(source.count('"python3"'), 1)
+        # The one remaining fork is the slow disk sampler: direct argv
+        # (no shell wrapper) on a >= 60 s cadence.
+        self.assertIn("shutil.disk_usage", source)
+        m = re.search(r"diskInterval\s*:\s*(\d+)", source)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(int(m.group(1)), 60000)
+        # Views run nothing.
+        self.assertNotIn("Process {", module)
+        self.assertNotIn("Timer {", module)
+        self.assertNotIn("StdioCollector", module)
+        self.assertIn("statsSource", module)
+        self.assertIn("statKey", module)
+        # Shell owns one instance; bars consume it.
+        self.assertIn("SystemStats {", shell)
+        self.assertIn("id: systemStats", shell)
+        self.assertIn("statsSource: bar.systemStats", bar)
+
+    def test_clock_one_shared_second_fans_out_to_views(self):
+        source = read("SharedClock.qml")
+        module = read("ClockModule.qml")
+        shell = (ROOT / "shell.qml").read_text(encoding="utf-8")
+        bar = read("Bar.qml")
+        self.assertEqual(source.count("Timer {"), 1)
+        self.assertIn("interval: 1000", source)
+        self.assertIn("objectName: \"sharedClockTick\"", source)
+        # Date segments advance on day change, not every tick.
+        self.assertIn("dayDate", source)
+        self.assertIn("sameDay", source)
+        self.assertIn("function textFor(", source)
+        self.assertNotIn("Timer {", module)
+        self.assertIn("clockSource", module)
+        self.assertIn("SharedClock {", shell)
+        self.assertIn("clockSource: bar.clockSource", bar)
+        # Three visual segments stay, fed by the shared source.
+        for fmt in ('format: "ddd"', 'format: "HH:mm"', 'format: "MM-dd"'):
+            self.assertIn(fmt, bar)
+
+    def test_project_one_shell_stream_with_slow_badge(self):
+        source = read("CurrentProjectSource.qml")
+        module = read("CurrentProjectModule.qml")
+        shell = (ROOT / "shell.qml").read_text(encoding="utf-8")
+        bar = read("Bar.qml")
+        # One resident watch stream + backoff restart + one 60 s badge timer.
+        self.assertIn('"watch"', source)
+        self.assertIn("SplitParser", source)
+        self.assertIn('objectName: "watchRestartTimer"', source)
+        self.assertNotIn("projectPoll", source)
+        self.assertNotIn("signal(9)", source)
+        self.assertIn("interval: 60000", source)
+        self.assertIn("objectName: \"ledgerBadgePoll\"", source)
+        self.assertIn("current-project", source)
+        self.assertIn("currentGeneration", source)
+        self.assertIn("watchLive", source)
+        # The view runs nothing but keeps popup/badge behavior.
+        self.assertNotIn("Process {", module)
+        self.assertNotIn("Timer {", module)
+        self.assertNotIn("launchGeneration", module)
+        self.assertNotIn("currentProjectProcess", module)
+        self.assertIn("property var projectSource", module)
+        self.assertIn("activateCurrentProject", module)
+        self.assertIn("overviewPopup.openFor", module)
+        self.assertIn("currentProjectLedgerBadge", module)
+        self.assertIn("refreshLedgerInboxBadge", module)
+        # Shell owns one instance; bars consume it.
+        self.assertIn("CurrentProjectSource {", shell)
+        self.assertIn("projectSource: bar.projectSource", bar)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class SystemStatsFormulaTests(unittest.TestCase):
+    """S-053: the mem/cpu formulas execute behaviorally, not just present.
+
+    Follows the node/vm pattern of tests/test_palette_query.py: the pure
+    QML functions are extracted from SystemStats.qml and run against
+    /proc fixtures with exact expected percents.
+    """
+
+    SOURCE = (ROOT / "widgets" / "SystemStats.qml").read_text(encoding="utf-8")
+
+    def extract(self, name):
+        source = self.SOURCE
+        start = source.index("function " + name + "(")
+        opening = source.index("{", start)
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:index + 1]
+        raise AssertionError("unterminated function: " + name)
+
+    def run_case(self, expression):
+        functions = [self.extract(name) for name in
+                     ("parseMemUsedPercent", "parseCpuPercent", "noteStatsTick")]
+        script = f"""
+const vm = require("vm");
+const warnings = [];
+const context = {{
+  root: {{
+    _prevCpuTotal: -1, _prevCpuIdle: -1,
+    memValue: "...", cpuValue: "...",
+    _memStaleTicks: 0, _cpuStaleTicks: 0,
+    _memStaleWarned: false, _cpuStaleWarned: false,
+  }},
+  console: {{ warn(m) {{ warnings.push(String(m)); }}, log() {{}} }},
+}};
+vm.createContext(context);
+for (const value of {json.dumps(functions)}) vm.runInContext(value, context);
+const out = vm.runInContext({json.dumps(expression)}, context);
+console.log(JSON.stringify({{ out, warnings,
+  stale: [context.root._memStaleTicks, context.root._cpuStaleTicks] }}));
+"""
+        completed = subprocess.run(
+            ["node", "-e", script], text=True, capture_output=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_mem_used_matches_free_semantics(self):
+        # used = MemTotal - MemAvailable (what free(1) reports since
+        # procps-ng 4.x); percent = int(used/total*100).
+        # used = 16384000 - 4096000 = 12288000 -> exactly 75%.
+        fixture = ("MemTotal:       16384000 kB\n"
+                   "MemFree:         2000000 kB\n"
+                   "MemAvailable:    4096000 kB\n"
+                   "Buffers:          500000 kB\n"
+                   "Cached:          1000000 kB\n"
+                   "SReclaimable:     200000 kB\n")
+        value = self.run_case("parseMemUsedPercent(%s)" % json.dumps(fixture))
+        self.assertEqual(value["out"], "75%")
+
+    def test_mem_falls_back_without_memavailable(self):
+        # Pre-3.14 kernels lack MemAvailable: total - free - buffers -
+        # cached - sreclaimable. used = 8000-1000-200-800-200 = 5800 ->
+        # floor(72.5) = 72%.
+        fixture = ("MemTotal:        8000 kB\n"
+                   "MemFree:         1000 kB\n"
+                   "Buffers:          200 kB\n"
+                   "Cached:           800 kB\n"
+                   "SReclaimable:     200 kB\n")
+        value = self.run_case("parseMemUsedPercent(%s)" % json.dumps(fixture))
+        self.assertEqual(value["out"], "72%")
+
+    def test_mem_malformed_stays_unavailable(self):
+        for bad in ("", "not procfs output\n",
+                    "MemFree:         100 kB\n"):
+            value = self.run_case(
+                "parseMemUsedPercent(%s)" % json.dumps(bad))
+            self.assertEqual(value["out"], "...", repr(bad))
+
+    def test_cpu_delta_counts_iowait_busy(self):
+        # Aggregate "cpu" line only (cpu0/cpu1 must not match); total =
+        # ALL fields, idle = the idle field only (iowait counts busy,
+        # like the legacy top pipeline).
+        # s1 total = 950, idle = 700; s2 total = 1125, idle = 750 ->
+        # busy = 175 - 50 = 125 -> floor(125/175*100) = 71%.
+        first = ("cpu  100 0 50 700 100 0 0 0 0 0\n"
+                 "cpu0 50 0 25 350 50 0 0 0 0 0\n"
+                 "cpu1 50 0 25 350 50 0 0 0 0 0\n")
+        second = ("cpu  150 0 75 750 150 0 0 0 0 0\n"
+                  "cpu0 75 0 38 375 75 0 0 0 0 0\n"
+                  "cpu1 75 0 37 375 75 0 0 0 0 0\n")
+        expression = ("[parseCpuPercent(%s), parseCpuPercent(%s)]"
+                      % (json.dumps(first), json.dumps(second)))
+        value = self.run_case(expression)
+        # First sample only stores state ("..." until two exist).
+        self.assertEqual(value["out"], ["...", "71%"])
+
+    def test_cpu_counter_reset_and_malformed_stay_unavailable(self):
+        steady = "cpu  100 0 50 700 100 0 0 0 0 0\n"
+        # Counter reset (total went backwards) recovers on the next tick.
+        expression = ("[parseCpuPercent(%s), parseCpuPercent(%s), "
+                      "parseCpuPercent(%s)]"
+                      % (json.dumps(steady), json.dumps(steady),
+                         json.dumps("cpu  200 0 100 800 200 0 0 0 0 0\n")))
+        value = self.run_case(expression)
+        self.assertEqual(value["out"], ["...", "...", "71%"])
+        for bad in ("", "garbage\n", "cpu  1 2 3\n"):
+            value = self.run_case(
+                "parseCpuPercent(%s)" % json.dumps(bad))
+            self.assertEqual(value["out"], "...", repr(bad))
+
+    def test_stale_ticks_warn_once_and_recover(self):
+        expression = """
+root.memValue = "..."; root.cpuValue = "...";
+noteStatsTick(); noteStatsTick(); noteStatsTick(); noteStatsTick();
+const stuck = [root._memStaleTicks, root._cpuStaleTicks,
+  root._memStaleWarned, root._cpuStaleWarned];
+root.memValue = "12%"; root.cpuValue = "34%";
+noteStatsTick();
+const recovered = [root._memStaleTicks, root._cpuStaleTicks,
+  root._memStaleWarned, root._cpuStaleWarned];
+[stuck, recovered]
+"""
+        value = self.run_case(expression)
+        self.assertEqual(value["out"][0], [4, 4, True, True])
+        self.assertEqual(value["out"][1], [0, 0, False, False])
+        # Exactly one warn per metric despite four stuck ticks.
+        self.assertEqual(len(value["warnings"]), 2)
+        self.assertTrue(any("meminfo" in warning for warning in value["warnings"]))
+        self.assertTrue(any("/proc/stat" in warning for warning in value["warnings"]))
+
+
+    def test_stale_accounting_runs_on_the_poll_tick(self):
+        start = self.SOURCE.index('objectName: "systemStatsPoll"')
+        poll = self.SOURCE[start:start + 600]
+        self.assertIn("memFile.reload()", poll)
+        self.assertIn("cpuFile.reload()", poll)
+        self.assertIn("root.noteStatsTick()", poll)
+
+
+class AudioDisplayTokenTests(unittest.TestCase):
+    def test_dead_visualizer_stays_deleted_and_no_one_off_easing(self):
+        self.assertFalse((ROOT / "widgets" / "AudioDisplay.qml").exists())
+        qml_files = list(ROOT.glob("widgets/*.qml")) + [ROOT / "shell.qml"]
+        hits = [p for p in qml_files if p.exists() and "Easing.InOutQuad" in p.read_text(encoding="utf-8")]
+        self.assertEqual(hits, [])
+
+
+class PopoutExclusivityTests(unittest.TestCase):
+    def _shell(self):
+        return (ROOT / "shell.qml").read_text(encoding="utf-8")
+
+    def _close_others(self):
+        shell = self._shell()
+        start = shell.index("function closeOthers(except)")
+        brace = shell.index("{", start)
+        depth = 0
+        for i in range(brace, len(shell)):
+            if shell[i] == "{":
+                depth += 1
+            elif shell[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return shell[start:i + 1]
+        raise AssertionError("unterminated closeOthers")
+
+    def test_close_others_uses_full_dismissals(self):
+        body = self._close_others()
+        # Stateless popouts dismiss directly.
+        self.assertIn("if (except !== mediaPopout) mediaPopout.setOpen(false);", body)
+        self.assertIn("if (except !== calendarPopout) calendarPopout.setOpen(false);", body)
+        # The overview aborts in-flight resume plan/execute (generation
+        # bumps + process kills); a bare setOpen would leak them.
+        self.assertIn("if (except !== projectOverview && projectOverview.requestedOpen) projectOverview.closePopup();", body)
+        self.assertNotIn("projectOverview.setOpen(false)", body)
+        # The password dialog is modal over ControlCenter: opening it must
+        # not close its originator (connection-status feedback survives).
+        self.assertIn("if (except !== controlCenter && except !== passwordPopup) controlCenter.setOpen(false);", body)
+        # External password dismissal notifies + clears via the single path.
+        self.assertIn("if (except !== passwordPopup) passwordPopup.cancelAndClose();", body)
+        self.assertNotIn("passwordPopup.setOpen(false)", body)
+
+    def test_requested_open_handlers_gate_on_truthiness(self):
+        shell = self._shell()
+        # Recursion guard: closeOthers only runs for the popout that just
+        # opened (closePopup/cancelAndClose set requestedOpen=false, so
+        # the closing side never re-enters).
+        for name in ("mediaPopout", "calendarPopout", "projectOverview",
+                     "controlCenter", "passwordPopup"):
+            self.assertIn("if (%s.requestedOpen) closeOthers(%s);" % (name, name), shell, name)
+
+    def test_catcher_sits_above_windows_below_popouts(self):
+        shell = self._shell()
+        catcher = shell[shell.index("id: popoutCatcher"):shell.index("id: popoutCatcher") + 1600]
+        self.assertIn("screen: barWindow.barScreen", catcher)
+        self.assertIn("readonly property var barScreen:", shell)
+        self.assertIn("WlrLayer.Top", catcher)
+        self.assertNotIn("WlrLayer.Bottom", catcher)
+        self.assertIn("margins {", catcher)
+        self.assertIn("top: barWindow.barHeight", catcher)
+        self.assertIn("readonly property var barHeight:", shell)
+        self.assertNotIn("top: 40", catcher)
+        self.assertIn("WlrKeyboardFocus.None", catcher)
+        # Visible only while a non-password anchored popout is open...
+        for marker in ("mediaPopout.requestedOpen || mediaPopout.visible",
+                       "calendarPopout.requestedOpen || calendarPopout.visible",
+                       "projectOverview.requestedOpen || projectOverview.visible",
+                       "controlCenter.requestedOpen || controlCenter.visible"):
+            self.assertIn(marker, catcher, marker)
+        # ...and a click on it dismisses via the shared path.
+        self.assertIn("MouseArea {", catcher)
+        self.assertIn("onClicked: closeOthers(null)", catcher)
+
+    def test_per_screen_password_follows_its_screen(self):
+        shell = self._shell()
+        popup = shell[shell.index("PasswordPopup {"):shell.index("PasswordPopup {") + 200]
+        self.assertIn("id: passwordPopup", popup)
+        self.assertIn("screen: barWindow.barScreen", popup)
+
+    def test_escape_closes_every_dismissible_popout(self):
+        for name in ("MediaPopout.qml", "CalendarPopout.qml",
+                     "ProjectOverviewPopup.qml", "PasswordPopup.qml"):
+            source = (ROOT / "widgets" / name).read_text(encoding="utf-8")
+            self.assertIn('sequence: "Escape"', source, name)
+
+    def test_password_single_external_dismissal_path(self):
+        popup = (ROOT / "widgets" / "PasswordPopup.qml").read_text(encoding="utf-8")
+        self.assertIn("function cancelAndClose()", popup)
+        guard = popup[popup.index("function cancelAndClose()"):popup.index("function cancelAndClose()") + 400]
+        self.assertIn("!root.requestedOpen || root.closing", guard)
+        self.assertIn("root.canceled()", guard)
+        self.assertIn("root.dismiss()", guard)
+        self.assertIn("return false", guard)
+        self.assertIn("return true", guard)
+        # Every external path routes through it: scrim click, card cancel,
+        # Escape shortcut.
+        self.assertEqual(popup.count("root.cancelAndClose()"), 3)
+        self.assertIn("onClicked: root.cancelAndClose()", popup)
+        self.assertIn("onActivated: root.cancelAndClose()", popup)
+        # canceled() fires exactly once (inside the guard); the field is
+        # cleared exactly once (inside dismiss()).
+        self.assertEqual(popup.count("root.canceled()"), 1)
+        self.assertEqual(popup.count('passwordField.text = ""'), 1)
+        # Defense in depth: backdrop clicks disabled during the exit fade.
+        self.assertIn("enabled: root.requestedOpen && !root.closing", popup)
 
 
 if __name__ == "__main__":

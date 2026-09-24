@@ -79,7 +79,7 @@ const ctx = {cwd: "/work", hasUI: true, ui: {confirm: async (_title, message) =>
 }}};
 const noUi = {cwd: "/work", hasUI: false, ui: ctx.ui};
 const assert = (value, message) => { if (!value) throw new Error(message); };
-assert(Object.keys(tools).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan", "journal mode exposed extra tools");
+assert(Object.keys(tools).join(",") === "logseq_journal_context,logseq_journal_append,desktop_current_context,desktop_project_todos,desktop_project_logseq_context,desktop_project_activity,desktop_current_session,desktop_search_activity,desktop_get_session,desktop_resume_plan,session_search", "journal mode exposed extra tools");
 const blocked = await hooks.tool_call({toolName: "bash", input: {command: "touch note"}}, ctx);
 assert(blocked?.block === true, "generic tool escaped journal allowlist");
 assert(await hooks.session_before_switch({reason: "new"}) === undefined, "new session hook was rejected");
@@ -180,11 +180,12 @@ console.log(JSON.stringify({ok: true}));
 
 
 class JournalDesktopHistoryTests(unittest.TestCase):
-    def test_eight_tools_and_timezone_routing(self):
+    def test_nine_tools_and_timezone_routing(self):
         for name in ("desktop_current_context", "desktop_project_todos",
                      "desktop_project_logseq_context", "desktop_project_activity",
                      "desktop_current_session", "desktop_search_activity",
-                     "desktop_get_session", "desktop_resume_plan"):
+                     "desktop_get_session", "desktop_resume_plan",
+                     "session_search"):
             self.assertIn(f'name: "{name}"', EXTENSION)
         for name in ("desktop_current_project", "desktop_project_resources",
                      "desktop_work_sessions", "desktop_session_resources",
@@ -200,7 +201,7 @@ class JournalDesktopHistoryTests(unittest.TestCase):
         system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
         self.assertIn("Prefer session search", system)
         self.assertIn("untrusted evidence", system)
-        self.assertIn("eight-tool desktop read-only exception", system)
+        self.assertIn("nine-tool desktop read-only exception", system)
         self.assertIn("not file edits", system)
         self.assertIn("matched_at_ms", system)
         self.assertIn("not file edits", EXTENSION)

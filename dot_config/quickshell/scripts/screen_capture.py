@@ -13,6 +13,8 @@ import sys
 import tempfile
 from contextlib import contextmanager
 
+import qscli
+
 TIMEOUT = 30
 MAX_BYTES = 8 * 1024 * 1024
 PROCESS_TERMINATE_TIMEOUT = 2
@@ -263,7 +265,7 @@ def capture(geometry=None):
 
 def build_parser():
     """Build the CLI parser using the same geometry validator as capture()."""
-    parser = argparse.ArgumentParser(description="Capture a selected screen region")
+    parser = qscli.SafeParser(description="Capture a selected screen region")
     parser.add_argument(
         "--geometry", type=_geometry_argument,
         help="capture directly using grim geometry (for example: 0,0 640x480)",
@@ -271,14 +273,31 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def _parse_args(argv):
+    return build_parser().parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args):
+    # Grandfathered: cancellation (and Ctrl-C) exits 130 with a single
+    # "error: ..." line, not the qscli exit-1 path, so it is handled here
+    # and returned as a bare int (already reported, run_main passes it
+    # through). CaptureCancelled stays out of _BOUNDED_EXCEPTIONS below.
     try:
-        print(json.dumps(capture(args.geometry)))
-        return 0
-    except (CaptureCancelled, OSError, RuntimeError, KeyboardInterrupt) as exc:
+        value = capture(args.geometry)
+    except (CaptureCancelled, KeyboardInterrupt) as exc:
         print(f"error: {exc or 'cancelled'}", file=sys.stderr)
-        return 130 if isinstance(exc, (CaptureCancelled, KeyboardInterrupt)) else 1
+        return 130
+    print(json.dumps(value))
+    return 0
+
+
+_BOUNDED_EXCEPTIONS = (OSError, RuntimeError, TypeError, ValueError,
+                       UnicodeError)
+
+
+def main(argv=None):
+    return qscli.run_main(_parse_args, _dispatch, "screen capture",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

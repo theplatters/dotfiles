@@ -47,7 +47,7 @@ PopupWindow {
     visible: false
     implicitWidth: Math.min(420, maxPopupWidth)
     implicitHeight: Math.min(600, maxPopupHeight)
-    color: "transparent"
+    color: Theme.transparent
 
     anchor {
         item: root.anchorItem
@@ -98,8 +98,11 @@ PopupWindow {
         inhibitWindow: root.barWindow
     }
 
+    // One-way tab routing (S-011): CC owns selectedTab; the embedded
+    // NetworkPanel is a slave. The mapping lives here only (network=0,
+    // BT=1); the panel never writes back to selectedTab and its hidden
+    // inner selector stays inert (showTabSelector: false).
     onSelectedTabChanged: {
-        // Route CC tabs into the shared network panel (network=0, BT=1).
         if (root.selectedTab === 1) netPanel.activeTab = 0;
         else if (root.selectedTab === 2) netPanel.activeTab = 1;
         bodyFlick.contentY = 0;
@@ -108,15 +111,6 @@ PopupWindow {
 
     onVisibleChanged: {
         netPanel.syncDiscovery();
-    }
-
-    Connections {
-        target: netPanel
-        function onActiveTabChanged() {
-            // Keep CC tabs coherent when the embedded panel switches.
-            if (root.selectedTab === 1 && netPanel.activeTab === 1) root.selectedTab = 2;
-            else if (root.selectedTab === 2 && netPanel.activeTab === 0) root.selectedTab = 1;
-        }
     }
 
     function setOpen(open) {
@@ -156,9 +150,9 @@ PopupWindow {
     }
 
     function openSection(tab) {
+        // Single click path for all four tabs: set the owned tab and
+        // open; the onSelectedTabChanged handler routes into the panel.
         selectedTab = tab;
-        if (tab === 1) netPanel.activeTab = 0;
-        else if (tab === 2) netPanel.activeTab = 1;
         setOpen(true);
     }
 
@@ -345,7 +339,7 @@ PopupWindow {
                     Layout.fillWidth: true
                     checkable: true
                     checked: root.selectedTab === 0
-                    onClicked: root.selectedTab = 0
+                    onClicked: root.openSection(0)
                 }
                 WidgetButton {
                     text: "Network"
@@ -366,7 +360,7 @@ PopupWindow {
                     Layout.fillWidth: true
                     checkable: true
                     checked: root.selectedTab === 3
-                    onClicked: root.selectedTab = 3
+                    onClicked: root.openSection(3)
                 }
             }
 

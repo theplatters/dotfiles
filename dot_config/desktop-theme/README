@@ -1,0 +1,87 @@
+# Rich Black desktop theme
+
+Unified opaque dark theme for GTK 3/4, Qt 6, and LibreOffice.
+Single source of truth is `quickshell/theme/Theme.qml` — every app
+color is derived from it, so the bar, GTK, Qt, and LibreOffice chrome
+stay in sync. Flat, opaque, monochrome: no gradients, assets, or glows.
+Selection/checked/primary fill is light accent with dark text on top.
+
+## How it works
+
+* `desktop-theme/theme_tokens.py` — parses `Theme.qml`; exposes
+  `tokens()`, `css(name)` (GTK `rgba` alpha 0..1), `qss(name)`
+  (QSS `rgba` alpha 0..255).
+* `desktop-theme/generate.py` — `render` (default) regenerates the
+  derived files below; `check` fails if (a) generated files drift from
+  `Theme.qml`, (b) hand-authored `gtk.css` files contain raw hex or
+  `rgba()` literals, or (c) a `@token` used in `gtk.css` is not defined
+  in `colors.css`. Exit non-zero on violation.
+* `desktop-theme/templates/rich-black.qss.tmpl` — Qt 6 stylesheet
+  template; every color/radius is a `{{token}}` placeholder filled at
+  render time.
+* `desktop-theme/libreoffice/apply.py` plus
+  `desktop-theme/libreoffice/rich-black.settings.json` — idempotently
+  fuses tokens into
+  `~/.config/libreoffice/4/user/registrymodifications.xcu` (backs up to
+  `.bak` first). See `desktop-theme/libreoffice/README.md` for details.
+
+Generated files (do not edit by hand; re-render instead):
+
+* `gtk-3.0/colors.css`, `gtk-4.0/colors.css`
+* `qt6ct/colors/rich-black.conf`, `qt6ct/qss/rich-black.qss`
+
+Hand-authored files (only place for manual styling):
+
+* `gtk-3.0/gtk.css`, `gtk-4.0/gtk.css` — must use `@rb_*` /
+  libadwaita `@-names` only, no literal colors.
+* `desktop-theme/templates/rich-black.qss.tmpl`
+
+## Tokens (from Theme.qml)
+
+bg `#070707` (window bg) · base `#0C0C0C` (headerbar/menubar/toolbar/
+dialog) · mantle `#111111` (controls & overlays) · surface0 `#161616`
+(hover) · surface1 `#1D1D1D` (borders/pressed) · surface2 `#262626`
+(handles/strong separators) · text `#F5F5F5` · subtext1 `#A1A1A1` ·
+subtext0 `#6F6F6F` · border `#1D1D1D` · focusBorder `#33F5F5F5`
+(20% white focus ring) · accent `#D6D6D6` (selection/checked/primary)
+· accentMuted `#969696` · scrim `#B0070707` · muted semantic red
+`#C59D9D`, green `#A8B6A4`, mauve `#C8C8C8`, teal `#A8B8B8`, pink
+`#BDBDBD`, blue `#AAB3BD`, base3 `#F5F5F5`.
+Radii: control 12 · chip 7 · card 16 · large 20.
+UI font is Noto Sans 10pt; Qt icons use `breeze-dark`.
+
+## Qt 6 wiring
+
+`qt6ct/qt6ct.conf` sets `color_scheme_path=` to
+`qt6ct/colors/rich-black.conf` and `stylesheets=` to
+`qt6ct/qss/rich-black.qss`; style stays Fusion. Apps need
+`QT_QPA_PLATFORMTHEME=qt6ct` (already exported in `~/.profile`).
+
+## LibreOffice
+
+White document page (WYSIWYG) + dark chrome + readable text + dark
+monochrome icons. `apply.py` sets `IsAutomaticFontColor=true`, icon
+theme `sifr_dark`, `ApplicationAppearance=2` (force dark),
+`UseOnlyWhiteDocBackground=true`, `LibreOfficeTheme=1` (enables the
+theme engine — it was `0`, which disabled theming and caused the brown
+chrome / transparent menus), and a custom `RICH_BLACK`
+Application Colors scheme mapped to the tokens above.
+
+## Keeping it in sync
+
+Run from `~/.config`:
+
+1. Edit `quickshell/theme/Theme.qml`.
+2. `python3 desktop-theme/generate.py render` — propagate to GTK/Qt 6.
+3. `python3 desktop-theme/generate.py check` — verify no drift and no
+   raw colors in `gtk.css`.
+4. `python3 desktop-theme/libreoffice/apply.py` — push tokens into
+   LibreOffice (restart LibreOffice afterwards).
+5. Restart apps to pick up changes: GTK reads
+   `~/.config/gtk-3.0/gtk.css` + `~/.config/gtk-4.0/gtk.css` (restart
+   the app; restart `xsettingsd` if a running app does not refresh).
+   Qt 6 apps need a restart with `QT_QPA_PLATFORMTHEME=qt6ct`.
+
+Limitation: apps that bundle their own toolkit/theme, use
+client-side decoration, or ship their own styling may not fully follow
+these colors.

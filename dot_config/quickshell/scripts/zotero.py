@@ -102,6 +102,12 @@ import urllib.request
 from pathlib import Path
 from typing import NoReturn
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import qscli
+
 
 class ZoteroError(ValueError):
     pass
@@ -113,6 +119,10 @@ API_KEY_ENV = "ZOTERO_API_KEY"
 PREPARE_DIR_ENV = "QUICKSHELL_ZOTERO_PREPARE_DIR"
 KEY_FILE_ENV = "QUICKSHELL_ZOTERO_KEY_FILE"
 
+# NOTE: stdin transport now goes through qscli.read_input (1 MiB cap).
+# This narrower 256 KiB bound is retained for the key-cache and
+# prepared-plan store reads/writes below, not for stdin. Do not unify
+# by accident.
 INPUT_LIMIT = 256 * 1024
 HTTP_TIMEOUT = 10.0
 RESPONSE_LIMIT = 8 * 1024 * 1024
@@ -1999,70 +2009,68 @@ def cmd_apply(payload: dict, base: str, registry_file=None) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _read_input():
-    stream = getattr(sys.stdin, "buffer", sys.stdin)
-    try:
-        data = stream.read(INPUT_LIMIT + 1)
-    except OSError as exc:
-        raise ZoteroError("cannot read JSON input") from exc
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    if len(data) > INPUT_LIMIT:
-        _error("JSON input is too large")
-    if not data.strip():
-        _error("JSON input must be an object")
-    try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ZoteroError(f"invalid JSON input: {exc}") from exc
-    if not isinstance(value, dict):
-        _error("JSON input must be an object")
-    return value
+# ---------------------------------------------------------------------------
+# CLI (shared plumbing lives in qscli.py; argv stays byte-identical)
+# ---------------------------------------------------------------------------
 
-
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--projects-file", default=None)
+def _parse_args(argv) -> argparse.Namespace:
+    parser = qscli.SafeParser(description=__doc__)
+    qscli.add_global_flags(parser, projects_file=True)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("command",
                         choices=("capabilities", "authorize", "collections",
                                  "libraries", "search", "item", "read-pdf",
                                  "prepare", "preview", "apply"))
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args: argparse.Namespace) -> dict:
     try:
-        args = parser.parse_args(argv)
         base = _resolve_base_url(args.base_url)
+        payload = qscli.read_input()
         if args.command == "capabilities":
-            value = cmd_capabilities(_read_input(), base, args.projects_file)
+            return cmd_capabilities(payload, base, args.projects_file)
         elif args.command == "authorize":
-            value = cmd_authorize(_read_input(), base, args.projects_file)
+            return cmd_authorize(payload, base, args.projects_file)
         elif args.command == "collections":
-            value = cmd_collections(_read_input(), base, args.projects_file)
+            return cmd_collections(payload, base, args.projects_file)
         elif args.command == "libraries":
-            value = cmd_libraries(_read_input(), base, args.projects_file)
+            return cmd_libraries(payload, base, args.projects_file)
         elif args.command == "search":
-            value = cmd_search(_read_input(), base, args.projects_file)
+            return cmd_search(payload, base, args.projects_file)
         elif args.command == "item":
-            value = cmd_item(_read_input(), base, args.projects_file)
+            return cmd_item(payload, base, args.projects_file)
         elif args.command == "read-pdf":
-            value = cmd_read_pdf(_read_input(), base, args.projects_file)
+            return cmd_read_pdf(payload, base, args.projects_file)
         elif args.command == "prepare":
-            value = cmd_prepare(_read_input(), base, args.projects_file)
+            return cmd_prepare(payload, base, args.projects_file)
         elif args.command == "preview":
-            value = cmd_preview(_read_input(), base, args.projects_file)
+            return cmd_preview(payload, base, args.projects_file)
         else:
-            value = cmd_apply(_read_input(), base, args.projects_file)
-        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-        return 0
-    except SystemExit as exc:
-        return 0 if exc.code == 0 else 1
-    except (ZoteroError, OSError, TypeError, ValueError,
-            UnicodeError) as exc:
-        message = str(exc) or "zotero request failed"
-        for secret in (os.environ.get(API_KEY_ENV, ""),):
-            if secret and secret in message:
-                message = message.replace(secret, "[redacted]")
-        print(f"error: {message}", file=sys.stderr)
-        return 1
+            return cmd_apply(payload, base, args.projects_file)
+    except Exception as exc:
+        # Never leak the write-key override into diagnostics: redact the
+        # ZOTERO_API_KEY value before run_main formats the error.
+        try:
+            message = str(exc)
+        except Exception:
+            raise
+        secret = os.environ.get(API_KEY_ENV, "")
+        if secret and secret in message:
+            raise ZoteroError(
+                message.replace(secret, "[redacted]")) from exc
+        if not message:
+            raise ZoteroError("zotero request failed") from exc
+        raise
+
+
+_BOUNDED_EXCEPTIONS = (ZoteroError, OSError, TypeError, ValueError,
+                       UnicodeError, RecursionError, OverflowError)
+
+
+def main(argv=None) -> int:
+    return qscli.run_main(_parse_args, _dispatch, "zotero",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

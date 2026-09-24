@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Safe, bounded JSON operations on a Logseq graph."""
-import argparse
 import datetime
 import fcntl
 import json
@@ -13,6 +12,8 @@ import sys
 from logseq_common import (GraphError, MAX_FILE_BYTES, markdown_files,
                            page_name, read_lines, MAX_RESULTS, resolve_graph)
 from logseq_todos import todos
+
+import qscli
 
 DATE = re.compile(r"^\d{4}_\d{2}_\d{2}$")
 
@@ -123,25 +124,35 @@ def append_journal(graph, text, date):
                 except OSError: pass
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--graph", default=None,
-                        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json")
-    sub = parser.add_subparsers(dest="command", required=True)
+def _parse_args(argv):
+    parser = qscli.SafeParser(add_help=True)
+    qscli.add_global_flags(parser, graph=True)  # --graph defaults to LOGSEQ_GRAPH or logseqGraph in settings.json
+    sub = parser.add_subparsers(dest="command", required=True,
+                                parser_class=qscli.SafeParser)
     todos_parser = sub.add_parser("todos"); todos_parser.add_argument("--query")
     found = sub.add_parser("search"); found.add_argument("query")
     add = sub.add_parser("append"); add.add_argument("--text", required=True); add.add_argument("--date")
-    args = parser.parse_args(argv)
-    try:
-        graph = resolve_graph(args.graph)
-        if args.command == "todos": value = todos(graph, args.query)
-        elif args.command == "search": value = search(graph, args.query)
-        else: value = append_journal(graph, args.text, args.date)
-        print(json.dumps(value, ensure_ascii=False))
-        return 0
-    except (GraphError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args):
+    graph = resolve_graph(args.graph)
+    if args.command == "todos": value = todos(graph, args.query)
+    elif args.command == "search": value = search(graph, args.query)
+    else: value = append_journal(graph, args.text, args.date)
+    print(json.dumps(value, ensure_ascii=False))
+    return 0
+
+
+# Grandfathered: pre-migration tuple was (GraphError, OSError); ValueError
+# is added so qscli.emit cap failures report cleanly instead of falling
+# through to the generic fallback (GraphError already subclasses it).
+_BOUNDED_EXCEPTIONS = (GraphError, OSError, ValueError)
+
+
+def main(argv=None):
+    return qscli.run_main(_parse_args, _dispatch, "logseq graph",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

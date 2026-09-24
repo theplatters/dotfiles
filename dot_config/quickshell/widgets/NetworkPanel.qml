@@ -6,9 +6,9 @@ import Quickshell.Io
 import Quickshell.Networking
 import "../theme"
 
-// Embeddable network + bluetooth controls extracted from NetworkPopup.
+// Embeddable network + bluetooth controls for the ControlCenter.
 // Item root so it can live persistently inside ControlCenter.
-// NetworkPopup.qml remains as a thin PopupWindow wrapper for backcompat.
+// The standalone NetworkPopup wrapper was deleted (D1).
 //
 // Discovery contract:
 // - `active` gates all scanning: Wi-Fi scanner and Bluetooth discovery run
@@ -448,7 +448,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
 
                     Behavior on x {
-                        NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
+                        NumberAnimation { duration: Theme.motionFast; easing.type: Easing.OutCubic }
                     }
                 }
 
@@ -603,8 +603,8 @@ Item {
                 width: wifiListView.width
                 height: 58
                 radius: Theme.controlRadius
-                color: modelData.connected ? Theme.surface2 : (wifiMouse.containsMouse ? Theme.surface0 : "transparent")
-                border.color: modelData.connected ? Theme.border : "transparent"
+                color: modelData.connected ? Theme.surface2 : (wifiMouse.containsMouse ? Theme.surface0 : Theme.transparent)
+                border.color: modelData.connected ? Theme.border : Theme.transparent
                 border.width: 1
 
                 readonly property bool active: modelData.connected
@@ -716,8 +716,8 @@ Item {
                 width: bluetoothListView.width
                 height: 62
                 radius: Theme.controlRadius
-                color: modelData.connected ? Theme.surface2 : (btMouse.containsMouse ? Theme.surface0 : "transparent")
-                border.color: modelData.connected ? Theme.border : "transparent"
+                color: modelData.connected ? Theme.surface2 : (btMouse.containsMouse ? Theme.surface0 : Theme.transparent)
+                border.color: modelData.connected ? Theme.border : Theme.transparent
                 border.width: 1
 
                 readonly property bool busy: modelData.state === BluetoothDeviceState.Connecting || modelData.state === BluetoothDeviceState.Disconnecting || modelData.pairing

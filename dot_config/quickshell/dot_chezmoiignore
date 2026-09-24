@@ -4,6 +4,7 @@ __pycache__/
 # Per-machine settings (see settings.example.json). Never commit the real
 # logseqGraph path; every machine keeps its own copy.
 settings.json
+projects.toml
 # Desktop-context collector databases: runtime data, never deployed.
 *.db
 *.db-wal

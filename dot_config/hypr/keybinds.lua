@@ -36,7 +36,6 @@ hl.bind(mainMod .. " + SHIFT + S", hl.dsp.window.move({ workspace = "special:mag
 
 -- Evolution magic workspace
 hl.bind(mainMod .. " + L", hl.dsp.workspace.toggle_special("evolution"))
-hl.bind(mainMod .. " + N", hl.dsp.workspace.toggle_special("journal"))
 
 -- Scroll through existing workspaces with mainMod + scroll
 hl.bind(mainMod .. " + mouse_down", hl.dsp.focus({ workspace = "e+1" }))

@@ -220,10 +220,25 @@ the last session time, selected files, observed repository/branch, Logseq
 page, open-TODO count, and saved/new Pi-session status. The same palette card
 offers `Resume`, `Ask Pi`, and `History`:
 
-- `Resume` executes a freshly rebuilt backend plan, then hands the stable
-  project UUID to the existing ProjectPlanner.
+- `Resume` (palette) opens an operation checkbox confirmation listing the
+  available operations with all available operations selected by default,
+  then executes a freshly rebuilt backend plan limited to the checked
+  subset via `--operations`; an empty selection is disallowed and `Cancel`
+  performs no action. It then hands the stable project UUID to the
+  existing ProjectPlanner. The Overview popup `Resume` button is unchanged
+  (its existing preview/Confirm flow still executes all available operations).
 - `Ask Pi` opens the same project-scoped planner and prefills—but does not
-  send—a deterministic continuation request.
+  send—a deterministic continuation request: the baseline draft is
+  prefilled immediately, then the cached local continuation from
+  `python3 scripts/work_log.py continuation --project UUID`
+  (`{project, available, text}`, `text` at most 2400 chars) is appended
+  fail-soft while `memory.enabled` is on. The summary is included only when `memory.workLog` is on and
+  the stored label line only when `memory.sessionEnrichment` is on; the
+  backend derives the summary only from cached deterministic work-log
+  sections and reads stored labels when enabled (no fresh draft, no
+  polished text), with no new network calls. When unavailable
+  the baseline remains unchanged; it never auto-sends and never
+  overwrites an edited draft (see `docs/work-memory.md`).
 - `History` opens the project's existing scoped transcript.
 
 The handoff waits for the palette exit animation, then ProjectPlanner reloads

@@ -16,9 +16,25 @@
  * - Palette routes agent onUiRequest/open() into openRequest(); routes
  *   null-request into close(). Dialog calls paletteInput.forceActiveFocus()
  *   on dismiss/restore; no other palette writes.
- * - dismiss() stays view-only: it clears the local view and never responds
- *   to RPC, so closing the palette leaves the request pending. reject()
- *   responds cancelled, accept() responds confirm/select/input branches.
+ * - dismiss() defers (S-048): it sends deferRequest for the visible
+ *   request so the bridge parks it round-robin (skipped while other
+ *   requests remain, re-surfaced bridge-side when the round reaches it,
+ *   never expiring while parked) and clears only the local view. The
+ *   parked id is recorded (deferredIds) so its same-id echo never
+ *   force-opens this dialog or the palette again in this surface
+ *   session; new ids still surface immediately, and reopening re-shows
+ *   whatever is pending via openRequest(agent.pendingApproval). It never
+ *   sends an RPC response. reject() responds cancelled, accept()
+ *   responds confirm/select/input branches (both via clearView, never
+ *   via dismiss, so a failed respond cannot park the request).
+ *   Gestures are labelled by effect: "Reject (Esc)" cancels,
+ *   "Defer" parks the request queued, and the footer states that
+ *   Defer/closing parks it without expiry or auto-reopen while Reject
+ *   cancels it and Stop cancels everything.
+ * - Preview follows the bounded exact-preview pattern (S-024): specific
+ *   titles, a consequence line, a destination/what-will-run line, and a
+ *   bounded monospace excerpt. Untrusted text stays bounded; args are
+ *   never raw-dumped.
  *
  * Generation/staleness: N/A (single pending request; openRequest replaces it).
  *
@@ -28,6 +44,7 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
 import "../theme"
+import "ApprovalGrammar.js" as ApprovalGrammar
 
 FocusScope {
     id: root
@@ -39,6 +56,13 @@ FocusScope {
     property bool paletteOpen: false
     property bool paletteClosing: false
     property var paletteInput
+    // Same-id suppression for the current surface session: every id
+    // parked via dismiss() is recorded here so a bridge round-robin
+    // re-surface of that SAME id never force-opens this dialog (or the
+    // palette) while the surface stays open. New ids still surface
+    // immediately; the set resets on open()/mode change, and reopening
+    // re-shows whatever is pending via openRequest(agent.pendingApproval).
+    property var deferredIds: ({})
 
     z: 100
     anchors.fill: parent
@@ -49,16 +73,77 @@ FocusScope {
         request = value;
         choiceIndex = 0;
         responseInput.text = value.prefill ? String(value.prefill) : "";
+        // S-048: a dialog opened for this request marks it surfaced, so
+        // the bridge never expires it silently. Guarded: test harnesses
+        // may install a partial agent without the op.
+        try {
+            if (agent && typeof agent.surfaceRequest === "function" && value.id)
+                agent.surfaceRequest(value.id);
+        } catch (error) {}
         Qt.callLater(focusRequest);
     }
 
-    // Dismiss only removes the local view.  It deliberately does not send
-    // a response: closing the palette must leave the RPC request pending.
-    function dismiss() {
+    // View-only reset: clears the visible request without parking it.
+    // Accept/Reject use this so the respond runs first and a failed
+    // respond can never park the request (parking is the Defer/close
+    // path's job, below). Defer/close use dismiss(), never this.
+    function clearView() {
         request = null;
         choiceIndex = 0;
         responseInput.text = "";
         Qt.callLater(restoreFocus);
+    }
+
+    // Dismiss defers (S-048): park the visible request round-robin via
+    // deferRequest, then clear only the local view. It deliberately
+    // sends no RPC response: closing the palette parks the request
+    // queued (never expiring, never reopening on its own this session),
+    // and reopening re-shows whatever is pending.
+    // Reached only from the Defer button and surface-close paths
+    // (close(), compositor unmap); Accept/Reject go through clearView.
+    function dismiss() {
+        // Capture the id first: clearing the view must not lose the op.
+        let deferredId = null;
+        try {
+            if (request && request.id) deferredId = request.id;
+        } catch (error) {
+            deferredId = null;
+        }
+        // Record BEFORE parking: even a failed park must suppress the
+        // same-id echo (the request stays queued bridge-side regardless).
+        noteDeferred(deferredId);
+        clearView();
+        // Park AFTER the view is cleared; a failed park never resurrects
+        // the dialog (the request stays queued bridge-side regardless).
+        try {
+            if (deferredId && agent && typeof agent.deferRequest === "function")
+                agent.deferRequest(deferredId);
+        } catch (error) {}
+    }
+
+    // Same-id suppression bookkeeping (see deferredIds): plain var-map
+    // copies so QML notifies on replace; reads are null-safe for
+    // harness contexts.
+    function noteDeferred(requestId) {
+        if (!requestId) return;
+        try {
+            let copy = Object.assign({}, deferredIds);
+            copy[requestId] = true;
+            deferredIds = copy;
+        } catch (error) {}
+    }
+
+    function isDeferred(requestId) {
+        if (!requestId) return false;
+        try {
+            return !!deferredIds[requestId];
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function resetDeferred() {
+        deferredIds = ({});
     }
 
     function close() { dismiss(); }
@@ -75,40 +160,60 @@ FocusScope {
         else if (root.paletteOpen && !root.paletteClosing && root.paletteInput) root.paletteInput.forceActiveFocus();
     }
 
+    // Thin wrapper over the shared approval grammar (S-059): the same
+    // request derives the same title on every surface. Kept by name —
+    // tests pin titleFor here.
     function titleFor(value) {
-        if (!value) return "Approval";
-        if (value.method === "select") return "Choose a session";
-        if (value.method === "confirm") return "Confirm request";
-        if (value.method === "editor") return "Edit response";
-        return "Enter response";
+        return ApprovalGrammar.titleFor(value);
     }
+
 
     function messageFor(value) {
-        if (!value) return "";
-        return value.message || value.title || value.prompt ||
-            "Pi is requesting an explicit response.";
+        return ApprovalGrammar.messageFor(value);
     }
 
-    function argumentPreview(value) {
-        if (!value) return "";
-        let args = value.arguments !== undefined ? value.arguments :
-            (value.input !== undefined ? value.input : value);
-        try { return JSON.stringify(args, null, 2); }
-        catch (error) { return String(args); }
+
+    // Bound untrusted text: strip controls, collapse whitespace, cap.
+    function boundedText(value, limit) {
+        return ApprovalGrammar.boundedText(value, limit);
     }
+
+
+    // Consequence line (S-024/S-059): shared grammar. Exactly true: a
+    // deferred request never expires, never reopens on its own while
+    // this view stays open, and is still pending when the user comes
+    // back to it; only Reject cancels it and Stop cancels everything.
+    function consequenceFor(value) {
+        return ApprovalGrammar.consequenceFor(value);
+    }
+
+
+    // Destination / what-will-run line (S-024/S-059): shared grammar,
+    // bounded, never a raw dump. Passes this dialog's choice cursor.
+    function destinationFor(value) {
+        return ApprovalGrammar.destinationFor(value, choiceIndex);
+    }
+
+
+    // Bounded exact-preview excerpt (S-024/S-059): shared field-walk,
+    // capped for display. Never a raw JSON dump of args.
+    function argumentPreview(value) {
+        return ApprovalGrammar.argumentPreview(value);
+    }
+
 
     function moveChoice(delta) {
         if (!request || request.method !== "select") return;
-        let options = request.options || [];
-        choiceIndex = Math.max(0, Math.min(options.length - 1, choiceIndex + delta));
+        choiceIndex = ApprovalGrammar.moveChoice(delta, choiceIndex, (request.options || []).length);
         choiceList.positionViewAtIndex(choiceIndex, ListView.Contain);
     }
+
 
     function reject() {
         if (!request) return;
         let current = request;
         let requestId = current.id;
-        dismiss();
+        clearView();
         agent.respond(requestId, { cancelled: true });
     }
 
@@ -123,7 +228,7 @@ FocusScope {
             value.value = options[choiceIndex] || options[0];
         } else value.value = responseInput.text;
         let requestId = current.id;
-        dismiss();
+        clearView();
         agent.respond(requestId, value);
     }
 
@@ -182,6 +287,20 @@ FocusScope {
                 wrapMode: Text.Wrap
                 Layout.fillWidth: true
             }
+            Text {
+                text: root.consequenceFor(root.request)
+                color: Theme.accentMuted
+                wrapMode: Text.Wrap
+                font.pixelSize: 12
+                Layout.fillWidth: true
+            }
+            Text {
+                text: root.destinationFor(root.request)
+                color: Theme.subtext1
+                wrapMode: Text.Wrap
+                font.pixelSize: 12
+                Layout.fillWidth: true
+            }
             ScrollView {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 100
@@ -192,6 +311,7 @@ FocusScope {
                     textFormat: TextEdit.PlainText
                     wrapMode: TextArea.Wrap
                     selectByMouse: true
+                    font.family: "monospace"
                     color: Theme.subtext0
                     background: Rectangle { color: Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border; border.width: 1 }
                 }
@@ -243,18 +363,32 @@ FocusScope {
                 selectByMouse: true
                 color: Theme.text
                 background: Rectangle { color: Theme.mantle; radius: Theme.controlRadius; border.color: responseInput.activeFocus ? Theme.focusBorder : Theme.border; border.width: 1 }
-                // Enter intentionally remains a newline for input/editor.
-                // The explicit Accept button is the only submit path.
+                // Enter intentionally remains a newline for input/editor
+                // (labelled by the hint above). The explicit Accept button
+                // is the only submit path.
                 Keys.onPressed: (event) => {
                     if (event.key === Qt.Key_Escape) { root.reject(); event.accepted = true; }
                 }
+            }
+            Text {
+                visible: root.request && (root.request.method === "input" || root.request.method === "editor")
+                text: "Enter adds a newline · Accept submits"
+                color: Theme.subtext0
+                font.pixelSize: 12
+                Layout.fillWidth: true
             }
             RowLayout {
                 Layout.fillWidth: true
                 Item { Layout.fillWidth: true }
                 Button {
-                    text: "Reject"
+                    text: "Reject (Esc)"
                     onClicked: root.reject()
+                    contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
+                }
+                Button {
+                    text: "Defer"
+                    onClicked: root.dismiss()
                     contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
                 }
@@ -265,6 +399,13 @@ FocusScope {
                     contentItem: Text { text: parent.text; color: Theme.text; font.family: Theme.fontFamily; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     background: Rectangle { color: parent.hovered ? Theme.surface1 : Theme.mantle; radius: Theme.controlRadius; border.color: Theme.border }
                 }
+            }
+            Text {
+                text: "Defer or closing the palette parks the request queued — it never expires and never reopens on its own while the palette stays open. Reopening the palette shows whatever is pending then. Reject cancels this request; Stop cancels everything."
+                color: Theme.subtext0
+                wrapMode: Text.Wrap
+                font.pixelSize: 12
+                Layout.fillWidth: true
             }
         }
     }

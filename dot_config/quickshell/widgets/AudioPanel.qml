@@ -4,9 +4,9 @@ import Quickshell
 import Quickshell.Services.Pipewire
 import "../theme"
 
-// Embeddable audio controls extracted from AudioPopup.
+// Embeddable audio controls for the ControlCenter.
 // Item root so it can live persistently inside ControlCenter.
-// AudioPopup.qml remains as a thin PopupWindow wrapper for backcompat.
+// The standalone AudioPopup wrapper was deleted (D1).
 Item {
     id: root
 
@@ -178,8 +178,8 @@ Item {
                 height: rowVisible ? 92 : 0
                 visible: rowVisible
                 radius: Theme.controlRadius
-                color: defaultNode ? Theme.surface2 : (rowHover.hovered ? Theme.surface0 : "transparent")
-                border.color: defaultNode ? Theme.border : "transparent"
+                color: defaultNode ? Theme.surface2 : (rowHover.hovered ? Theme.surface0 : Theme.transparent)
+                border.color: defaultNode ? Theme.border : Theme.transparent
                 border.width: 1
                 clip: true
 
@@ -242,7 +242,7 @@ Item {
                         Rectangle {
                             Layout.fillWidth: true
                             height: 8
-                            radius: 4
+                            radius: height / 2
                             color: Theme.surface1
 
                             Rectangle {

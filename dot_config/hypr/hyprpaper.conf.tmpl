@@ -1,0 +1,37 @@
+{{- /* Wallpaper path is resolved at apply time from the XDG pictures dir:
+     its name is locale-dependent (e.g. "Bilder" vs "Pictures"), so bake the
+     per-device absolute path in via xdg-user-dir instead of hardcoding one. */ -}}
+{{- $wall := joinPath (trim (output "xdg-user-dir" "PICTURES")) "wall.jpg" -}}
+# The empty monitor entry is the fallback for outputs not listed below.
+wallpaper {
+  monitor =
+  path = {{ $wall }}
+  fit_mode = cover
+}
+wallpaper  { 
+  monitor = eDP-1
+  path = {{ $wall }}
+  fit_mode = cover
+}
+wallpaper  { 
+  monitor = DP-1
+  path = {{ $wall }}
+  fit_mode = cover
+}
+wallpaper  { 
+  monitor = DP-2
+  path = {{ $wall }}
+  fit_mode = cover
+}
+wallpaper  { 
+  monitor = DP-3
+  path = {{ $wall }}
+  fit_mode = cover
+}
+#if more than one monitor in use, can load a 2nd image
+
+#enable splash text rendering over the wallpaper
+splash = false
+
+#fully disable ipc
+# ipc = off

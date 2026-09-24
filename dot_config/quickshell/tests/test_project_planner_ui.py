@@ -67,6 +67,7 @@ console.log(JSON.stringify({{prompt, hasPath: prompt.includes('"path":"pages/Wor
                 "hasPriorUserMessage", "historyReadyForSend",
                 "shouldIncludeProjectContext", "conversationBoundary",
                 "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -225,6 +226,7 @@ console.log(JSON.stringify(results));
             for name in (
                 "draftFor", "selectProject", "cancelPageRead", "startPage", "send", "validPage",
                 "responseIsCurrent", "setPage", "finishPage",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -371,6 +373,7 @@ console.log(JSON.stringify(seen));
                 "clearInspectPrompt", "hasPriorUserMessage", "historyReadyForSend",
                 "shouldIncludeProjectContext", "conversationBoundary",
                 "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -752,6 +755,7 @@ console.log(JSON.stringify({{messages: worker.messages, generation: worker.messa
                 "trackContextReservation", "dropContextReservation", "hasContextReservation",
                 "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
                 "handlePromptAck",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -928,6 +932,7 @@ console.log(JSON.stringify(out));
                 "trackConversationTurn", "dropConversationTurn",
                 "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
                 "handleHistoryLoaded", "handleHistoryFailed",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -1039,6 +1044,7 @@ console.log(JSON.stringify(out));
                 "trackContextReservation", "dropContextReservation", "hasContextReservation",
                 "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
                 "handleAgentFailedForContext", "handleHistoryLoaded", "handleHistoryFailed",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -1265,6 +1271,7 @@ console.log(JSON.stringify(out));
             name: extract_function(PLANNER, name)
             for name in (
                 "composePrompt", "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
+             "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -1348,6 +1355,8 @@ console.log(JSON.stringify(out));
                 "composePrompt", "decodePlannerRequest", "isPlannerWrapped", "plannerDisplayText",
                 "hasPriorUserMessage", "conversationPlan", "conversationWantsLive",
                 "toggleInspectPrompt", "clearInspectPrompt", "pruneInspectPrompt",
+                "isAmbientPromptWrapped", "isInspectablePrompt",
+                "plannerAmbientForSend",
             )
         }
         script = f"""
@@ -1786,7 +1795,10 @@ class ProjectPlannerStructureTests(unittest.TestCase):
     def test_manual_surface_has_no_automatic_timer_or_ledger(self):
         self.assertNotIn("interval: 1500", PLANNER)
         self.assertNotIn("automatic", PLANNER.lower())
-        self.assertNotIn("ledger", PLANNER.lower())
+        # The Daily tab focuses an Open-session handoff through the shared
+        # agenda (read-only selection); no ledger management lives here.
+        ledger_free = PLANNER.lower().replace("selectledgerentry", "")
+        self.assertNotIn("ledger", ledger_free)
         self.assertIn('name: "projectPlanner"', PLANNER)
         self.assertIn('target: "projectPlanner"', PLANNER)
         self.assertIn("listTimeout", PLANNER)
@@ -1803,6 +1815,381 @@ class ProjectPlannerStructureTests(unittest.TestCase):
         self.assertIn("ScrollBar.vertical", PLANNER)
         self.assertIn("function stopAgent()", PLANNER)
         self.assertIn("function blockedReason()", PLANNER)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class PlannerApprovalDeferralTests(unittest.TestCase):
+    """S-048: a pending approval never blocks leaving the planner.
+
+    Navigation away simply defers (the request stays queued and is
+    re-adopted on return). Session/registry management keeps its
+    explicit approval guards; closing with a visible approval parks it
+    round-robin via deferRequest.
+    """
+
+    def run_node(self, script):
+        completed = subprocess.run(
+            ["node", "-e", script],
+            text=True, capture_output=True,
+        )
+        if completed.returncode:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_navigation_unblocked_but_session_and_registry_guards_kept(self):
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in ("approvalOpen", "hasBusyAgent", "blockedReason",
+                         "sessionControlBlockedReason", "projectManagementBlockedReason")
+        }
+        script = f"""
+const vm = require("vm");
+const worker = {{pendingApproval: {{id: "appr-1"}}, busy: false, compacting: false,
+  stopping: false, controlPending: false, sessionSwitching: false,
+  sessionRefreshPending: false, ready: true}};
+const agentCache = {{}};
+const context = {{activeTab: "projects", journalChild: null,
+  selectedPath: "pages/Work.md", selectedProjectId: "11111111-1111-1111-1111-111111111111",
+  selectedAgent: worker, agentCache: agentCache,
+  pageBusy: false, pageRetiring: false, sendBusy: false,
+  toggleBusy: false, toggleRetiring: false,
+  projectWriteBusy: false, projectWriteRetiring: false,
+  listBusy: false, listRetiring: false,
+  notice: ""}};
+context.root = context;
+vm.createContext(context);
+for (const value of {json.dumps(list(functions.values()))}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+if (!context.approvalOpen()) throw new Error("harness did not stage an approval");
+if (context.hasBusyAgent()) throw new Error("a parked approval still counts as busy");
+if (context.blockedReason() !== "") throw new Error("approval still blocks leaving: " + context.blockedReason());
+const sessionReason = context.sessionControlBlockedReason();
+if (!sessionReason || sessionReason.indexOf("approval") < 0) throw new Error("session control lost its approval guard");
+const registryReason = context.projectManagementBlockedReason();
+if (!registryReason || registryReason.indexOf("approval") < 0) throw new Error("registry editing lost its approval guard");
+console.log(JSON.stringify({{sessionReason, registryReason}}));
+"""
+        value = self.run_node(script)
+        self.assertIn("approval", value["sessionReason"])
+        self.assertIn("approval", value["registryReason"])
+
+    def test_close_defers_visible_approval_and_adoption_surfaces(self):
+        # Static pins: every overlay adoption marks the request surfaced;
+        # closing with a visible approval parks it round-robin and
+        # records the id against same-id echo.
+        self.assertIn("worker.surfaceRequest(worker.pendingApproval.id)", PLANNER)
+        self.assertIn("root.selectedAgent.surfaceRequest(request.id)", PLANNER)
+        self.assertIn("worker.surfaceRequest(request.id)", PLANNER)
+        self.assertIn("root.noteApprovalDeferred(approvalRequest.id)", PLANNER)
+        self.assertIn("approvalAgent.deferRequest(approvalRequest.id)", PLANNER)
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in ("blockedReason", "close", "noteApprovalDeferred",
+                         "isApprovalDeferred", "resetApprovalDeferred")
+        }
+        script = f"""
+const vm = require("vm");
+const calls = [];
+const worker = {{pendingApproval: {{id: "appr-1"}}, busy: false, compacting: false,
+  stopping: false, controlPending: false, sessionSwitching: false,
+  sessionRefreshPending: false,
+  deferRequest(id) {{ calls.push(["defer", id]); return "ui-1"; }}}};
+const context = {{activeTab: "projects", journalChild: null,
+  requestedOpen: true, closing: false, notice: "",
+  approvalRequest: {{id: "appr-1"}}, approvalAgent: worker, agentCache: {{}},
+  deferredApprovalIds: {{}},
+  toggleBusy: false, toggleRetiring: false, sendBusy: false, pageBusy: false,
+  interactionGeneration: 0,
+  pauseIdleAgents() {{}}, clearPendingOpenProject() {{}}, invalidateResumeContinuation() {{}},
+  closeSessionMenu() {{}}, closeModelPopup() {{}}, cancelRename() {{}}, closeZoteroPicker() {{}},
+  enterMotion: {{stop() {{}}}}, exitMotion: {{restart() {{}}}},
+  approvalOpen() {{ return this.approvalRequest !== null; }},
+  hasBusyAgent() {{ return false; }}}};
+context.root = context;
+vm.createContext(context);
+for (const value of {json.dumps(list(functions.values()))}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+if (!context.close() || context.requestedOpen || !context.closing) throw new Error("close stayed blocked by approval");
+if (context.approvalRequest !== null) throw new Error("close kept a stale overlay request");
+if (!context.isApprovalDeferred("appr-1")) throw new Error("close did not record the parked id");
+console.log(JSON.stringify({{calls, deferred: context.deferredApprovalIds}}));
+"""
+        self.assertEqual(self.run_node(script),
+                         {"calls": [["defer", "appr-1"]],
+                          "deferred": {"appr-1": True}})
+
+    def test_deferred_request_never_auto_adopts(self):
+        # Item 10: a request deferred in this planner session must not
+        # auto-adopt into the overlay when the bridge round-robin
+        # re-surfaces it; NEW ids still adopt immediately (with the
+        # surfaced mark); an explicit openApprovalForProject always
+        # adopts regardless of suppression.
+        handler = extract_function(PLANNER, "onUiRequest")
+        self.assertIn("root.isApprovalDeferred(id)", handler)
+        self.assertIn("root.selectedAgent.surfaceRequest(request.id)", handler)
+        route_src = extract_function(PLANNER, "routeJournalApproval")
+        self.assertIn("root.isApprovalDeferred(id)", route_src)
+        functions = {
+            name: extract_function(PLANNER, name)
+            for name in ("onUiRequest", "routeJournalApproval",
+                         "noteApprovalDeferred", "isApprovalDeferred",
+                         "resetApprovalDeferred")
+        }
+        script = f"""
+const vm = require("vm");
+const surfaced = [];
+const worker = {{pendingApproval: null,
+  surfaceRequest(id) {{ surfaced.push(id); return "ui-1"; }}}};
+const context = {{selectedAgent: worker,
+  approvalAgent: null, approvalRequest: null, notice: "",
+  deferredApprovalIds: {{"appr-1": true}}}};
+context.root = context;
+vm.createContext(context);
+for (const value of {json.dumps(list(functions.values()))}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+// The just-deferred id echoes: no adoption, no notice, no surface mark.
+context.onUiRequest({{id: "appr-1"}});
+if (context.approvalRequest !== null) throw new Error("suppressed id adopted");
+if (context.notice !== "") throw new Error("suppressed id notified");
+context.routeJournalApproval(worker, {{id: "appr-1"}});
+if (context.approvalRequest !== null) throw new Error("suppressed journal id adopted");
+// A NEW id adopts immediately with the surfaced mark.
+context.onUiRequest({{id: "appr-2"}});
+if (!context.approvalRequest || context.approvalRequest.id !== "appr-2")
+  throw new Error("new id did not adopt");
+if (context.approvalAgent !== worker) throw new Error("new id lost its worker");
+if (surfaced.join(",") !== "appr-2") throw new Error("new id was not marked surfaced");
+if (context.notice === "") throw new Error("new id set no notice");
+// A new session ends suppression.
+context.resetApprovalDeferred();
+context.approvalRequest = null;
+context.onUiRequest({{id: "appr-1"}});
+if (!context.approvalRequest || context.approvalRequest.id !== "appr-1")
+  throw new Error("post-reset id did not adopt");
+console.log(JSON.stringify({{surfaced}}));
+"""
+        self.assertEqual(self.run_node(script), {"surfaced": ["appr-2", "appr-1"]})
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class PlannerApprovalGrammarTests(unittest.TestCase):
+    """S-059: one preview/approval grammar — the planner inline dialog
+    derives the same title/message/consequence/destination/bounded
+    excerpt as the palette dialog from the shared ApprovalGrammar.js
+    module instead of its old raw-JSON dump.
+    """
+
+    GRAMMAR = (ROOT / "widgets" / "ApprovalGrammar.js").read_text(encoding="utf-8")
+    PALETTE_APPROVAL = (ROOT / "widgets" / "PaletteApprovalDialog.qml").read_text(encoding="utf-8")
+
+    def approval_block(self):
+        start = PLANNER.index("    FocusScope {\n        id: approval\n")
+        end = PLANNER.index("    // Keep the rename editor")
+        return PLANNER[start:end]
+
+    def run_node(self, script):
+        completed = subprocess.run(
+            ["node", "-e", script],
+            text=True, capture_output=True,
+        )
+        if completed.returncode:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_both_dialogs_import_the_same_grammar(self):
+        self.assertIn('import "ApprovalGrammar.js" as ApprovalGrammar', PLANNER)
+        self.assertIn('import "ApprovalGrammar.js" as ApprovalGrammar', self.PALETTE_APPROVAL)
+        block = self.approval_block()
+        for name in ("titleFor", "messageFor", "boundedText",
+                     "consequenceFor", "destinationFor",
+                     "argumentPreview", "moveChoice"):
+            self.assertIn("ApprovalGrammar." + name, block)
+
+    def test_planner_shows_consequence_destination_and_bounded_excerpt(self):
+        block = self.approval_block()
+        # Same four stacked rows as the palette: message, consequence
+        # (muted, small), destination (small), bounded excerpt.
+        self.assertIn("approval.messageFor(root.approvalRequest)", block)
+        self.assertIn("approval.consequenceFor(root.approvalRequest)", block)
+        self.assertIn("approval.destinationFor(root.approvalRequest)", block)
+        self.assertIn("approval.argumentPreview(root.approvalRequest)", block)
+        self.assertIn("Theme.accentMuted", block)
+        self.assertIn('font.family: "monospace"', block)
+        # The raw 1 MiB JSON dump is gone: args go through the shared
+        # bounded field-walk, never JSON.stringify output.
+        self.assertNotIn("JSON.stringify", block)
+        self.assertNotIn("1024 * 1024", block)
+
+    def test_planner_defer_parks_without_answering_and_open_surfaces(self):
+        block = self.approval_block()
+        self.assertIn('text: "Reject (Esc)"', block)
+        self.assertIn('text: "Defer"', block)
+        self.assertIn("onClicked: { approval.defer() }", block)
+        defer_src = extract_function(PLANNER, "defer")
+        self.assertIn("root.noteApprovalDeferred(deferredId)", defer_src)
+        self.assertIn("worker.deferRequest(deferredId)", defer_src)
+        self.assertNotIn("worker.respond", defer_src)
+        open_src = extract_function(PLANNER, "openRequest")
+        self.assertIn("root.approvalAgent.surfaceRequest(value.id)", open_src)
+        self.assertNotIn("worker.respond", open_src)
+        self.assertNotIn("approvalAgent.respond", open_src)
+
+    def test_shared_grammar_behaviour(self):
+        grammar_path = str(ROOT / "widgets" / "ApprovalGrammar.js")
+        script = f"""
+const G = require({json.dumps(grammar_path)});
+const out = {{}};
+out.sanitized = G.boundedText("a\\x00b\\x1Fc\\td\\n e  f", 240);
+out.capped = G.boundedText("abcdef", 5);
+out.confirmTitle = G.titleFor({{method: "confirm", message: "Run it?"}});
+out.namedTitle = G.titleFor({{method: "confirm", title: "Deploy now", message: "x"}});
+out.pickerTitle = G.titleFor({{method: "select"}}, {{sessionSwitching: true}});
+out.pickerMessage = G.messageFor({{method: "select"}}, {{sessionSwitching: true}});
+out.consequence = G.consequenceFor({{method: "confirm"}});
+out.destination = G.destinationFor({{method: "select", options: ["a", "bb"]}}, 1);
+out.preview = G.argumentPreview({{method: "confirm", message: "do X", arguments: {{path: "p"}}}});
+out.previewSelectOverflow = G.argumentPreview({{method: "select", options: ["1","2","3","4","5","6","7"]}});
+out.moveClamped = [G.moveChoice(1, 0, 3), G.moveChoice(-5, 1, 3), G.moveChoice(9, 0, 2)];
+console.log(JSON.stringify(out));
+"""
+        value = self.run_node(script)
+        self.assertEqual(value["sanitized"], "a b c d e f")
+        self.assertEqual(value["capped"], "abcd…")
+        self.assertEqual(value["confirmTitle"], "Confirm requested action")
+        self.assertEqual(value["namedTitle"], "Deploy now")
+        # The planner's session-picker context still works through the
+        # shared grammar instead of a fork.
+        self.assertEqual(value["pickerTitle"], "Restore session")
+        self.assertEqual(value["pickerMessage"], "Choose a saved session for this project.")
+        self.assertIn("never expires", value["consequence"])
+        self.assertIn("will not reopen on its own", value["consequence"])
+        self.assertIn("still pending when you come back to it", value["consequence"])
+        self.assertEqual(value["destination"], "Options: 2 · highlighted: bb")
+        self.assertIn("Message: do X", value["preview"])
+        self.assertIn("Details: path=p", value["preview"])
+        self.assertNotIn("{", value["preview"])
+        self.assertIn("…and 1 more", value["previewSelectOverflow"])
+        self.assertEqual(value["moveClamped"], [1, 0, 1])
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for QML JS coverage")
+class PlannerPinnedAmbientTests(unittest.TestCase):
+    """Phase 1 §2.1 follow-up: planner send paths attach the pinned
+    (selected) project, never the compositor-current identity."""
+
+    def run_pinned(self, exercise, setup=""):
+        script = f"""
+const vm = require("vm");
+const context = {{}};
+vm.createContext(context);
+{setup}
+for (const value of {json.dumps([extract_function(PLANNER, name) for name in
+        ("plannerPinnedIdentity", "plannerAmbientForSend")])}) {{
+  const fn = vm.runInContext("(" + value + ")", context);
+  context[fn.name] = fn;
+}}
+context.root = context;
+{exercise}
+"""
+        completed = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=8)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        return json.loads(completed.stdout.splitlines()[-1])
+
+    PINNED_ID = "11111111-1111-1111-1111-111111111111"
+
+    def base_setup(self, selected, marker, block_project="other", resources=True, scope=None):
+        res = ("[{kind: 'file', label: 'f', identity: '/f', last_seen_ms: 1}]"
+               if resources else "[]")
+        proj = ("null" if block_project is None
+                else "{id: '%s', name: 'Cached'}" % block_project)
+        scope = marker if scope is None else scope
+        return f"""
+context.selectedProjectId = {json.dumps(selected)};
+context.projectById = (id) => id === "{self.PINNED_ID}"
+  ? {{id: "{self.PINNED_ID}", name: "Pinned"}} : null;
+context.projectName = (entry) => entry.name;
+context.ambientSource = {{ambientBlock: {{
+    project: {proj}, session: {{id: "s", start_ms: 1}},
+    day: "2026-09-21", recent_resources: {res}}},
+  _ambientResourcesProjectId: {json.dumps(marker)},
+  ambientScopeId: {json.dumps(scope)}}};
+"""
+
+    def test_unpinned_returns_cache_unchanged(self):
+        value = self.run_pinned(
+            "console.log(JSON.stringify(context.plannerAmbientForSend()));",
+            self.base_setup("", ""))
+        self.assertEqual(value["project"], {"id": "other", "name": "Cached"})
+        self.assertEqual(len(value["recent_resources"]), 1)
+
+    def test_pinned_overrides_project_and_keeps_matching_resources(self):
+        value = self.run_pinned(
+            "console.log(JSON.stringify(context.plannerAmbientForSend()));",
+            self.base_setup(self.PINNED_ID, self.PINNED_ID))
+        self.assertEqual(value["project"],
+                         {"id": self.PINNED_ID, "name": "Pinned"})
+        self.assertEqual(len(value["recent_resources"]), 1)
+        self.assertEqual(value["session"], {"id": "s", "start_ms": 1})
+
+    def test_pinned_with_stale_resources_omits_resources(self):
+        # Never misattribute: resources fetched for another project stay
+        # hidden until the pinned fetch returns.
+        value = self.run_pinned(
+            "console.log(JSON.stringify(context.plannerAmbientForSend()));",
+            self.base_setup(self.PINNED_ID, "other"))
+        self.assertEqual(value["project"],
+                         {"id": self.PINNED_ID, "name": "Pinned"})
+        self.assertEqual(value["recent_resources"], [])
+
+    def test_unresolvable_pin_omits_project_and_resources(self):
+        value = self.run_pinned(
+            "console.log(JSON.stringify(context.plannerAmbientForSend()));",
+            self.base_setup("22222222-2222-2222-2222-222222222222",
+                            "22222222-2222-2222-2222-222222222222"))
+        self.assertIsNone(value["project"])
+        self.assertEqual(value["recent_resources"], [])
+        self.assertEqual(value["day"], "2026-09-21")
+
+    def test_unpinned_with_pinned_scope_block_omits_project(self):
+        # S-057: the shared resolver may hold a block resolved for a pin
+        # while this surface is unpinned; it must not ride along as
+        # compositor-current. Session/day are scope-independent.
+        value = self.run_pinned(
+            "console.log(JSON.stringify(context.plannerAmbientForSend()));",
+            self.base_setup("", self.PINNED_ID,
+                            block_project=self.PINNED_ID,
+                            scope=self.PINNED_ID))
+        self.assertIsNone(value["project"])
+        self.assertEqual(value["recent_resources"], [])
+        self.assertEqual(value["day"], "2026-09-21")
+        self.assertEqual(value["session"], {"id": "s", "start_ms": 1})
+
+    def test_both_send_paths_attach_pinned_ambient(self):
+        # Zotero-only (no note) first message carries the ambient block;
+        # the page flow threads it through composePrompt; both gate on
+        # first-message-only. Refreshes stay scoped to the selection.
+        without_note = extract_function(PLANNER, "sendWithoutNote")
+        self.assertIn("root.shouldIncludeProjectContext(worker, key)",
+                      without_note)
+        self.assertIn("root.plannerAmbientForSend()", without_note)
+        self.assertIn("Ambient.wrapPromptWithAmbient", without_note)
+        page_flow = PLANNER[PLANNER.index("let includeContext = root.shouldIncludeProjectContext(worker, path)"):
+                            PLANNER.index("let includeContext = root.shouldIncludeProjectContext(worker, path)") + 300]
+        self.assertIn("root.plannerAmbientForSend()", page_flow)
+        self.assertIn("root.composePrompt(data, promptText, ambient)",
+                      page_flow)
+        self.assertIn("refreshAmbientForSelection", PLANNER)
+        self.assertIn("root.ambientSource.refreshAmbient(pin.id, pin.name)",
+                      PLANNER)
+        # S-057: the shared block is scope-checked (project override +
+        # resource marker + ambientScopeId) so another scope never
+        # misattributes.
 
 
 class ProjectPlannerChatLayoutTests(unittest.TestCase):
@@ -1834,7 +2221,8 @@ class ProjectPlannerChatLayoutTests(unittest.TestCase):
         self.assertIn("function isPlannerWrapped(text)", PLANNER)
         self.assertIn("function plannerDisplayText(text)", PLANNER)
         self.assertIn("root.plannerDisplayText(model.text)", PLANNER)
-        self.assertIn("root.isPlannerWrapped(model.text)", PLANNER)
+        self.assertIn("function isInspectablePrompt(text)", PLANNER)
+        self.assertIn("root.isInspectablePrompt(model.text)", PLANNER)
         # The old standalone content-sized answer Text pushed the composer
         # away; the live answer must only exist as a store row.
         self.assertNotIn('visible: root.selectedAgent && root.selectedAgent.answer !== ""', PLANNER)

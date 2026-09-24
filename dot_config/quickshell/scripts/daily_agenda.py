@@ -34,6 +34,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from logseq_common import GraphError, graph_path, resolve_graph
 import project_planner
+import qscli
 from project_planner import (
     _GraphLock,
     _page_bytes,
@@ -592,6 +593,9 @@ def toggle_agenda_task(graph, path, revision=None, line=None, done=None):
 
 
 def _read_input():
+    # Grandfathered: local reader preserved (error tokens differ from
+    # qscli.read_input); only the parser moves to qscli. Failures below
+    # surface as stdout {"error": ...} (see main), never stderr.
     stream = getattr(sys.stdin, "buffer", sys.stdin)
     try:
         data = stream.read(INPUT_LIMIT + 1)
@@ -610,17 +614,26 @@ def _read_input():
     return value
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--graph", default=None,
-        help="graph directory; defaults to LOGSEQ_GRAPH or logseqGraph in settings.json"
-    )
+# ---------------------------------------------------------------------------
+# CLI (parser lives in qscli.py; argv stays byte-identical)
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv=None):
+    parser = qscli.SafeParser()
+    qscli.add_global_flags(parser, graph=True)  # --graph defaults to LOGSEQ_GRAPH or logseqGraph in settings.json
     parser.add_argument(
         "command", choices=("list", "select", "complete", "toggle")
     )
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def main(argv=None):
+    # Grandfathered: failures report stdout {"error": ...} (exit 1), not
+    # stderr — the contract tests require it — so the emit/guard stay
+    # local and main is NOT qscli.run_main. Success output also keeps
+    # its exact unsorted separators=(",", ":") encoding.
     try:
-        args = parser.parse_args(argv)
+        args = _parse_args(argv)
         graph = resolve_graph(args.graph)
         if args.command == "list":
             request = _read_input()

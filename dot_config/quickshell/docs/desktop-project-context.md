@@ -71,6 +71,16 @@ resolved lazily in order (`src/project_context.rs`):
   exception: the Logseq page level below, which matches the focused
   Logseq page extracted from the window title exactly against linked
   registry pages (never a fuzzy title search).
+- The `file` level is fed by application providers. A focused Okular
+  window contributes the currently displayed PDF through Okular's
+  per-process D-Bus service (`org.kde.okular-<PID>`, or the
+  `org.kde.okular.Instance_*` name under Flatpak; objects `/okular`,
+  `/okular2`, ... answering `currentDocument`), so a PDF inside a
+  registered folder matches at `file` without any title guessing.
+  Multi-tab windows bind only when the window title uniquely matches one
+  tab's file stem; ambiguous tabs and the welcome screen bind nothing
+  (fail closed, evicting any stale last-good document). No git metadata
+  is attached to PDFs.
 
 Logseq page level (between `git_root` and `git_remote`):
 
@@ -171,8 +181,8 @@ cargo build --locked --release --manifest-path services/agent-orchestrator/Cargo
 ```text
 usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-interruption-ms MS]]
        qs-desktop-context [--db PATH] history [--project UUID] [--limit N] [--from START_MS --to END_MS [--limit N]]
-       qs-desktop-context current
-       qs-desktop-context current-project
+       qs-desktop-context [--db PATH] current
+       qs-desktop-context [--db PATH] current-project
        qs-desktop-context [--db PATH] last-activity --project UUID
        qs-desktop-context [--db PATH] resources --project UUID [--limit N]
        qs-desktop-context [--db PATH] current-session
@@ -187,14 +197,35 @@ usage: qs-desktop-context [--db PATH] [collect [--session-gap-ms MS --session-in
 - `current`: fresh on-demand snapshot with default enrichment
   (app + project) and a focus recheck after enrichment (opaque id +
   application + title + client PID + workspace must agree, else
-  unavailable). Never collector IPC, never DB, never a latest-row
-  fallback.
-- `current-project`: same fresh path, prints the `ProjectContext`
+  unavailable). Never collector IPC. When the snapshot is focusless
+  (`available`, no focused window — e.g. a Quickshell layer surface holds
+  focus while the planner/popup is open), up to 64 newest persisted rows
+  are read best-effort (strictly read-only; `--db` or the default DB)
+  newest→oldest to find the carry source — the newest row that actually
+  carries a `project` or non-empty `resource`, skipping un-enriched rows
+  for the same focused window (raw `focus`/`title` rows land before
+  their enriched `context` row) — and its `resource`/`project` are
+  retained inside the session interruption grace, so a brief focus gap
+  never blanks the current project. Expiry is anchored on the durable
+  focusless streak clock (`focusless_since_ms`, stamped on every
+  available focusless observation; `retained_since_ms` still means
+  retention was applied); repeated focusless events never extend the
+  window and there is no schema change. The walk returns the fresh
+  snapshot unchanged on three hard boundaries — an unavailable row, a
+  workspace mismatch with the candidate, or an intervening windowed row
+  that carried nothing (unknown project) — as well as on an expired
+  streak or an unreadable/missing DB. A popup held past the grace still
+  clears by design; while the collector is not running the read-only
+  live path cannot persist the streak clock, so a windowed carry source
+  re-anchors fresh each poll and the grace effectively does not expire
+  until the collector persists a row.
+- `current-project`: same path, prints the `ProjectContext`
   object or `null`.
 - `history --project UUID` / `last-activity --project UUID` /
   `resources --project UUID [--limit N]`: read-only indexed queries for
-  one UUID. `--db` overrides the default DB; `current` ignores `--db`
-  (warns). Work-session queries (`current-session`, `sessions`,
+  one UUID. `--db` overrides the default DB for every command; for
+  `current`/`current-project` it only feeds the focusless retention
+  fallback (current modes still work without a database or HOME). Work-session queries (`current-session`, `sessions`,
   `last-session`, `session-resources`, `session-events`) are read-only
   persisted-DB queries returning session objects with query-time
    `effective_status` (`active`/`interrupted`/`stale`/`closed`); full

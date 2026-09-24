@@ -1,3 +1,11 @@
 {
-    "logseqGraph": "/home/franzs/Nextcloud/Documents/Notes"
+    "logseqGraph": "/home/franzs/Nextcloud/Documents/Notes",
+    "memory": {
+        "workLogPolish": true,
+        "sessionEnrichment": true,
+        "sessionCapture": true,
+        "reviewPolish": true,
+        "reviewPrioritization": true,
+        "ledger": {"unitGapSec": 180, "fragmentMaxSec": 120, "autoIgnore": false}
+    }
 }

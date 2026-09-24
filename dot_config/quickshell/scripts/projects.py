@@ -155,6 +155,12 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlparse
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import qscli
+
 
 class RegistryError(ValueError):
     pass
@@ -164,6 +170,9 @@ DEFAULT_FILE = Path(__file__).resolve().parent.parent / "projects.toml"
 ENV_VAR = "QUICKSHELL_PROJECTS_FILE"
 
 REGISTRY_LIMIT = 512 * 1024
+# Grandfathered: narrower than qscli.INPUT_LIMIT (1 MiB) and load-bearing
+# for this CLI's stdin transport, so the local _read_input below keeps
+# this cap instead of qscli.read_input. Do not unify by accident.
 INPUT_LIMIT = 256 * 1024
 PATH_LIMIT = 4096
 NAME_LIMIT = 512
@@ -1139,36 +1148,41 @@ def _read_input():
     return value
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--projects-file", default=None,
-                        help="registry TOML file; defaults to QUICKSHELL_PROJECTS_FILE or <repo>/projects.toml")
-    parser.add_argument("--graph", default=None,
-                        help="graph directory for import-logseq only")
+# ---------------------------------------------------------------------------
+# CLI (shared plumbing lives in qscli.py; argv stays byte-identical)
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv) -> argparse.Namespace:
+    parser = qscli.SafeParser(description=__doc__)
+    qscli.add_global_flags(parser, projects_file=True, graph=True)
     parser.add_argument("command", choices=("list", "create", "update",
                                             "remove", "import-logseq"))
-    try:
-        args = parser.parse_args(argv)
-        if args.command == "list":
-            value = list_projects(args.projects_file)
-        elif args.command == "create":
-            value = create_project(_read_input(), args.projects_file)
-        elif args.command == "update":
-            value = update_project(_read_input(), args.projects_file)
-        elif args.command == "remove":
-            value = remove_project(_read_input(), args.projects_file)
-        else:
-            value = import_logseq(args.graph, args.projects_file)
-        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-        return 0
-    except SystemExit as exc:
-        return 0 if exc.code == 0 else 1
-    except (RegistryError, OSError, TypeError, ValueError,
-            UnicodeError) as exc:
-        # ValueError covers GraphError (subclass) from graph helpers used by
-        # import-logseq; all user-facing failures stay one line, no traceback.
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _dispatch(args: argparse.Namespace) -> dict:
+    if args.command == "list":
+        return list_projects(args.projects_file)
+    elif args.command == "create":
+        return create_project(_read_input(), args.projects_file)
+    elif args.command == "update":
+        return update_project(_read_input(), args.projects_file)
+    elif args.command == "remove":
+        return remove_project(_read_input(), args.projects_file)
+    else:
+        return import_logseq(args.graph, args.projects_file)
+
+
+# ValueError covers RegistryError (subclass) plus GraphError (subclass)
+# from the graph helpers used by import-logseq; all user-facing failures
+# stay one line, no traceback.
+_BOUNDED_EXCEPTIONS = (RegistryError, OSError, TypeError, ValueError,
+                       UnicodeError, RecursionError, OverflowError)
+
+
+def main(argv=None) -> int:
+    return qscli.run_main(_parse_args, _dispatch, "projects",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":

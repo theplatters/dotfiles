@@ -8,19 +8,61 @@ PopupWindow {
     id: root
 
     property var anchorItem: null
+    // Stable bar ancestor for the TransformWatcher (bound to the Bar in
+    // shell.qml). Follows capsule motion caused by any ancestor in the
+    // Bar -> capsule path, not just the capsule item itself.
+    property var anchorScope: null
     property var selectedPlayer: Mpris.players.values.find(player => player.isPlaying) || Mpris.players.values[0] || null
     property bool requestedOpen: false
     property bool closing: false
+    // Diagnostic: how many times the anchor rect was recalculated.
+    property int anchorUpdates: 0
+    // Single reveal progress (0 hidden .. 1 shown), ControlCenter pattern:
+    // panel opacity/scale derive from it so an interrupted close reopens
+    // mid-fade instead of flashing from zero.
+    property real reveal: 0
 
     visible: false
     implicitWidth: 430
     implicitHeight: 410
-    color: "transparent"
+    color: Theme.transparent
 
+    // Item-relative anchor grammar (docs/control-center.md): anchored
+    // centered under the media capsule, tracked while open.
     anchor {
-        window: QsWindow.window
-        rect: anchorItem ? Qt.rect(anchorItem.mapToGlobal(0, 0).x, anchorItem.mapToGlobal(0, 0).y + anchorItem.height + 8, anchorItem.width, 1) : Qt.rect(0, 48, 1, 1)
+        item: root.anchorItem
+        edges: Edges.Bottom
         gravity: Edges.Bottom
+        margins.top: 8
+    }
+
+    // Quickshell only computes the item-relative anchor rect at show
+    // time, so every geometry path calls anchor.updateAnchor() to
+    // recalculate it. Item-relative only, no global coords.
+    function updateAnchor() {
+        if (!root.anchorItem) return;
+        root.anchor.updateAnchor();
+        root.anchorUpdates++;
+    }
+
+    onAnchorItemChanged: root.updateAnchor()
+    onScreenChanged: root.updateAnchor()
+
+    TransformWatcher {
+        id: anchorWatcher
+        a: root.anchorScope ? root.anchorScope : root.anchorItem
+        b: root.anchorItem
+        onTransformChanged: root.updateAnchor()
+    }
+
+    Connections {
+        target: root.anchorItem
+        enabled: !!root.anchorItem
+        ignoreUnknownSignals: true
+        function onXChanged() { root.updateAnchor(); }
+        function onYChanged() { root.updateAnchor(); }
+        function onWidthChanged() { root.updateAnchor(); }
+        function onHeightChanged() { root.updateAnchor(); }
     }
 
     function setOpen(open) {
@@ -29,9 +71,15 @@ PopupWindow {
             closing = false;
             exitMotion.stop();
             selectDefaultPlayer();
-            panel.opacity = 0;
-            panel.scale = 0.98;
+            // Fresh anchor rect for this open (the capsule may have moved
+            // while the popup was hidden, when nothing tracked it).
+            root.updateAnchor();
             if (!visible) visible = true;
+            // Already open and steady: keep the frame (no reset/flash).
+            if (root.reveal >= 0.99 && enterMotion.running === false) return;
+            // Otherwise reverse from the current reveal value: fully
+            // hidden starts at the bottom, an interrupted close continues
+            // mid-fade. Never assign a fresh start while visible.
             enterMotion.restart();
         } else if (visible && !closing) {
             closing = true;
@@ -43,6 +91,11 @@ PopupWindow {
     function toggle(item) {
         anchorItem = item;
         setOpen(!requestedOpen);
+    }
+
+    Shortcut {
+        sequence: "Escape"
+        onActivated: root.setOpen(false)
     }
 
     function selectDefaultPlayer() {
@@ -124,13 +177,20 @@ PopupWindow {
         radius: Theme.cardRadius
         border.color: Theme.border
         border.width: 1
-        opacity: 0
-        scale: 0.98
+        // Reveal-driven chrome (ControlCenter pattern): opacity + scale
+        // derive from the single progress; content slides via transform.
+        // Panel clips so the start offset never paints outside.
+        opacity: root.reveal
+        scale: 0.96 + 0.04 * root.reveal
+        transformOrigin: Item.Top
+        clip: true
+        visible: root.reveal > 0.01 || root.visible
 
         ColumnLayout {
             anchors.fill: parent
             anchors.margins: 14
             spacing: 12
+            transform: Translate { y: (1 - root.reveal) * -8 }
 
             RowLayout {
                 Layout.fillWidth: true
@@ -295,7 +355,7 @@ PopupWindow {
                         Rectangle {
                             Layout.fillWidth: true
                             height: 7
-                            radius: 4
+                            radius: height / 2
                             color: Theme.surface1
 
                             Rectangle {
@@ -393,7 +453,7 @@ PopupWindow {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 7
-                    radius: 4
+                    radius: height / 2
                     color: Theme.surface1
                     visible: root.selectedPlayer && root.selectedPlayer.volumeSupported
 
@@ -493,18 +553,29 @@ PopupWindow {
         }
     }
 
-    ParallelAnimation {
+    // Single-progress motion (ControlCenter pattern): enter/exit animate
+    // reveal to 1/0 from the current value (interrupted close reopens
+    // mid-fade, never resets). No spring/overshoot: OutCubic in, InCubic
+    // out.
+    NumberAnimation {
         id: enterMotion
-        NumberAnimation { target: panel; property: "opacity"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
-        NumberAnimation { target: panel; property: "scale"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
+        target: root
+        property: "reveal"
+        to: 1
+        duration: Theme.motionPanel
+        easing.type: Easing.OutCubic
     }
 
-    SequentialAnimation {
+    NumberAnimation {
         id: exitMotion
-        ParallelAnimation {
-            NumberAnimation { target: panel; property: "opacity"; to: 0; duration: Theme.motionExit; easing.type: Easing.InCubic }
-            NumberAnimation { target: panel; property: "scale"; to: 0.98; duration: Theme.motionExit; easing.type: Easing.InCubic }
+        target: root
+        property: "reveal"
+        to: 0
+        duration: Theme.motionExit
+        easing.type: Easing.InCubic
+        onFinished: {
+            if (!root.requestedOpen) root.visible = false;
+            root.closing = false;
         }
-        ScriptAction { script: { if (!root.requestedOpen) root.visible = false; root.closing = false; } }
     }
 }

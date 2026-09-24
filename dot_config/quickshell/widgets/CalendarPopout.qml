@@ -18,15 +18,25 @@ PanelWindow {
     id: root
 
     property var anchorItem: null
+    // Stable bar ancestor for the TransformWatcher (bound to the Bar in
+    // shell.qml). refreshPosition already tracks the clock item's own
+    // geometry; the watcher additionally fires on ancestor motion that
+    // leaves the clock's own x/y/width/height untouched.
+    property var anchorScope: null
     property var agenda: null
     property bool requestedOpen: false
     property bool closing: false
+    // Single reveal progress (ControlCenter pattern): panel chrome
+    // derives from it so an interrupted close reopens mid-fade.
+    property real reveal: 0
     // Screen-local placement, refreshed on open and on clock/screen
     // changes (defaults: maximum 430x640 card just under the clock).
     property int popupX: 8
     property int popupY: 48
     property int popupWidth: 430
     property int popupHeight: 640
+
+    signal projectPlanningRequested(string projectId, string action, string message)
 
     // The bar window hosting the clock item; its screen keeps the popout
     // on the same monitor as the clock in multi-screen setups.
@@ -44,7 +54,7 @@ PanelWindow {
 
     implicitWidth: popupWidth
     implicitHeight: popupHeight
-    color: "transparent"
+    color: Theme.transparent
     visible: false
 
     // Non-reserving overlay: never shifts tiled windows, like the working
@@ -126,15 +136,31 @@ PanelWindow {
         function onHeightChanged() { root.refreshPosition(); }
     }
 
+    // PanelWindow variant of the anchor grammar (docs/control-center.md):
+    // screen-local margins derived item-relative from the clock; the
+    // watcher covers ancestor motion like ControlCenter's TransformWatcher.
+    TransformWatcher {
+        id: anchorWatcher
+        a: root.anchorScope ? root.anchorScope : root.anchorItem
+        b: root.anchorItem
+        onTransformChanged: root.refreshPosition()
+    }
+
     function setOpen(open) {
         requestedOpen = open;
         if (open) {
             closing = false;
             exitMotion.stop();
             root.refreshPosition();
-            panel.opacity = 0;
-            panel.scale = 0.98;
             if (!visible) visible = true;
+            // Already open and steady: keep the frame (no reset/flash).
+            if (root.reveal >= 0.99 && enterMotion.running === false) {
+                if (planner) planner.syncViewToDate();
+                if (agenda && !agenda.agendaBusy && !agenda.completionSaving) agenda.reload();
+                return;
+            }
+            // Otherwise reverse from the current reveal value. Never
+            // assign a fresh start while partially visible.
             if (planner) planner.syncViewToDate();
             if (agenda && !agenda.agendaBusy && !agenda.completionSaving) agenda.reload();
             enterMotion.restart();
@@ -150,6 +176,11 @@ PanelWindow {
         setOpen(!requestedOpen);
     }
 
+    Shortcut {
+        sequence: "Escape"
+        onActivated: root.setOpen(false)
+    }
+
     Rectangle {
         id: panel
         anchors.fill: parent
@@ -157,13 +188,19 @@ PanelWindow {
         radius: Theme.cardRadius
         border.color: Theme.border
         border.width: 1
-        opacity: 0
-        scale: 0.98
+        // Reveal-driven chrome (ControlCenter pattern): opacity + scale
+        // derive from the single progress; content slides via transform.
+        opacity: root.reveal
+        scale: 0.96 + 0.04 * root.reveal
+        transformOrigin: Item.Top
+        clip: true
+        visible: root.reveal > 0.01 || root.visible
 
         ColumnLayout {
             anchors.fill: parent
             anchors.margins: 14
             spacing: 10
+            transform: Translate { y: (1 - root.reveal) * -8 }
 
             RowLayout {
                 Layout.fillWidth: true
@@ -195,27 +232,43 @@ PanelWindow {
                 contentWidth: width
                 contentHeight: planner.implicitHeight
                 boundsBehavior: Flickable.StopAtBounds
-                DailyPlanner {
+                DailyPlannerPane {
                     id: planner
                     width: parent.width
                     agenda: root.agenda
+                    // Slim popout set (§6.3): month grid, Scheduled,
+                    // picker, Pomodoro, quick-add. Captured/Review/
+                    // SessionCard live in the planner Daily tab only.
+                    compact: true
+                    onProjectPlanningRequested: (projectId, action, message) => root.projectPlanningRequested(projectId, action, message)
                 }
             }
         }
     }
 
-    ParallelAnimation {
+    // Single-progress motion (ControlCenter pattern): enter/exit animate
+    // reveal to 1/0 from the current value (interrupted close reopens
+    // mid-fade, never resets). No spring/overshoot: OutCubic in, InCubic
+    // out.
+    NumberAnimation {
         id: enterMotion
-        NumberAnimation { target: panel; property: "opacity"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
-        NumberAnimation { target: panel; property: "scale"; to: 1; duration: Theme.motionPanel; easing.type: Easing.OutCubic }
+        target: root
+        property: "reveal"
+        to: 1
+        duration: Theme.motionPanel
+        easing.type: Easing.OutCubic
     }
 
-    SequentialAnimation {
+    NumberAnimation {
         id: exitMotion
-        ParallelAnimation {
-            NumberAnimation { target: panel; property: "opacity"; to: 0; duration: Theme.motionExit; easing.type: Easing.InCubic }
-            NumberAnimation { target: panel; property: "scale"; to: 0.98; duration: Theme.motionExit; easing.type: Easing.InCubic }
+        target: root
+        property: "reveal"
+        to: 0
+        duration: Theme.motionExit
+        easing.type: Easing.InCubic
+        onFinished: {
+            if (!root.requestedOpen) root.visible = false;
+            root.closing = false;
         }
-        ScriptAction { script: { if (!root.requestedOpen) root.visible = false; root.closing = false; } }
     }
 }

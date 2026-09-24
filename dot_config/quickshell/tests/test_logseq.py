@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from logseq_common import GraphError, graph_path
+from logseq_common import GraphError, append_session_log, graph_path
 from logseq_graph import append_journal, search
 from logseq_todos import main as todos_main, todos
 import screen_capture
@@ -178,6 +178,98 @@ class LogseqTests(unittest.TestCase):
                          ["/bin/grim", "-g", "0,0 1x1", "-t", "png", "-"])
         self.assertTrue(popen.call_args_list[0].kwargs["start_new_session"])
         self.assertTrue(popen.call_args_list[1].kwargs["start_new_session"])
+
+
+class SessionLogInsertTests(unittest.TestCase):
+    def test_create_when_missing(self):
+        new_content, inserted = append_session_log("# Demo\n", "- TODO Ship it")
+        self.assertEqual(new_content, "# Demo\n- ## Session logs\n\t- TODO Ship it\n")
+        self.assertEqual(inserted, "- ## Session logs\n\t- TODO Ship it")
+
+    def test_existing_bulleted_heading_with_child_and_sibling(self):
+        content = "- ## Session logs\n\t- old\n- ## Next\n"
+        block = "- Session log abcd1234\n  quickshell-worklog:: p:s\n  # Session log\n  body"
+        new_content, inserted = append_session_log(content, block)
+        self.assertEqual(
+            inserted,
+            "\t- Session log abcd1234\n\t  quickshell-worklog:: p:s\n\t  # Session log\n\t  body",
+        )
+        self.assertEqual(
+            new_content,
+            "- ## Session logs\n\t- old\n"
+            "\t- Session log abcd1234\n\t  quickshell-worklog:: p:s\n"
+            "\t  # Session log\n\t  body\n- ## Next\n",
+        )
+
+    def test_raw_heading_at_column_zero(self):
+        new_content, inserted = append_session_log("## Session logs\n\t- old\n", "- new")
+        self.assertEqual(inserted, "\t- new")
+        self.assertEqual(new_content, "## Session logs\n\t- old\n\t- new\n")
+
+    def test_heading_variants(self):
+        for content in ("- ### Session Log:\n", "## session logs\n", "- Session logs\n"):
+            with self.subTest(content=content):
+                new_content, inserted = append_session_log(content, "- new")
+                self.assertEqual(inserted, "\t- new")
+                self.assertEqual(new_content, content + "\t- new\n")
+
+    def test_false_positive_guard(self):
+        content = "- Session log abc\n  quickshell-worklog:: x\n  # Session log\n  body\n"
+        new_content, inserted = append_session_log(content, "- x")
+        self.assertEqual(inserted, "- ## Session logs\n\t- x")
+        self.assertEqual(new_content, content + "- ## Session logs\n\t- x\n")
+        self.assertIn("  # Session log\n", new_content)
+
+    def test_blank_line_before_sibling_preserved(self):
+        content = "- ## Session logs\n\t- old\n\n- ## Next\n"
+        new_content, inserted = append_session_log(content, "- new")
+        self.assertEqual(inserted, "\t- new")
+        self.assertEqual(new_content, "- ## Session logs\n\t- old\n\t- new\n\n- ## Next\n")
+
+    def test_nested_heading(self):
+        new_content, inserted = append_session_log("\t- ## Session logs\n\t\t- old\n", "- new")
+        self.assertEqual(inserted, "\t\t- new")
+        self.assertEqual(new_content, "\t- ## Session logs\n\t\t- old\n\t\t- new\n")
+
+    def test_fenced_code(self):
+        content = "```\n## Session logs\n```\n"
+        new_content, inserted = append_session_log(content, "- x")
+        self.assertEqual(inserted, "- ## Session logs\n\t- x")
+        self.assertEqual(new_content, content + "- ## Session logs\n\t- x\n")
+
+    def test_no_trailing_newline(self):
+        new_content, inserted = append_session_log("# Demo", "- x")
+        self.assertEqual(inserted, "- ## Session logs\n\t- x")
+        self.assertEqual(new_content, "# Demo\n- ## Session logs\n\t- x\n")
+
+    def test_empty_page(self):
+        new_content, inserted = append_session_log("", "- x")
+        self.assertEqual(inserted, "- ## Session logs\n\t- x")
+        self.assertEqual(new_content, "- ## Session logs\n\t- x\n")
+
+    def test_unterminated_fence_canonical_heading(self):
+        content = "```\n- ## Session logs\n\t- old\n"
+        new_content, inserted = append_session_log(content, "- new")
+        self.assertEqual(inserted, "\t- new")
+        self.assertEqual(new_content, "```\n- ## Session logs\n\t- old\n\t- new\n")
+
+    def test_four_backtick_fence_not_closed_by_three(self):
+        content = "````\n## Session logs\n```\n````\n"
+        new_content, inserted = append_session_log(content, "- x")
+        self.assertEqual(inserted, "- ## Session logs\n\t- x")
+        self.assertEqual(new_content, content + "- ## Session logs\n\t- x\n")
+
+    def test_closed_fence_canonical_heading_is_ignored(self):
+        content = "```\n- ## Session logs\n```\n- real\n"
+        new_content, inserted = append_session_log(content, "- x")
+        self.assertEqual(inserted, "- ## Session logs\n\t- x")
+        self.assertEqual(new_content, "```\n- ## Session logs\n```\n- real\n- ## Session logs\n\t- x\n")
+
+    def test_visual_indent_columns(self):
+        content = "\t- ## Session logs\n    - other\n"
+        new_content, inserted = append_session_log(content, "- new")
+        self.assertEqual(inserted, "\t\t- new")
+        self.assertEqual(new_content, "\t- ## Session logs\n\t\t- new\n    - other\n")
 
 
 if __name__ == "__main__":

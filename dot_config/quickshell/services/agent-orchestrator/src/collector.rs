@@ -40,8 +40,8 @@
 
 use crate::app_context::APP_REFRESH_INTERVAL;
 use crate::desktop_context::{
-    now_ms, DesktopContext, EnqueueOutcome, PendingFull, Source, Tracker,
-    MAX_PENDING_OBSERVATIONS,
+    now_ms, retain_focusless, retain_focusless_with_anchor, DesktopContext, EnqueueOutcome,
+    PendingFull, Source, Tracker, MAX_PENDING_OBSERVATIONS,
 };
 use crate::desktop_store::{ActivityStore, StoreError};
 use crate::hyprland::{
@@ -189,6 +189,13 @@ fn run_session(
     if shutdown.load(Ordering::SeqCst) {
         return (SessionOutcome::Shutdown, false);
     }
+    // Focusless-retention window for this session: the store's interruption
+    // grace (CLI > env > defaults, resolved once when the collector opened
+    // the database), so brief compositor focus gaps keep the current project
+    // instead of clearing it. Tests set small values via
+    // `open_in_memory_with_config`. Threaded explicitly to both persistence
+    // choke points below — never hardcoded at call sites.
+    let retention_ms = store.session_config().interruption_grace_ms();
     let mut stream = match connect_bounded(&config.event_socket, CONNECT_TIMEOUT) {
         Ok(s) => s,
         Err(e) => {
@@ -235,7 +242,7 @@ fn run_session(
     let made_progress = match fetch_snapshot(&config.request_socket) {
         Ok(ctx) => {
             let base = with_merged_overlay(tracker, ctx);
-            match persist_observation_via_backlog(store, tracker, base.clone()) {
+            match persist_observation_via_backlog(store, tracker, base.clone(), retention_ms) {
                 Ok(()) => {
                     focus_gen = focus_gen.wrapping_add(1);
                     worker.submit(focus_gen, base.with_resource(None));
@@ -280,18 +287,20 @@ fn run_session(
         match worker.poll() {
             None => None,
             Some(res) if res.generation != focus_gen => None,
-            Some(res) => match persist_enriched_result(store, tracker, res.enriched) {
-                Ok(queued) => {
-                    if queued {
-                        *made_progress = true;
+            Some(res) => {
+                match persist_enriched_result(store, tracker, res.enriched, retention_ms) {
+                    Ok(queued) => {
+                        if queued {
+                            *made_progress = true;
+                        }
+                        None
                     }
-                    None
+                    Err(_) => {
+                        tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
+                        Some(SessionOutcome::BacklogFull)
+                    }
                 }
-                Err(_) => {
-                    tracker.mark_current_unavailable_local(Source::Hyprland, now_ms());
-                    Some(SessionOutcome::BacklogFull)
-                }
-            },
+            }
         }
     };
 
@@ -357,7 +366,12 @@ fn run_session(
                             made_progress = true;
                             last_app_refresh = Instant::now();
                             let base = with_merged_overlay(tracker, ctx);
-                            match persist_observation_via_backlog(store, tracker, base.clone()) {
+                            match persist_observation_via_backlog(
+                                store,
+                                tracker,
+                                base.clone(),
+                                retention_ms,
+                            ) {
                                 Ok(()) => {
                                     worker.submit(focus_gen, base.with_resource(None));
                                 }
@@ -654,6 +668,10 @@ pub fn run_collector_forever_with_enrich(
 /// in-memory loss reported by the caller.
 pub fn final_drain(store: &ActivityStore, tracker: &mut Tracker) -> usize {
     let deadline = Instant::now() + SHUTDOWN_DRAIN_DEADLINE;
+    // No change capture here by design: the aggregate git budget (up to
+    // ~1.2 s) must never steal time from the 2 s activity drain. An honest
+    // missing latest is preferable to a dropped activity row; the frozen
+    // row keeps its last in-session refresh.
     drain_rows_with_deadline(tracker, deadline, |kind, snap| {
         store
             .append(kind.as_str(), snap.source.as_str(), snap)
@@ -717,8 +735,21 @@ fn drain_rows_with_deadline(
 pub fn flush_pending(store: &ActivityStore, tracker: &mut Tracker) -> Result<usize, StoreError> {
     let mut flushed = 0usize;
     while let Some((kind, snap)) = tracker.pending_front() {
-        match store.append(kind.as_str(), snap.source.as_str(), &snap) {
-            Ok(_) => {
+        match store.append_with_outcome(kind.as_str(), snap.source.as_str(), &snap) {
+            Ok(outcome) => {
+                // Best-effort change capture AFTER the activity transaction
+                // commits (never inside it). Resolves the assigned session
+                // from the writer outcome — never from popup reads. Failures
+                // are swallowed (one stderr line) so activity persistence
+                // never breaks. Baseline is immediate on new sessions;
+                // latest refreshes are rate-limited inside the sidecar.
+                crate::session_changes::observe_session_change(
+                    &outcome.session_id,
+                    outcome.project_id.as_deref(),
+                    snap.observed_at_ms,
+                    outcome.is_new_session,
+                    None,
+                );
                 tracker.mark_persisted(&snap);
                 let _ = tracker.pop_pending_front();
                 flushed += 1;
@@ -747,13 +778,22 @@ fn flush_pending_and_log(store: &ActivityStore, tracker: &mut Tracker) {
 /// later `A` behind a pending `B` is retained rather than lost to watermark
 /// dedup. Original `observed_at_ms` is preserved end-to-end.
 ///
+/// Before enqueueing, focusless retention is applied against the live
+/// previous context (`tracker.current_context()`): a focusless snapshot
+/// inside `retention_ms` carries the previous resource/project instead of
+/// clearing them. Unavailable markers bypass retention (see
+/// `mark_unavailable_via_backlog`, which never calls this helper).
+///
 /// Returns `Err(PendingFull)` on bounded overflow (explicit, no silent
 /// drop); caller must end the session with `BacklogFull`.
 fn persist_observation_via_backlog(
     store: &ActivityStore,
     tracker: &mut Tracker,
     ctx: DesktopContext,
+    retention_ms: i64,
 ) -> Result<(), PendingFull> {
+    let prev = tracker.current_context();
+    let ctx = retain_focusless(prev.as_ref(), ctx, retention_ms);
     match tracker.enqueue(ctx) {
         Ok(EnqueueOutcome::Deduplicated) => {
             // Already queued/persisted semantically; still attempt flush so
@@ -1014,7 +1054,9 @@ fn run_enrich_blocking(base: DesktopContext, enrich: Option<&EnrichFn>) -> Deskt
 
 /// Enqueue a worker-produced enriched snapshot (already correlated by
 /// generation by the caller). The observation timestamp is set to completion
-/// time so idle resource changes advance history time. Returns `Ok(true)`
+/// time so idle resource changes advance history time. Focusless retention
+/// is applied like on the base path (windowed results simply have their
+/// marker cleared — a real window event ends retention). Returns `Ok(true)`
 /// when a new row was queued (backoff progress), `Ok(false)` on dedup or
 /// focus mismatch, and `Err(PendingFull)` on bounded overflow — which the
 /// caller must propagate as `BacklogFull` with local-unavailable marking,
@@ -1023,6 +1065,7 @@ fn persist_enriched_result(
     store: &ActivityStore,
     tracker: &mut Tracker,
     mut enriched: DesktopContext,
+    retention_ms: i64,
 ) -> Result<bool, PendingFull> {
     // Safety: the worker never rewrites compositor identity for injected
     // enrichers (clamped) and the default path preserves it; double-check
@@ -1042,6 +1085,8 @@ fn persist_enriched_result(
         }
     }
     enriched.observed_at_ms = now_ms();
+    let prev = tracker.current_context();
+    let enriched = retain_focusless(prev.as_ref(), enriched, retention_ms);
     match tracker.enqueue(enriched) {
         Ok(EnqueueOutcome::Deduplicated) => {
             flush_pending_and_log(store, tracker);
@@ -1059,6 +1104,174 @@ fn persist_enriched_result(
             Err(full)
         }
     }
+}
+
+/// Bounded lookback for the live focusless path: how many newest activity
+/// rows [`apply_focusless_retention`] pages before picking a carry source.
+/// The collector persists raw `focus`/`title` rows un-enriched and writes
+/// the enriched `context` row ~1 s later, so the single newest row very
+/// often carries no project; paging back skips those project-less rows to
+/// the older enriched row for the same window. Well under `MAX_QUERY_LIMIT`
+/// (1000, unchanged).
+const FOCUSLESS_LOOKBACK_ROWS: i64 = 64;
+
+/// Live-path focusless retention for `current` / `current-project`.
+///
+/// Best-effort DB-backed retention for a freshly observed context: when
+/// `candidate` is focusless, up to [`FOCUSLESS_LOOKBACK_ROWS`] newest
+/// persisted activity rows are loaded (strictly read-only) and walked
+/// newest→oldest to pick a carry source for
+/// [`retain_focusless_with_anchor`] with the given `retention_ms`. Any
+/// failure — no DB path, missing/unreadable database, empty history, or no
+/// parsable row — returns the candidate unchanged, so the live path keeps
+/// working without a database (including without HOME) and a fresh snapshot
+/// never fails because of a history read. Unparsable row JSON is skipped,
+/// not fatal.
+///
+/// Walk rules (newest→oldest):
+/// - Unavailable rows end the walk and return the candidate unchanged: a
+///   compositor outage marker ends the streak, so a project from before it
+///   must never be carried across it.
+/// - Rows whose workspace differs from the candidate's stop the walk and
+///   return the candidate unchanged: resurrecting across a workspace change
+///   would corrupt session/history attribution.
+/// - The streak anchor is taken from the newest available focusless row
+///   with the candidate's workspace: its `focusless_since_ms` when present
+///   (even when that row carries no project), else its `observed_at_ms`
+///   for legacy rows. It is threaded explicitly into
+///   [`retain_focusless_with_anchor`] so an expired project-less focusless
+///   row stays expired instead of re-anchoring on an older signal row.
+/// - The carry source is the newest available row (same workspace) with
+///   something to carry: a `project` or a non-empty `resource`.
+///   Un-enriched windowed rows for the SAME window (focused window present
+///   but no project/resource) are skipped — that skip is the point of the
+///   fix. But when a windowed row with a real `focused_window` whose opaque
+///   id differs from the eventual carry source's window id is seen before
+///   any carry source, the walk stops and the candidate is returned
+///   unchanged: a genuine window change happened, and resurrecting an older
+///   project would corrupt attribution. Same-id title-only differences do
+///   not block.
+/// - Windowed or unavailable candidates are returned unchanged (never
+///   rewritten); the in-memory [`retain_focusless`] still clears both
+///   markers on such candidates when the collector persists them.
+///
+/// Note on stale windowed rows: the newest row is written only on
+/// semantically distinct observations, so it can be minutes old while a
+/// window stayed focused. [`retain_focusless`] anchors such a first
+/// focusless observation at the candidate time, so the live path retains the
+/// last observed project while focusless here. When the collector is running
+/// it promptly persists that retained row with both the `retained_since_ms`
+/// and `focusless_since_ms` markers, and later polls read the streak clock
+/// back, so the total focusless period stays bounded and eventually expires.
+pub fn apply_focusless_retention(
+    db: Option<&Path>,
+    candidate: DesktopContext,
+    retention_ms: i64,
+) -> DesktopContext {
+    if !candidate.available || candidate.focused_window.is_some() {
+        return candidate;
+    }
+    let Some(path) = db else {
+        return candidate;
+    };
+    let store = match ActivityStore::open_read_only(path) {
+        Ok(s) => s,
+        Err(_) => return candidate,
+    };
+    let rows = match store.recent_activity(FOCUSLESS_LOOKBACK_ROWS) {
+        Ok(r) => r,
+        Err(_) => return candidate,
+    };
+    if rows.is_empty() {
+        return candidate;
+    }
+    // Newest→oldest walk. `streak_anchor` comes from the newest available
+    // focusless row (same workspace), even when it carries nothing.
+    // `pending_windows` holds the opaque ids of intervening un-enriched
+    // windowed rows seen before any carry source; they block the carry only
+    // when one of them names a different window than the eventual source.
+    let mut streak_anchor: Option<i64> = None;
+    let mut streak_anchor_seen = false;
+    let mut pending_windows: Vec<String> = Vec::new();
+    for row in &rows {
+        let ctx: DesktopContext = match row.snapshot() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !ctx.available {
+            // Outage boundary: never carry a project from before an
+            // unavailable marker.
+            return candidate;
+        }
+        if ctx.workspace != candidate.workspace {
+            // Workspace boundary: never resurrect across it.
+            return candidate;
+        }
+        if ctx.focused_window.is_none() {
+            // Available focusless row in the streak.
+            if !streak_anchor_seen {
+                streak_anchor_seen = true;
+                streak_anchor = Some(
+                    ctx.focusless_since_ms
+                        .or(ctx.retained_since_ms)
+                        .unwrap_or(ctx.observed_at_ms),
+                );
+            }
+            if ctx.project.is_some()
+                || ctx.resource.as_ref().map(|r| !r.is_empty()).unwrap_or(false)
+            {
+                // A focusless row with no `focused_window` cannot be
+                // id-compared, so ANY intervening windowed observation that
+                // carried nothing means the true current project is unknown:
+                // do not reach past it for an older one. (Stricter than the
+                // windowed branch's same-id tolerance by design; restores the
+                // old single-row behavior where a project-less `prev` carried
+                // nothing. The same-window un-enriched skip that is the point
+                // of the fix happens below a windowed carry source and is
+                // unaffected.)
+                if !pending_windows.is_empty() {
+                    return candidate;
+                }
+                return retain_focusless_with_anchor(
+                    Some(&ctx),
+                    candidate,
+                    retention_ms,
+                    streak_anchor,
+                );
+            }
+            // Project-less focusless: contributes the anchor, keep walking.
+            continue;
+        }
+        // Available windowed row (same workspace from here).
+        let carries = ctx.project.is_some()
+            || ctx.resource.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+        if carries {
+            // Candidate carry source: check the window-change boundary.
+            // Any intervening un-enriched windowed row naming a different
+            // opaque window id means a genuine window change happened after
+            // this source — do not resurrect it.
+            if let Some(win) = ctx.focused_window.as_ref() {
+                if pending_windows.iter().any(|id| id != &win.id) {
+                    return candidate;
+                }
+            }
+            return retain_focusless_with_anchor(
+                Some(&ctx),
+                candidate,
+                retention_ms,
+                streak_anchor,
+            );
+        }
+        // Un-enriched windowed row: record its window id and keep walking
+        // (skipping same-window unenriched rows is the fix; a different
+        // window aborts once the source is found above).
+        if let Some(win) = ctx.focused_window.as_ref() {
+            pending_windows.push(win.id.clone());
+        }
+    }
+    // No carry-capable row inside the page (or only skipped rows): nothing
+    // to retain, return as observed.
+    candidate
 }
 
 /// Zero-timeout readability probe on the event socket: true when a
@@ -1610,6 +1823,691 @@ mod tests {
             "no enrichment rows without a worker"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Focusless-retention persistence coverage (collector choke points).
+    mod focusless_retention {
+        use super::super::*;
+        use crate::desktop_context::{FocusedWindow, ProjectContext, ResourceContext, Workspace};
+        use crate::desktop_session::{resolved_project_id, SessionConfig};
+
+        const PROJ: &str = "12345678-1234-1234-1234-1234567890ab";
+
+        fn windowed(ts: i64) -> DesktopContext {
+            DesktopContext::available(
+                Source::Hyprland,
+                Some(FocusedWindow::new("0x1", "kitty", "t")),
+                Some(Workspace::new("1", "1")),
+                ts,
+            )
+            .with_resource(Some(ResourceContext::new(
+                "neovim",
+                Some("/repo/note.md"),
+                Some("/repo"),
+                Some("/repo"),
+                Some("main"),
+                None,
+                None,
+                Some("T"),
+            )))
+            .with_project(Some(ProjectContext::new(PROJ, "P", "file")))
+        }
+
+        fn focusless(ts: i64) -> DesktopContext {
+            DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), ts)
+        }
+
+        fn test_store() -> ActivityStore {
+            // Small interruption grace doubles as a small retention window.
+            let cfg = SessionConfig::new(60_000, 5_000).expect("valid test config");
+            ActivityStore::open_in_memory_with_config(cfg).expect("in-memory store")
+        }
+
+        #[test]
+        fn retained_focus_row_keeps_project_and_session_open() {
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            assert_eq!(retention, 5_000);
+            let mut tracker = Tracker::new();
+
+            persist_observation_via_backlog(&store, &mut tracker, windowed(100_000), retention)
+                .expect("windowed persists");
+            // Focusless 1 s later: inside the 5 s retention window.
+            persist_observation_via_backlog(&store, &mut tracker, focusless(101_000), retention)
+                .expect("focusless persists");
+
+            let rows = store.recent_activity(10).expect("rows");
+            assert_eq!(rows.len(), 2, "windowed + one retained focus row");
+            assert_eq!(rows[0].kind, "focus");
+            let newest: DesktopContext = rows[0].snapshot().expect("parse snapshot");
+            assert!(
+                newest.focused_window.is_none(),
+                "retained rows stay honestly focusless"
+            );
+            assert_eq!(
+                newest.project.as_ref().map(|p| p.id.as_str()),
+                Some(PROJ),
+                "retained row carries the previous project"
+            );
+            assert!(newest.resource.is_some());
+            // First focusless observation anchors at its own time (the
+            // windowed row may be stale); the collector persists the marker.
+            assert_eq!(newest.retained_since_ms, Some(101_000));
+            assert_eq!(resolved_project_id(&newest).as_deref(), Some(PROJ));
+            // The session never sees an unresolved event: it stays on the
+            // project with no open interruption run.
+            let sess = store
+                .current_session(101_000)
+                .expect("current session")
+                .expect("session stays open");
+            assert_eq!(sess.project_id.as_deref(), Some(PROJ));
+            assert_eq!(sess.unresolved_start_ms, None);
+            assert_eq!(sess.status, "open");
+        }
+
+        #[test]
+        fn enriched_focusless_result_keeps_retained_project() {
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            let mut tracker = Tracker::new();
+            let t = now_ms();
+
+            persist_observation_via_backlog(&store, &mut tracker, windowed(t), retention)
+                .expect("windowed persists");
+            persist_observation_via_backlog(
+                &store,
+                &mut tracker,
+                focusless(t + 1_000),
+                retention,
+            )
+            .expect("retained focus persists");
+            assert_eq!(store.recent_activity(10).expect("rows").len(), 2);
+
+            // Worker result for the bare resource-free focusless observation
+            // (enrich_with_env's focusless early return) arrives with a
+            // completion timestamp: retention must re-derive the retained
+            // project from the tracker tail so the result dedups instead of
+            // appending a project-clearing row.
+            let enriched =
+                DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 0);
+            let queued =
+                persist_enriched_result(&store, &mut tracker, enriched, retention)
+                    .expect("enriched persist");
+            assert!(!queued, "retained result dedups against the retained tail");
+            let rows = store.recent_activity(10).expect("rows");
+            assert_eq!(rows.len(), 2, "no clearing row appended");
+            let newest: DesktopContext = rows[0].snapshot().expect("parse snapshot");
+            assert_eq!(newest.project.as_ref().map(|p| p.id.as_str()), Some(PROJ));
+        }
+
+        #[test]
+        fn enriched_focusless_result_after_expiry_clears() {
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            let mut tracker = Tracker::new();
+            let t = now_ms();
+
+            persist_observation_via_backlog(&store, &mut tracker, windowed(t), retention)
+                .expect("windowed persists");
+            // First focusless observation anchored 100 s in the past (the
+            // worker-enriched half of that same observation will complete at
+            // the real `now_ms()`): retention is anchored at the candidate,
+            // so the base row is retained while the anchored window is open.
+            persist_observation_via_backlog(
+                &store,
+                &mut tracker,
+                focusless(t - 100_000),
+                retention,
+            )
+            .expect("retained focus persists");
+
+            // Worker completion is 100 s past the anchor: expired, so the
+            // honest cleared row is appended (expiry is still observed).
+            let enriched =
+                DesktopContext::available(Source::Hyprland, None, Some(Workspace::new("1", "1")), 0);
+            let queued =
+                persist_enriched_result(&store, &mut tracker, enriched, retention)
+                    .expect("enriched persist");
+            assert!(queued, "expired retention appends the cleared row");
+            let rows = store.recent_activity(10).expect("rows");
+            let newest: DesktopContext = rows[0].snapshot().expect("parse snapshot");
+            assert!(newest.project.is_none());
+            assert!(newest.resource.is_none());
+            assert_eq!(newest.retained_since_ms, None);
+        }
+
+        #[test]
+        fn expired_retention_persists_honest_cleared_context() {
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            let mut tracker = Tracker::new();
+
+            persist_observation_via_backlog(&store, &mut tracker, windowed(100_000), retention)
+                .expect("windowed persists");
+            // First focusless observation anchors the window at its own time
+            // (a stale windowed row never expires immediately).
+            persist_observation_via_backlog(&store, &mut tracker, focusless(101_000), retention)
+                .expect("first retained");
+            // Focusless 99 s after the anchor: past the 5 s window, so the
+            // retained marker expires and the honest cleared context persists.
+            persist_observation_via_backlog(&store, &mut tracker, focusless(200_000), retention)
+                .expect("expired focusless persists");
+
+            let rows = store.recent_activity(10).expect("rows");
+            assert_eq!(rows.len(), 3);
+            let newest: DesktopContext = rows[0].snapshot().expect("parse snapshot");
+            assert!(newest.focused_window.is_none());
+            assert!(
+                newest.project.is_none(),
+                "expired retention clears the project, as observed today"
+            );
+            assert!(newest.resource.is_none());
+            assert_eq!(newest.retained_since_ms, None);
+        }
+
+        #[test]
+        fn repeated_focusless_events_do_not_extend_the_window() {
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            let mut tracker = Tracker::new();
+
+            persist_observation_via_backlog(&store, &mut tracker, windowed(100_000), retention)
+                .expect("windowed persists");
+            persist_observation_via_backlog(&store, &mut tracker, focusless(101_000), retention)
+                .expect("first retained");
+            assert_eq!(store.recent_activity(10).expect("rows").len(), 2);
+            // Second focusless 1 s after the anchor: still inside, and
+            // semantically equal to the retained tail, so it dedups.
+            persist_observation_via_backlog(&store, &mut tracker, focusless(102_000), retention)
+                .expect("repeat dedups");
+            assert_eq!(
+                store.recent_activity(10).expect("rows").len(),
+                2,
+                "repeated retained rows dedup against the tail"
+            );
+            // 6 s after the anchor (4 s after the last retained row): the
+            // window is anchored at the FIRST focusless time, so this must
+            // expire instead of extending.
+            persist_observation_via_backlog(&store, &mut tracker, focusless(107_000), retention)
+                .expect("expired persists");
+            let rows = store.recent_activity(10).expect("rows");
+            assert_eq!(rows.len(), 3);
+            let newest: DesktopContext = rows[0].snapshot().expect("parse snapshot");
+            assert!(
+                newest.project.is_none(),
+                "window anchored at first focusless time, not extended"
+            );
+            assert_eq!(newest.retained_since_ms, None);
+        }
+
+        #[test]
+        fn unavailable_markers_never_retain() {
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            let mut tracker = Tracker::new();
+
+            persist_observation_via_backlog(&store, &mut tracker, windowed(100_000), retention)
+                .expect("windowed persists");
+            // The unavailable path bypasses retention entirely.
+            super::super::mark_unavailable_via_backlog(&store, &mut tracker)
+                .expect("unavailable persists");
+            let rows = store.recent_activity(10).expect("rows");
+            assert_eq!(rows.len(), 2);
+            let newest: DesktopContext = rows[0].snapshot().expect("parse snapshot");
+            assert!(!newest.available);
+            assert!(newest.project.is_none());
+            assert_eq!(newest.retained_since_ms, None);
+        }
+
+        #[test]
+        fn live_path_retention_from_db_file() {
+            use crate::desktop_session::SessionConfig as SC;
+            let dir = super::tmpdir("live-retention");
+            let db_path = dir.join("activity.db");
+            let cfg = SC::new(60_000, 5_000).expect("valid test config");
+            let store = ActivityStore::open_with_session_config(&db_path, cfg).expect("file store");
+            store
+                .append("focus", "hyprland", &windowed(100_000))
+                .expect("windowed row");
+
+            // Within TTL: the focusless candidate gains the stored project,
+            // anchored at its own (first focusless) time.
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(101_000), 5_000);
+            assert!(out.focused_window.is_none());
+            assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some(PROJ));
+            assert_eq!(out.retained_since_ms, Some(101_000));
+
+            // Stale windowed row (written 10 minutes earlier while the window
+            // stayed focused without distinct observations): the first
+            // focusless candidate still retains, anchored at its own time.
+            // This is the live-path/DB-row regression: anchoring at the row
+            // time would expire immediately and drop the current project.
+            let stale_dir = super::tmpdir("live-retention-stale");
+            let stale_db = stale_dir.join("activity.db");
+            let stale_store =
+                ActivityStore::open_with_session_config(&stale_db, cfg).expect("file store");
+            stale_store
+                .append("focus", "hyprland", &windowed(100_000))
+                .expect("windowed row");
+            let stale_candidate = focusless(100_000 + 600_000);
+            let out = apply_focusless_retention(
+                Some(stale_db.as_path()),
+                stale_candidate.clone(),
+                5_000,
+            );
+            assert!(out.focused_window.is_none());
+            assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some(PROJ));
+            assert!(out.resource.is_some());
+            assert_eq!(
+                out.retained_since_ms,
+                Some(stale_candidate.observed_at_ms)
+            );
+            let _ = std::fs::remove_dir_all(&stale_dir);
+
+            // Expired marker: once a retained row with an old marker is the
+            // newest row, a candidate past the window no longer retains.
+            let old_marker_dir = super::tmpdir("live-retention-expired");
+            let old_marker_db = old_marker_dir.join("activity.db");
+            let old_marker_store =
+                ActivityStore::open_with_session_config(&old_marker_db, cfg)
+                    .expect("file store");
+            let mut old_retained = focusless(101_000);
+            old_retained.resource.clone_from(&windowed(100_000).resource);
+            old_retained.project.clone_from(&windowed(100_000).project);
+            old_retained.retained_since_ms = Some(100_000);
+            old_marker_store
+                .append("focus", "hyprland", &old_retained)
+                .expect("retained row");
+            let out = apply_focusless_retention(
+                Some(old_marker_db.as_path()),
+                focusless(200_000),
+                5_000,
+            );
+            assert!(
+                out.project.is_none(),
+                "retained marker 100 s old must expire"
+            );
+            assert_eq!(out.retained_since_ms, None);
+            let _ = std::fs::remove_dir_all(&old_marker_dir);
+
+            // Workspace change: unchanged.
+            let moved = DesktopContext::available(
+                Source::Hyprland,
+                None,
+                Some(Workspace::new("2", "2")),
+                101_000,
+            );
+            let out = apply_focusless_retention(Some(db_path.as_path()), moved, 5_000);
+            assert!(out.project.is_none());
+            assert_eq!(out.retained_since_ms, None);
+
+            // Missing database / no path: candidate passes through untouched.
+            let missing = dir.join("nope.db");
+            let out = apply_focusless_retention(Some(missing.as_path()), focusless(101_000), 5_000);
+            assert!(out.project.is_none());
+            assert_eq!(out.retained_since_ms, None);
+            let out = apply_focusless_retention(None, focusless(101_000), 5_000);
+            assert!(out.project.is_none());
+            assert_eq!(out.retained_since_ms, None);
+
+            // Windowed candidates are never rewritten (marker cleared).
+            let mut w = windowed(101_000);
+            w.retained_since_ms = Some(1);
+            let out = apply_focusless_retention(Some(db_path.as_path()), w, 5_000);
+            assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some(PROJ));
+            assert_eq!(out.retained_since_ms, Some(1));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn unenriched_windowed(ts: i64) -> DesktopContext {
+            // Raw `focus` row shape: focused window present, no enrichment.
+            DesktopContext::available(
+                Source::Hyprland,
+                Some(FocusedWindow::new("0x1", "kitty", "t")),
+                Some(Workspace::new("1", "1")),
+                ts,
+            )
+        }
+
+        fn unenriched_other_window(ts: i64) -> DesktopContext {
+            DesktopContext::available(
+                Source::Hyprland,
+                Some(FocusedWindow::new("0x2", "kitty", "other")),
+                Some(Workspace::new("1", "1")),
+                ts,
+            )
+        }
+
+        fn file_store(dir: &std::path::Path, name: &str) -> (ActivityStore, std::path::PathBuf) {
+            use crate::desktop_session::SessionConfig as SC;
+            let db_path = dir.join(name);
+            let cfg = SC::new(60_000, 5_000).expect("valid test config");
+            let store =
+                ActivityStore::open_with_session_config(&db_path, cfg).expect("file store");
+            (store, db_path)
+        }
+
+        #[test]
+        fn live_path_skips_unenriched_newest_row_for_same_window() {
+            // THE REGRESSION: newest persisted row is an un-enriched
+            // windowed row (focused window present, no project/resource)
+            // while an older enriched row for the SAME window carries the
+            // project. The focusless candidate must retain that project.
+            let dir = super::tmpdir("live-skip-unenriched");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("enriched older row");
+            store
+                .append("focus", "hyprland", &unenriched_windowed(100_500))
+                .expect("un-enriched newer row");
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(101_000), 5_000);
+            assert!(
+                out.focused_window.is_none(),
+                "retained rows stay honestly focusless"
+            );
+            assert_eq!(
+                out.project.as_ref().map(|p| p.id.as_str()),
+                Some(PROJ),
+                "must skip the project-less newest row to the same-window signal"
+            );
+            assert!(out.resource.is_some());
+            assert_eq!(out.retained_since_ms, Some(101_000));
+            assert_eq!(out.focusless_since_ms, Some(101_000));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_different_window_blocks_resurrection() {
+            // BOUNDARY: a newer windowed row with a DIFFERENT focused
+            // window (no project) sits between the candidate and an older
+            // same-window signal. A genuine window change happened — the
+            // candidate must stay project-less.
+            let dir = super::tmpdir("live-window-boundary");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("older same-window signal");
+            store
+                .append("focus", "hyprland", &unenriched_other_window(100_500))
+                .expect("newer different-window row");
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(101_000), 5_000);
+            assert!(
+                out.project.is_none(),
+                "must not resurrect across a window change"
+            );
+            assert_eq!(out.retained_since_ms, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_focusless_carry_past_windowed_row_is_blocked() {
+            // Focusless carry sources do NOT bypass the window-change
+            // boundary: [enriched 0x1+P, retained focusless carrying P,
+            // un-enriched 0x2, focusless candidate] must return NO project.
+            // The retained focusless row has no `focused_window` to compare
+            // ids against, so any intervening project-less windowed
+            // observation means the true current project is unknown.
+            let dir = super::tmpdir("live-focusless-past-window");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("enriched 0x1+P");
+            let mut retained = focusless(100_500);
+            retained.resource.clone_from(&windowed(100_000).resource);
+            retained.project.clone_from(&windowed(100_000).project);
+            retained.retained_since_ms = Some(100_500);
+            retained.focusless_since_ms = Some(100_500);
+            store
+                .append("focus", "hyprland", &retained)
+                .expect("retained focusless carrying P");
+            store
+                .append("focus", "hyprland", &unenriched_other_window(101_000))
+                .expect("un-enriched different window 0x2");
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(101_500), 5_000);
+            assert!(
+                out.project.is_none(),
+                "must not reach past an intervening windowed row for an older project"
+            );
+            assert_eq!(out.retained_since_ms, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_retained_focusless_newest_still_carries() {
+            // Primary popup path: the retained focusless row is the newest
+            // row (no intervening windowed observation) — it must still
+            // carry P.
+            let dir = super::tmpdir("live-retained-newest");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("enriched 0x1+P");
+            let mut retained = focusless(100_500);
+            retained.resource.clone_from(&windowed(100_000).resource);
+            retained.project.clone_from(&windowed(100_000).project);
+            retained.retained_since_ms = Some(100_500);
+            retained.focusless_since_ms = Some(100_500);
+            store
+                .append("focus", "hyprland", &retained)
+                .expect("retained focusless carrying P");
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(101_000), 5_000);
+            assert_eq!(
+                out.project.as_ref().map(|p| p.id.as_str()),
+                Some(PROJ),
+                "retained newest row must keep carrying without intervening windows"
+            );
+            assert_eq!(out.focusless_since_ms, Some(100_500));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_unavailable_row_ends_the_walk() {
+            // An unavailable marker is a hard boundary: [enriched P,
+            // unavailable, focusless candidate an hour later with a 5 s
+            // grace] must carry NO project.
+            let dir = super::tmpdir("live-unavailable-boundary");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("enriched P");
+            store
+                .append(
+                    "availability",
+                    "hyprland",
+                    &DesktopContext::unavailable(Source::Hyprland, 100_500),
+                )
+                .expect("unavailable marker");
+            let out = apply_focusless_retention(
+                Some(db_path.as_path()),
+                focusless(100_500 + 3_600_000),
+                5_000,
+            );
+            assert!(
+                out.project.is_none(),
+                "must not carry a project from before an unavailable marker"
+            );
+            assert_eq!(out.retained_since_ms, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_expired_streak_never_resurrects() {
+            // NO RESURRECTION AFTER EXPIRY: a persisted project-less
+            // focusless row (streak expired) followed by another focusless
+            // observation long after the grace stays project-less, even
+            // though an older signal row is inside the lookback page.
+            let dir = super::tmpdir("live-no-resurrect");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("signal");
+            // First focusless at 101_000 retains (anchor 101_000).
+            let mut retained = focusless(101_000);
+            retained.resource.clone_from(&windowed(100_000).resource);
+            retained.project.clone_from(&windowed(100_000).project);
+            retained.retained_since_ms = Some(101_000);
+            retained.focusless_since_ms = Some(101_000);
+            store
+                .append("focus", "hyprland", &retained)
+                .expect("retained row");
+            // Expired project-less focusless row: anchor preserved, carry
+            // cleared (this is what the collector persists on expiry).
+            let mut expired = focusless(200_000);
+            expired.focusless_since_ms = Some(101_000);
+            store
+                .append("focus", "hyprland", &expired)
+                .expect("expired row");
+            // Another focusless long after the grace: newest row is the
+            // expired project-less one; the old signal is still in the
+            // page but the streak (anchor 101_000) is long expired.
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(300_000), 5_000);
+            assert!(
+                out.project.is_none(),
+                "expired streak must not resurrect the old project"
+            );
+            assert_eq!(out.retained_since_ms, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_streak_anchor_survives_projectless_row() {
+            // Two consecutive focusless observations where the first is
+            // persisted WITHOUT a carry still expire at `anchor +
+            // retention`, not later. Here the first focusless row is a
+            // legacy-style bare row (no markers): the walk falls back to
+            // its observed time, and the second observation uses it.
+            let dir = super::tmpdir("live-anchor-survives");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(100_000))
+                .expect("signal");
+            // Bare project-less focusless row at 101_000 (no markers at
+            // all — e.g. persisted before the streak clock existed).
+            store
+                .append("focus", "hyprland", &focusless(101_000))
+                .expect("bare focusless");
+            // Candidate 1 s later: inside the window anchored at 101_000,
+            // so it retains the older signal (anchor = bare row time).
+            let kept =
+                apply_focusless_retention(Some(db_path.as_path()), focusless(102_000), 5_000);
+            assert_eq!(
+                kept.project.as_ref().map(|p| p.id.as_str()),
+                Some(PROJ),
+                "bare focusless row must not hide the older signal"
+            );
+            assert_eq!(kept.focusless_since_ms, Some(101_000));
+            // Candidate long past `101_000 + 5_000`: expired, even though
+            // it is recent relative to nothing else in the page.
+            let expired =
+                apply_focusless_retention(Some(db_path.as_path()), focusless(110_000), 5_000);
+            assert!(
+                expired.project.is_none(),
+                "must expire at anchor + retention, not later"
+            );
+            assert_eq!(expired.retained_since_ms, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_legacy_rows_without_markers_behave_sanely() {
+            // A row persisted without marker fields still round-trips and
+            // the live path treats the first focusless observation as a
+            // fresh streak instead of failing. (Genuine legacy-shape JSON
+            // coverage lives in `desktop_context.rs`
+            // `retain_focusless_legacy_rows_without_markers`.)
+            let dir = super::tmpdir("live-legacy");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            let legacy_json = serde_json::to_string(&windowed(100_000)).expect("serialize");
+            let legacy: DesktopContext =
+                serde_json::from_str(&legacy_json).expect("round-trip");
+            assert_eq!(legacy.project.as_ref().map(|p| p.id.as_str()), Some(PROJ));
+            store.append("focus", "hyprland", &legacy).expect("legacy row");
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(101_000), 5_000);
+            assert_eq!(out.project.as_ref().map(|p| p.id.as_str()), Some(PROJ));
+            assert_eq!(out.focusless_since_ms, Some(101_000));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn live_path_lookback_bound_ignores_older_source() {
+            // A carry source older than the lookback page is not used: 64
+            // same-window un-enriched fillers push the signal out of the
+            // page, so the candidate stays project-less. (With fewer
+            // fillers the same signal is found — proving the bound, not a
+            // boundary, is what blocks.)
+            let dir = super::tmpdir("live-lookback-bound");
+            let (store, db_path) = file_store(&dir, "activity.db");
+            store
+                .append("context", "hyprland", &windowed(1_000))
+                .expect("old signal");
+            for i in 0..64 {
+                store
+                    .append("focus", "hyprland", &unenriched_windowed(2_000 + i))
+                    .expect("filler");
+            }
+            let out = apply_focusless_retention(Some(db_path.as_path()), focusless(100_000), 5_000);
+            assert!(
+                out.project.is_none(),
+                "source 65 rows back is outside the 64-row page"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // Control: same signal with only 10 fillers is inside the page.
+            let dir2 = super::tmpdir("live-lookback-inside");
+            let (store2, db2) = file_store(&dir2, "activity.db");
+            store2
+                .append("context", "hyprland", &windowed(1_000))
+                .expect("old signal");
+            for i in 0..10 {
+                store2
+                    .append("focus", "hyprland", &unenriched_windowed(2_000 + i))
+                    .expect("filler");
+            }
+            let out2 = apply_focusless_retention(Some(db2.as_path()), focusless(100_000), 5_000);
+            assert_eq!(
+                out2.project.as_ref().map(|p| p.id.as_str()),
+                Some(PROJ),
+                "source 11 rows back is inside the page"
+            );
+            let _ = std::fs::remove_dir_all(&dir2);
+        }
+
+        #[test]
+        fn persist_path_streak_survives_projectless_expiry() {
+            // Collector in-memory path: once an expired project-less row is
+            // persisted WITH its streak clock, the next focusless event
+            // stays expired (the anchor is re-read, never re-anchored).
+            let store = test_store();
+            let retention = store.session_config().interruption_grace_ms();
+            let mut tracker = Tracker::new();
+            persist_observation_via_backlog(&store, &mut tracker, windowed(100_000), retention)
+                .expect("windowed persists");
+            persist_observation_via_backlog(&store, &mut tracker, focusless(101_000), retention)
+                .expect("first retained");
+            let rows = store.recent_activity(10).expect("rows");
+            let retained: DesktopContext = rows[0].snapshot().expect("parse");
+            assert_eq!(retained.focusless_since_ms, Some(101_000));
+            // Expire: honest cleared row keeps the streak clock.
+            persist_observation_via_backlog(&store, &mut tracker, focusless(200_000), retention)
+                .expect("expired persists");
+            let rows = store.recent_activity(10).expect("rows");
+            let expired: DesktopContext = rows[0].snapshot().expect("parse");
+            assert!(expired.project.is_none());
+            assert_eq!(expired.retained_since_ms, None);
+            assert_eq!(
+                expired.focusless_since_ms,
+                Some(101_000),
+                "expired rows must preserve the streak clock"
+            );
+            // One more focusless long after: still expired, same anchor.
+            persist_observation_via_backlog(&store, &mut tracker, focusless(300_000), retention)
+                .expect("still expired");
+            let rows = store.recent_activity(10).expect("rows");
+            let again: DesktopContext = rows[0].snapshot().expect("parse");
+            assert!(again.project.is_none());
+            assert_eq!(again.focusless_since_ms, Some(101_000));
+        }
     }
 
     #[test]

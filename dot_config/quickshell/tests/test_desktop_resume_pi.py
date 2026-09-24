@@ -18,41 +18,46 @@ EXTENSION = (ROOT / ".pi" / "extensions" / "desktop-agent.ts").read_text(encodin
 BUN = shutil.which("bun")
 
 PALETTE_TOOLS = (
-    "logseq_search,logseq_todos,logseq_append_journal,logseq_agenda_list,"
+    "logseq_search,logseq_todos,logseq_append_journal,create_project,"
+    "create_logseq_page,logseq_agenda_list,"
     "logseq_agenda_add,zotero_search,zotero_item,zotero_read_pdf,"
     "zotero_collections,zotero_prepare,zotero_apply,desktop_current_context,"
     "desktop_project_todos,"
     "desktop_project_logseq_context,desktop_project_activity,"
     "desktop_current_session,desktop_search_activity,desktop_get_session,"
-    "desktop_resume_plan"
+    "desktop_resume_plan,session_search"
 )
 PROJECT_TOOLS = (
-    "logseq_project_read,logseq_project_update,logseq_project_files,"
-    "logseq_project_read_file,logseq_project_git,zotero_search,zotero_item,"
+    "logseq_agenda_list,logseq_agenda_add,logseq_project_read,"
+    "logseq_project_update,logseq_project_files,"
+    "logseq_project_read_file,logseq_project_git,project_folder_list,"
+    "project_folder_read,project_folder_write,zotero_search,zotero_item,"
     "zotero_read_pdf,zotero_collections,zotero_prepare,zotero_apply,"
     "desktop_current_context,"
     "desktop_project_todos,desktop_project_logseq_context,"
     "desktop_project_activity,desktop_current_session,"
-    "desktop_search_activity,desktop_get_session,desktop_resume_plan"
+    "desktop_search_activity,desktop_get_session,desktop_resume_plan,"
+    "session_search"
 )
 JOURNAL_TOOLS = (
     "logseq_journal_context,logseq_journal_append,desktop_current_context,"
     "desktop_project_todos,desktop_project_logseq_context,"
     "desktop_project_activity,desktop_current_session,"
-    "desktop_search_activity,desktop_get_session,desktop_resume_plan"
+    "desktop_search_activity,desktop_get_session,desktop_resume_plan,"
+    "session_search"
 )
-DESKTOP_EIGHT = (
+DESKTOP_NINE = (
     "desktop_current_context", "desktop_project_todos",
     "desktop_project_logseq_context", "desktop_project_activity",
     "desktop_current_session", "desktop_search_activity",
-    "desktop_get_session", "desktop_resume_plan",
+    "desktop_get_session", "desktop_resume_plan", "session_search",
 )
 
 
 class ResumeStaticContractTests(unittest.TestCase):
-    def test_read_allowlist_has_eight_tools(self):
+    def test_read_allowlist_has_nine_tools(self):
         allowlist = EXTENSION.split("const DESKTOP_READ_TOOLS")[1].split("]")[0]
-        for name in DESKTOP_EIGHT:
+        for name in DESKTOP_NINE:
             self.assertIn(f'"{name}"', allowlist)
         for name in ("desktop_current_project", "desktop_project_resources",
                      "desktop_work_sessions", "desktop_session_resources",
@@ -144,15 +149,16 @@ class ResumeStaticContractTests(unittest.TestCase):
 
     def test_protected_paths_cover_resume_helper(self):
         self.assertIn('"desktop_resume.py"', EXTENSION)
-        self.assertIn("desktop_resume|projects", EXTENSION)
-        self.assertIn("desktop_projects|desktop_resume|projects", EXTENSION)
+        for name in ("desktop_resume.py", "desktop_projects.py",
+                     "projects.py", "project_folder.py"):
+            self.assertIn(name, EXTENSION)
 
-    def test_policy_coherence_eight_tools(self):
+    def test_policy_coherence_nine_tools(self):
         system = (ROOT / ".pi" / "SYSTEM.md").read_text(encoding="utf-8")
-        for name in DESKTOP_EIGHT:
+        for name in DESKTOP_NINE:
             self.assertIn(name, system)
-        self.assertGreaterEqual(system.count("eight read-only desktop tools"), 2)
-        self.assertIn("eight-tool desktop read-only exception", system)
+        self.assertGreaterEqual(system.count("nine read-only desktop tools"), 2)
+        self.assertIn("nine-tool desktop read-only exception", system)
         self.assertIn("desktop exception never permits writes", system)
         self.assertIn("desktop_resume_plan", system)
         # Resume workflow guidance.
@@ -164,23 +170,27 @@ class ResumeStaticContractTests(unittest.TestCase):
             self.assertIn(phrase, system)
         skill = (ROOT / ".pi" / "skills" / "logseq-graph" / "SKILL.md"
                  ).read_text(encoding="utf-8")
-        for name in DESKTOP_EIGHT:
+        for name in DESKTOP_NINE:
             self.assertIn(name, skill)
         self.assertIn("exception in every scope", skill)
         self.assertIn("desktop_resume_plan", skill)
+        self.assertIn("session_search", skill)
         self.assertIn("pinned", skill)
         readme = (ROOT / ".pi" / "README.md").read_text(encoding="utf-8")
-        for name in DESKTOP_EIGHT:
+        for name in DESKTOP_NINE:
             self.assertIn(name, readme)
         self.assertIn("desktop_resume_plan", readme)
+        self.assertIn("session_search", readme)
         self.assertIn("No execute tool is exposed", readme)
 
-    def test_existing_seven_tools_unchanged(self):
+    def test_existing_tools_unchanged(self):
         for name in ("desktop_current_context", "desktop_project_todos",
                      "desktop_project_logseq_context", "desktop_project_activity",
                      "desktop_current_session", "desktop_search_activity",
-                     "desktop_get_session"):
+                     "desktop_get_session", "session_search"):
             self.assertIn(f'name: "{name}"', EXTENSION)
+        self.assertNotIn("declared focus-block units with their block titles",
+                         EXTENSION)
         self.assertIn('"current-context"', EXTENSION)
         self.assertIn('"search-activity"', EXTENSION)
         self.assertIn('"get-session"', EXTENSION)
@@ -216,7 +226,7 @@ const lstatSync = () => { throw new Error("unused"); };
 const readFileSync = () => { throw new Error("unused"); };
 const realpathSync = { native: (value) => value };
 const SessionManager = {};
-const Type = { Object: (value) => value, String: () => ({}), Optional: (value) => value, Integer: () => ({}), Boolean: () => ({}) };
+const Type = { Object: (value) => value, String: () => ({}), Optional: (value) => value, Integer: () => ({}), Boolean: () => ({}), Any: () => ({}) };
 const tools = {}, hooks = {}, commands = {}, calls = [];
 let mode = "normal";
 let registryEntries = [{ id: "11111111-1111-4111-8111-111111111111", name: "Work", logseq_path: "pages/Work.md" }];

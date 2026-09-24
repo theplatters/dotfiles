@@ -1,7 +1,5 @@
 import QtQuick
 import QtQuick.Controls
-import Quickshell
-import Quickshell.Io
 import "../theme"
 
 // Top-bar tray element showing the authoritative current working project.
@@ -22,6 +20,15 @@ Item {
     // Injected by Bar (shell binds the shared ProjectPlanner), analogous to
     // calendarPopout/controlCenter.
     property var projectPlanner: null
+    // Compact overview popup (shell-owned ProjectOverviewPopup, anchored to
+    // the tray button). Valid-project clicks open it; no-project and
+    // backend-unavailable states fall back to the plain project list.
+    property var overviewPopup: null
+    // Shared DailyAgenda injected by Bar for the session badge (count
+    // of sessions needing attention). This module only reads the badge
+    // count (agenda.ledgerInboxBadge) and calls the guarded refresh
+    // (agenda.refreshLedgerInboxBadge()).
+    property var agenda: null
     // Width-threshold compactness driven by Bar (bar.compactNetwork, a plain
     // bar.width threshold). Deliberately NOT tightSides: tightSides derives
     // from measured sideReserve, which includes this module, so reading it
@@ -30,27 +37,20 @@ Item {
     // Bounded label budget: full name stays in the tooltip.
     property int maxLabelWidth: compact ? 80 : 140
 
-    property string projectId: ""
-    property string projectName: ""
-    property string projectStatus: ""
-    property bool hasProject: false
+    // Shared shell-level source (S-005b): one poller per desktop, not per
+    // monitor. Identity state binds here; this module keeps only the
+    // button/popup/badge UI plus the pure parsers. No Process, no Timer.
+    property var projectSource: null
+
+    // Identity mirrors the shared source (local fallbacks keep the module
+    // renderable with no source, e.g. headless tests).
+    property string projectId: root.projectSource ? root.projectSource.projectId : ""
+    property string projectName: root.projectSource ? root.projectSource.projectName : ""
+    property string projectStatus: root.projectSource ? root.projectSource.projectStatus : ""
+    property bool hasProject: root.projectSource ? root.projectSource.hasProject : false
     // False only when the backend call failed or its payload was invalid.
     // Distinct from hasProject===false, which is a valid "No project".
-    property bool backendOk: true
-    // Monotonic launch counter, bumped on every launch (diagnostics only).
-    property int currentGeneration: 0
-    // Frozen in-flight generation, captured at launch and unchanged until
-    // the actual exit (or failed-start) reconciles it. The watchdog timeout
-    // deliberately does NOT touch it: a late onExited must still recognize
-    // itself as the timed-out launch and drop its success, never relabel
-    // fresh. -1 when no launch is in flight.
-    property int launchGeneration: -1
-    // Timeout fired and SIGTERM sent, but the owned process has not exited
-    // yet. While set, the poller must not launch (running may already read
-    // false before onExited arrives) and the kill timer may escalate.
-    property bool retiring: false
-    property bool _launched: false
-    property bool _started: false
+    property bool backendOk: root.projectSource ? root.projectSource.backendOk : true
 
     readonly property string displayLabel: {
         if (!root.backendOk) return "Project unavailable";
@@ -69,6 +69,7 @@ Item {
         }
         return "No current project — open the project list";
     }
+    readonly property int ledgerInboxBadge: root.parseLedgerInboxBadge(root.agenda ? root.agenda.ledgerInboxBadge : 0)
 
     // Pure payload parser (no root refs) so unit tests can exercise it via
     // node. code !== 0, empty, malformed, or unknown shapes => {ok:false}.
@@ -105,76 +106,27 @@ Item {
         return { ok: false };
     }
 
-    // Guarded completion: the generation must match the frozen
-    // launchGeneration. Captured stdout is parsed and exit acceptance
-    // (code 0 + valid shape) is required; failed/invalid payloads clear the
-    // stale identity to the honest unavailable state.
-    function finishCurrentProject(code, output, generation) {
-        if (Number(generation) !== Number(root.launchGeneration)) return false;
-        if (!root._launched) return false;
-        projectWatchdog.stop();
-        let parsed = root.parseCurrentProject(output, code);
-        if (!parsed.ok) {
-            root.backendOk = false;
-            root.hasProject = false;
-            root.projectId = "";
-            root.projectName = "";
-            root.projectStatus = "";
-            return false;
-        }
-        root.backendOk = true;
-        root.hasProject = parsed.hasProject;
-        root.projectId = parsed.hasProject ? String(parsed.id || "") : "";
-        root.projectName = parsed.hasProject ? String(parsed.name || "") : "";
-        root.projectStatus = String(parsed.status || "");
-        return true;
+    // Strict badge parser (no root refs) so unit tests can exercise it via
+    // node. Mirrors the strict-type style of parseCurrentProject: only a
+    // finite non-negative number is accepted, otherwise 0; floors floats
+    // and caps at 999. No coercion of strings/booleans/objects.
+    function parseLedgerInboxBadge(value) {
+        if (typeof value !== "number" || !isFinite(value) || value < 0) return 0;
+        return Math.min(Math.floor(value), 999);
     }
 
-    // Actual exit handler (thin onExited delegates here so tests exercise
-    // the real logic). Uses the frozen launchGeneration captured at launch,
-    // never re-read current state: after a timeout the late exit still
-    // matches its launch, but retiring drops the success instead of
-    // relabeling fresh. Either path consumes the launch and ends retiring.
-    function handleCurrentProjectExited(code, output) {
-        projectWatchdog.stop();
-        projectKillTimer.stop();
-        if (!root._launched) return false;
-        if (root.retiring) {
-            root._launched = false;
-            root._started = false;
-            root.launchGeneration = -1;
-            root.retiring = false;
+    // Guarded badge refresh: delegates to the shared DailyAgenda's guarded
+    // inbox read (safe to call on demand). Never throws; false when there is
+    // no agenda or no refresh method. The steady cadence now comes from the
+    // shell-level source's 60 s timer, not from a per-monitor poll.
+    function refreshLedgerInboxBadge() {
+        if (!root.agenda) return false;
+        try {
+            if (typeof root.agenda.refreshLedgerInboxBadge === "function") return !!root.agenda.refreshLedgerInboxBadge();
+            return false;
+        } catch (error) {
             return false;
         }
-        let generation = root.launchGeneration;
-        let applied = root.finishCurrentProject(code, output, generation);
-        root._launched = false;
-        root._started = false;
-        root.launchGeneration = -1;
-        return applied;
-    }
-
-    // Failed-start reconciliation (thin onRunningChanged delegates here).
-    // A helper that never starts (missing binary) emits no exited, so
-    // running going false without started is the only signal. Uses the
-    // frozen launchGeneration like the exit path; a retiring window owns
-    // reconciliation instead (timeout already cleared the identity).
-    function handleCurrentProjectRunningChanged() {
-        if (currentProjectProcess.running) return false;
-        if (!root._launched || root._started) return false;
-        projectWatchdog.stop();
-        projectKillTimer.stop();
-        if (root.retiring) {
-            root._launched = false;
-            root.launchGeneration = -1;
-            root.retiring = false;
-            return false;
-        }
-        let generation = root.launchGeneration;
-        let applied = root.finishCurrentProject(1, "", generation);
-        root._launched = false;
-        root.launchGeneration = -1;
-        return applied;
     }
 
     // Navigation target: the stable id only when a valid project is held;
@@ -197,53 +149,24 @@ Item {
         return target;
     }
 
-    // Serialized poll: never overlap a running helper, a retiring one, or
-    // the runningChanged-before-exited window (running already reads false
-    // there while _launched is still set, so running alone is not enough).
-    function refreshCurrentProject() {
-        if (currentProjectProcess.running || root.retiring || root._launched) return false;
-        root.currentGeneration = Number(root.currentGeneration) + 1;
-        root.launchGeneration = Number(root.currentGeneration);
-        root._launched = true;
-        root._started = false;
-        currentProjectProcess.command = ["python3", Quickshell.shellPath("scripts/desktop_projects.py"), "current-project"];
-        projectWatchdog.restart();
-        currentProjectProcess.running = true;
-        return true;
+    // Click gate: a valid held project opens the compact overview popup
+    // anchored to the tray button; anything else (no project,
+    // backend-unavailable) falls back to the plain project list with a
+    // blank id, never a stale id.
+    function shouldOpenOverview() {
+        return !!(root.backendOk && root.hasProject && root.projectId !== "");
     }
 
-    // Bounded watchdog: mark retiring, send SIGTERM (asynchronous: the
-    // process may outlive this call), and clear the stale identity now. The
-    // frozen launchGeneration is kept so the late exit recognizes itself
-    // and drops its success; the kill timer escalates if SIGTERM is ignored.
-    function handleCurrentProjectTimeout() {
-        if (!root._launched) {
-            projectWatchdog.stop();
-            return false;
-        }
-        projectWatchdog.stop();
-        root.retiring = true;
-        currentProjectProcess.running = false;
-        projectKillTimer.restart();
-        root.backendOk = false;
-        root.hasProject = false;
-        root.projectId = "";
-        root.projectName = "";
-        root.projectStatus = "";
-        return true;
-    }
-
-    // SIGKILL escalation for a retiring helper that ignored SIGTERM. Owned
-    // process only (Process.signal API, as in ControlCenterSystem); a no-op
-    // once the actual exit has reconciled.
-    function fireCurrentProjectKillTimeout() {
-        if (root.retiring && currentProjectProcess.running) {
+    function activateCurrentProject() {
+        if (root.shouldOpenOverview()) {
             try {
-                currentProjectProcess.signal(9);
+                if (root.overviewPopup && typeof root.overviewPopup.openFor === "function") {
+                    let name = root.projectName !== "" ? root.projectName : root.projectId;
+                    if (root.overviewPopup.openFor(root.projectId, name, projectButton)) return root.projectId;
+                }
             } catch (error) {}
-            return true;
         }
-        return false;
+        return root.openCurrentProject();
     }
 
     // Keyboard-operable tray button (Button, not a MouseArea div): StrongFocus,
@@ -257,10 +180,11 @@ Item {
         focusPolicy: Qt.StrongFocus
         text: root.displayLabel
         Accessible.name: root.displayLabel
+        Accessible.description: root.ledgerInboxBadge > 0 ? root.displayLabel + ", " + root.ledgerInboxBadge + (root.ledgerInboxBadge === 1 ? " session needing attention" : " sessions needing attention") : ""
         ToolTip.text: root.tooltipText
         ToolTip.visible: root.tooltipText !== "" && (hovered || activeFocus)
         ToolTip.delay: 400
-        onClicked: root.openCurrentProject()
+        onClicked: root.activateCurrentProject()
 
         contentItem: Row {
             spacing: 6
@@ -298,55 +222,30 @@ Item {
             }
             Behavior on color { ColorAnimation { duration: Theme.motionFast } }
         }
-    }
 
-    Process {
-        id: currentProjectProcess
-        workingDirectory: Quickshell.shellPath(".")
-        stdinEnabled: false
-        stdout: StdioCollector { id: currentProjectOutput; waitForEnd: true }
-        stderr: StdioCollector { id: currentProjectError; waitForEnd: true }
-        onStarted: {
-            root._started = true;
+        Rectangle {
+            objectName: "currentProjectLedgerBadge"
+            z: 1
+            visible: root.ledgerInboxBadge > 0
+            Accessible.ignored: true
+            height: 14
+            width: Math.max(14, ledgerBadgeText.implicitWidth + 6)
+            radius: Theme.chipRadius
+            color: Theme.accent
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.topMargin: -3
+            anchors.rightMargin: -3
+            Text {
+                id: ledgerBadgeText
+                objectName: "currentProjectLedgerBadgeText"
+                anchors.centerIn: parent
+                text: String(root.ledgerInboxBadge)
+                font.pixelSize: 9
+                font.bold: true
+                color: Theme.base
+                Accessible.ignored: true
+            }
         }
-        onRunningChanged: {
-            root.handleCurrentProjectRunningChanged();
-        }
-        onExited: (code) => {
-            // waitForEnd collectors are complete here: hand the captured
-            // stdout to the completion wrapper, which owns the frozen
-            // launchGeneration. Never re-read the mutable counter here:
-            // after a timeout it no longer identifies this launch.
-            root.handleCurrentProjectExited(code, currentProjectOutput.text);
-        }
     }
-
-    Timer {
-        id: projectPoll
-        objectName: "currentProjectPoll"
-        interval: 3000
-        repeat: true
-        running: true
-        onTriggered: root.refreshCurrentProject()
-    }
-
-    Timer {
-        id: projectWatchdog
-        objectName: "currentProjectWatchdog"
-        interval: 12000
-        repeat: false
-        onTriggered: root.handleCurrentProjectTimeout()
-    }
-
-    // SIGTERM grace: escalate a retiring helper that ignores the watchdog
-    // stop. Stopped by the actual exit (or failed-start) reconciliation.
-    Timer {
-        id: projectKillTimer
-        objectName: "currentProjectKillTimer"
-        interval: 3000
-        repeat: false
-        onTriggered: root.fireCurrentProjectKillTimeout()
-    }
-
-    Component.onCompleted: root.refreshCurrentProject()
 }

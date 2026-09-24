@@ -22,10 +22,10 @@ PanelWindow {
     
     implicitWidth: 350
     implicitHeight: mainLayout.implicitHeight
-    color: "transparent"
+    color: Theme.transparent
     
     // DND: ControlCenter toggles notifServer.inhibit; banners hide while set.
-    // History in NotificationModule still collects independently.
+    // History in NotificationHistory still collects independently.
     readonly property bool inhibited: !!root.notifServer && root.notifServer.inhibit === true
 
     // Make sure we don't block clicks when empty or inhibited
@@ -40,7 +40,7 @@ PanelWindow {
         enabled: !!root.notifServer
         
         function onNotification(n) {
-            // DND suppresses incoming banners; history (NotificationModule)
+            // DND suppresses incoming banners; history (NotificationHistory)
             // is the sole tracking owner and still collects independently.
             if (root.inhibited) return;
             // Check for updates to existing notification
@@ -121,7 +121,7 @@ PanelWindow {
                 Layout.fillWidth: true
                 height: innerLayout.implicitHeight + 24
                 color: Theme.base
-                radius: 12
+                radius: Theme.controlRadius
                  border.color: Theme.border
                 border.width: 1
                 

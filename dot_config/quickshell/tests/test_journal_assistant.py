@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ from unittest import mock
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import journal_assistant
+
+SID = "a" * 32
 
 
 class JournalAssistantTests(unittest.TestCase):
@@ -333,6 +336,285 @@ class JournalAssistantTests(unittest.TestCase):
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+
+class JournalPageTitleTests(unittest.TestCase):
+    def test_examples(self):
+        self.assertEqual(
+            journal_assistant.journal_page_title("2026_09_20"),
+            "Sep 20th, 2026")
+        self.assertEqual(
+            journal_assistant.journal_page_title("2026_01_01"),
+            "Jan 1st, 2026")
+        self.assertEqual(
+            journal_assistant.journal_page_title("2026_01_11"),
+            "Jan 11th, 2026")
+        self.assertEqual(
+            journal_assistant.journal_page_title("2026_01_23"),
+            "Jan 23rd, 2026")
+
+    def test_ordinal_suffixes(self):
+        cases = {
+            "2026_01_01": "Jan 1st, 2026",
+            "2026_01_02": "Jan 2nd, 2026",
+            "2026_01_03": "Jan 3rd, 2026",
+            "2026_01_04": "Jan 4th, 2026",
+            "2026_01_11": "Jan 11th, 2026",
+            "2026_01_12": "Jan 12th, 2026",
+            "2026_01_13": "Jan 13th, 2026",
+            "2026_01_21": "Jan 21st, 2026",
+            "2026_01_22": "Jan 22nd, 2026",
+            "2026_01_23": "Jan 23rd, 2026",
+            "2026_01_24": "Jan 24th, 2026",
+            "2026_01_30": "Jan 30th, 2026",
+            "2026_01_31": "Jan 31st, 2026",
+            "2026_02_20": "Feb 20th, 2026",
+            "2026_12_25": "Dec 25th, 2026",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    journal_assistant.journal_page_title(raw), expected)
+
+    def test_invalid_inputs(self):
+        for bad in ("", None, "2026-09-20", "nope", 123, 20260920,
+                    ["2026_09_20"], "2026_13_01", "2026_02_30",
+                    "2026_9_5", "  ", "2026_09_20\n"):
+            with self.subTest(bad=repr(bad)):
+                self.assertEqual(
+                    journal_assistant.journal_page_title(bad), "")
+
+
+class ThoughtWritePathTests(unittest.TestCase):
+    """Phase 2c §5.3: session-marked thought prepare/append + writeback."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.graph = Path(self.temp.name) / "graph"
+        self.graph.mkdir()
+        (self.graph / "journals").mkdir()
+        self.db = str(Path(self.temp.name) / "annotations.db")
+
+    @property
+    def today(self):
+        return datetime.date.today().strftime("%Y_%m_%d")
+
+    def journal(self):
+        return self.graph / "journals" / (self.today + ".md")
+
+    def test_marker_shape_session_at_ref(self):
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- single writer",
+            session_id=SID, ref="file:///tmp/work.py",
+            at="2026-09-21T09:00")
+        self.assertEqual(
+            prepared["addition"],
+            "- single writer\n"
+            "  quickshell-session:: " + SID + "\n"
+            "  quickshell-at:: 2026-09-21T09:00\n"
+            "  quickshell-ref:: file:///tmp/work.py\n")
+        # Destination is always today's journal.
+        self.assertEqual(prepared["date"], self.today)
+        self.assertEqual(prepared["path"], "journals/" + self.today + ".md")
+
+    def test_markers_precede_existing_children(self):
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing",
+            "- top thought\n  - existing child", session_id=SID)
+        self.assertEqual(
+            prepared["addition"],
+            "- top thought\n"
+            "  quickshell-session:: " + SID + "\n"
+            "  - existing child\n")
+
+    def test_nonbullet_text_gets_flat_markers_never_blocked(self):
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "just words",
+            session_id=SID)
+        self.assertEqual(
+            prepared["addition"],
+            "just words\n  quickshell-session:: " + SID + "\n")
+
+    def test_degraded_no_session_is_byte_identical(self):
+        plain = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- plain thought")
+        self.assertEqual(plain["addition"], "- plain thought\n")
+
+    def test_sensitive_ref_drops_line_keeps_session(self):
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- t", session_id=SID,
+            ref="/home/u/.ssh/id_rsa")
+        self.assertIn("quickshell-session:: " + SID, prepared["addition"])
+        self.assertNotIn("quickshell-ref", prepared["addition"])
+
+    def test_overlong_ref_drops_line(self):
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- t", session_id=SID,
+            ref="x" * 161)
+        self.assertNotIn("quickshell-ref", prepared["addition"])
+
+    def test_malformed_session_and_stamp_fail_closed(self):
+        with self.assertRaises(journal_assistant.GraphError):
+            journal_assistant.prepare(
+                self.graph, self.today, "missing", "- t",
+                session_id="short")
+        with self.assertRaises(journal_assistant.GraphError):
+            journal_assistant.prepare(
+                self.graph, self.today, "missing", "- t",
+                session_id=SID, at="2026-09-21\n09:00")
+        with self.assertRaises(journal_assistant.GraphError):
+            journal_assistant.prepare(
+                self.graph, self.today, "missing", "- t",
+                session_id=SID, ref=123)
+        # Nothing was written.
+        self.assertFalse(self.journal().exists())
+
+    def test_today_only_with_session(self):
+        wrong = (datetime.date.today() -
+                 datetime.timedelta(days=1)).strftime("%Y_%m_%d")
+        with self.assertRaises(journal_assistant.GraphError):
+            journal_assistant.prepare(
+                self.graph, wrong, "missing", "- t", session_id=SID)
+
+    def test_append_writes_thought_ref_and_index(self):
+        import annotations
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- organised thought",
+            session_id=SID, ref="file:///tmp/work.py",
+            at="2026-09-21T09:00")
+        result = journal_assistant.append(
+            self.graph, self.today, prepared["revision"],
+            prepared["addition"], session_id=SID,
+            ref="file:///tmp/work.py", at="2026-09-21T09:00", db=self.db)
+        self.assertEqual(result["line"], 1)
+        self.assertEqual(result["thought_ref"],
+                         "journal:" + self.today + ".md:1")
+        conn = annotations.connect(self.db)
+        try:
+            meta = annotations.get_session_meta(conn, SID)
+            self.assertEqual(meta["thought_ref"],
+                             "journal:" + self.today + ".md:1")
+            self.assertEqual(meta["todo_refs"], [])
+            self.assertEqual(meta["refs"], [])
+            self.assertEqual(meta["attended"], 0)
+            rows = conn.execute(
+                "SELECT text, page, line, kind, session_id"
+                " FROM content_index"
+                " WHERE content_index MATCH 'organised'").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("organised thought", rows[0]["text"])
+            self.assertIn("quickshell-session:: " + SID, rows[0]["text"])
+            self.assertEqual(rows[0]["page"], self.today)
+            self.assertEqual(rows[0]["line"], 1)
+            self.assertEqual(rows[0]["kind"], "thought")
+            self.assertEqual(rows[0]["session_id"], SID)
+        finally:
+            conn.close()
+        # Journal holds the exact marker-inclusive block.
+        self.assertIn("quickshell-session:: " + SID,
+                      self.journal().read_text(encoding="utf-8"))
+
+    def test_append_without_session_touches_no_sidecar(self):
+        import annotations
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- plain")
+        result = journal_assistant.append(
+            self.graph, self.today, prepared["revision"],
+            prepared["addition"], db=self.db)
+        self.assertEqual(result["thought_ref"], "")
+        self.assertFalse(Path(self.db).exists())
+
+    def test_append_rejects_marker_mismatch(self):
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- plain")
+        with self.assertRaises(journal_assistant.GraphError):
+            journal_assistant.append(
+                self.graph, self.today, prepared["revision"],
+                prepared["addition"], session_id=SID, db=self.db)
+        # Journal unchanged (still missing).
+        self.assertFalse(self.journal().exists())
+
+    def test_append_overwrites_thought_ref_on_second_save(self):
+        import annotations
+        first = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- first",
+            session_id=SID)
+        journal_assistant.append(
+            self.graph, self.today, first["revision"], first["addition"],
+            session_id=SID, db=self.db)
+        current = journal_assistant.context(self.graph)
+        second = journal_assistant.prepare(
+            self.graph, self.today, current["revision"], "- second",
+            session_id=SID)
+        result = journal_assistant.append(
+            self.graph, self.today, second["revision"],
+            second["addition"], session_id=SID, db=self.db)
+        conn = annotations.connect(self.db)
+        try:
+            meta = annotations.get_session_meta(conn, SID)
+            self.assertEqual(meta["thought_ref"],
+                             "journal:" + self.today + ".md:"
+                             + str(result["line"]))
+        finally:
+            conn.close()
+
+    def test_append_sidecar_failure_reports_saved_link_failed(self):
+        import annotations
+        prepared = journal_assistant.prepare(
+            self.graph, self.today, "missing", "- doomed link",
+            session_id=SID)
+        # The journal write lands; the link fails with a message that
+        # says so (no silent retry trap that would duplicate the thought).
+        with mock.patch.object(
+                annotations, "connect",
+                side_effect=annotations.AnnotationsError(
+                    "database is unavailable")):
+            with self.assertRaises(journal_assistant.GraphError) as ctx:
+                journal_assistant.append(
+                    self.graph, self.today, prepared["revision"],
+                    prepared["addition"], session_id=SID, db=self.db)
+        self.assertIn("thought saved; session link failed",
+                      str(ctx.exception))
+        self.assertIn("doomed link",
+                      self.journal().read_text(encoding="utf-8"))
+
+    def test_cli_prepare_append_roundtrip_with_session(self):
+        script = str(ROOT / "scripts" / "journal_assistant.py")
+
+        def run(command, payload, extra=()):
+            return subprocess.run(
+                [sys.executable, script, "--graph", str(self.graph),
+                 "--db", self.db, command, *extra],
+                input=json.dumps(payload), text=True, capture_output=True,
+                check=False, timeout=30)
+
+        prepped = run("prepare", {"date": self.today,
+                                  "revision": "missing",
+                                  "text": "- cli thought",
+                                  "session_id": SID,
+                                  "ref": "file:///tmp/cli.py",
+                                  "at": "2026-09-21T09:00"})
+        self.assertEqual(prepped.returncode, 0, prepped.stderr)
+        prepared = json.loads(prepped.stdout)
+        self.assertIn("quickshell-session:: " + SID, prepared["addition"])
+        applied = run("append", {"date": self.today,
+                                 "revision": prepared["revision"],
+                                 "addition": prepared["addition"],
+                                 "session_id": SID,
+                                 "ref": "file:///tmp/cli.py",
+                                 "at": "2026-09-21T09:00"})
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        result = json.loads(applied.stdout)
+        self.assertEqual(result["thought_ref"],
+                         "journal:" + self.today + ".md:1")
+        # Malformed session id fails closed with a single bounded line.
+        bad = run("prepare", {"date": self.today, "revision": "missing",
+                              "text": "- x", "session_id": "nope"})
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("error:", bad.stderr)
+        self.assertNotIn("Traceback", bad.stderr)
+        self.assertEqual(bad.stdout, "")
 
 
 if __name__ == "__main__":

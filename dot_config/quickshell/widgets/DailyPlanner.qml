@@ -1,18 +1,56 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
 import "../theme"
 
 // Reusable daily-planner UI bound to a shared DailyAgenda state object.
 // Used both by the clock CalendarPopout and the ProjectPlanner Daily tab,
 // so the date, drafts, and Pomodoro stay identical in both surfaces.
+//
+// Card set per host (§6.3): `compact` renders the slim popout set (month
+// grid, Scheduled, picker, Pomodoro, quick-add); the full planner Daily
+// tab additionally shows Captured, Review, and SessionCard.
 ColumnLayout {
     id: root
 
     property var agenda: null
+    property bool compact: false
     property string pickerFilter: ""
     property int viewYear: 2026
     property int viewMonth: 8
+    // Quick-add TODO state (compact popout only, §6.3): bare `todo:`
+    // input routing into the current project page, else today's journal,
+    // via prepare → exact preview → Confirm. No silent writes; the write
+    // lands only on Confirm. Provenance is degraded to a bare block
+    // (no quickshell-session::/quickshell-ref::): this surface has no
+    // ambient block, and the palette owns the session-scoped flow.
+    property string quickText: ""
+    property string quickRequestText: ""
+    property string quickTarget: ""
+    property string quickTargetName: ""
+    property string quickPreview: ""
+    property string quickRevision: ""
+    property string quickContent: ""
+    property string quickPath: ""
+    property string quickProjectId: ""
+    property string quickDate: ""
+    property string quickAddition: ""
+    property bool quickBusy: false
+    property bool quickConfirming: false
+    property bool quickApplying: false
+    property bool quickStarted: false
+    property bool quickStartFailed: false
+    property string quickError: ""
+    property string quickNotice: ""
+    property string quickApplyError: ""
+    property int quickGeneration: 0
+    property int quickProcessGeneration: 0
+    property string quickStage: ""
+    property var quickPayload: null
+
+    signal projectPlanningRequested(string projectId, string action, string message)
 
     spacing: 10
 
@@ -49,7 +87,332 @@ ColumnLayout {
 
     Component.onCompleted: root.syncViewToDate()
 
-    // Header: title + selected day + reload.
+    // ---- Quick-add TODO (§6.3, §8.2) ----
+    //
+    // One serialized Process across the read stages (project/page/context/
+    // prepare) plus the apply stage. List-form argv, shell=False (QML
+    // Process), 12 s watchdog on reads; the apply write is never killed
+    // on timeout (it may already have committed), only warned — the
+    // planner toggle precedent.
+    function quickSingleLineError(stderrText, fallback) {
+        try {
+            let raw = String(stderrText || "")
+            let first = raw.split("\n")[0] || ""
+            first = first.replace(/^error:\s*/, "").trim()
+            if (first) return first.substring(0, 160)
+        } catch (error) {}
+        return fallback
+    }
+
+    function quickValidRevision(value) {
+        try {
+            if (typeof value === "string" && /^[0-9a-f]{64}$/i.test(value)) return value
+            if (value === "missing") return value
+        } catch (error) {}
+        return ""
+    }
+
+    function quickComposePageBlock(text) {
+        return "- TODO " + String(text || "").trim()
+    }
+
+    function quickBegin() {
+        if (root.quickBusy) { root.quickError = "Preparing TODO…"; return false }
+        // An armed preview needs its explicit Confirm button: Enter
+        // never confirms.
+        if (root.quickConfirming) return false
+        let text = ""
+        try {
+            text = String(quickAddField.text || "").trim()
+        } catch (error) {
+            text = ""
+        }
+        if (!text) { root.quickError = "Type a TODO first"; return false }
+        if (text.length > 2000) { root.quickError = "TODO is too long"; return false }
+        root.quickText = text
+        root.quickRequestText = text
+        root.quickTarget = ""
+        root.quickTargetName = ""
+        root.quickPreview = ""
+        root.quickRevision = ""
+        root.quickContent = ""
+        root.quickPath = ""
+        root.quickProjectId = ""
+        root.quickDate = ""
+        root.quickAddition = ""
+        root.quickError = ""
+        root.quickApplyError = ""
+        return root.quickLaunch("project",
+            ["python3", Quickshell.shellPath("scripts/desktop_projects.py"), "current-project"],
+            null)
+    }
+
+    function quickLaunch(stage, argv, payload) {
+        if (quickProcess.running) { root.quickError = "Preparing TODO…"; return false }
+        root.quickGeneration++
+        root.quickProcessGeneration = root.quickGeneration
+        root.quickStage = String(stage || "")
+        root.quickPayload = (payload === undefined) ? null : payload
+        root.quickBusy = true
+        if (String(stage || "") !== "apply") root.quickApplying = false
+        else root.quickApplying = true
+        root.quickError = ""
+        quickProcess.command = argv
+        quickProcess.stdinEnabled = (payload !== null && payload !== undefined)
+        quickWatchdog.restart()
+        quickProcess.running = true
+        return true
+    }
+
+    function finishQuickStage(code, output, stderrText, generation, stage) {
+        if (generation !== root.quickProcessGeneration || stage !== root.quickStage) return false
+        root.quickBusy = false
+        root.quickApplying = false
+        quickWatchdog.stop()
+        // A changed input invalidates the in-flight prepare: the preview
+        // belongs to the old text. Apply is exempt — it writes the
+        // confirmed snapshot.
+        if (stage !== "apply") {
+            let current = ""
+            try {
+                current = String(quickAddField.text || "").trim()
+            } catch (error) {
+                current = ""
+            }
+            if (current !== root.quickRequestText) return false
+        }
+        if (stage === "project") {
+            if (code !== 0) {
+                root.quickError = root.quickSingleLineError(stderrText, "Project lookup failed")
+                return false
+            }
+            let payload = null
+            try {
+                payload = JSON.parse(output || "{}")
+            } catch (error) {
+                payload = null
+            }
+            if (!payload || typeof payload !== "object") {
+                root.quickError = "Project lookup returned invalid data"
+                return false
+            }
+            let project = (payload.project && typeof payload.project === "object") ? payload.project : null
+            if (project && project.id && payload.has_logseq_linkage === true) {
+                root.quickProjectId = String(project.id)
+                try {
+                    if (typeof project.name === "string" && project.name.trim())
+                        root.quickTargetName = project.name.trim().substring(0, 80)
+                } catch (error) {}
+                return root.quickLaunch("page",
+                    ["python3", Quickshell.shellPath("scripts/project_planner.py"), "page"],
+                    ({ project_id: String(project.id) }))
+            }
+            return root.quickLaunch("context",
+                ["python3", Quickshell.shellPath("scripts/journal_assistant.py"), "context"],
+                ({ query: "" }))
+        }
+        if (stage === "page") {
+            if (code !== 0) {
+                root.quickError = root.quickSingleLineError(stderrText, "Project page is unavailable")
+                return false
+            }
+            let page = null
+            try {
+                page = JSON.parse(output || "{}")
+            } catch (error) {
+                page = null
+            }
+            let revision = page ? root.quickValidRevision(page.revision) : ""
+            let content = (page && typeof page.content === "string") ? page.content : null
+            let path = (page && typeof page.path === "string") ? page.path : ""
+            if (!page || !revision || content === null || !path) {
+                root.quickError = "Project page returned invalid data"
+                return false
+            }
+            let block = root.quickComposePageBlock(root.quickText)
+            let separator = (!content || content[content.length - 1] === "\n") ? "" : "\n"
+            let composed = content + separator + block + "\n"
+            if (composed.length > 128 * 1024) {
+                root.quickError = "Project page would be too large"
+                return false
+            }
+            root.quickTarget = "page"
+            if (!root.quickTargetName) root.quickTargetName = "project page"
+            root.quickPath = path
+            root.quickRevision = revision
+            root.quickContent = composed
+            root.quickPreview = block
+            root.quickConfirming = true
+            root.quickError = ""
+            return true
+        }
+        if (stage === "context") {
+            if (code !== 0) {
+                root.quickError = root.quickSingleLineError(stderrText, "Journal is unavailable")
+                return false
+            }
+            let context = null
+            try {
+                context = JSON.parse(output || "{}")
+            } catch (error) {
+                context = null
+            }
+            let date = (context && typeof context.date === "string") ? context.date : ""
+            let revision = context ? root.quickValidRevision(context.revision) : ""
+            if (!context || !/^\d{4}_\d{2}_\d{2}$/.test(date) || !revision) {
+                root.quickError = "Journal returned invalid data"
+                return false
+            }
+            root.quickDate = date
+            root.quickRevision = revision
+            return root.quickLaunch("prepare",
+                ["python3", Quickshell.shellPath("scripts/journal_assistant.py"), "prepare"],
+                ({ date: date, revision: revision, text: "- TODO " + root.quickText }))
+        }
+        if (stage === "prepare") {
+            if (code !== 0) {
+                root.quickError = root.quickSingleLineError(stderrText, "Journal prepare failed")
+                return false
+            }
+            let prepared = null
+            try {
+                prepared = JSON.parse(output || "{}")
+            } catch (error) {
+                prepared = null
+            }
+            let addition = (prepared && typeof prepared.addition === "string") ? prepared.addition : ""
+            let revision = prepared ? root.quickValidRevision(prepared.revision) : ""
+            if (!prepared || !addition || !revision) {
+                root.quickError = "Journal prepare returned invalid data"
+                return false
+            }
+            root.quickTarget = "journal"
+            root.quickTargetName = "journal " + root.quickDate
+            root.quickRevision = revision
+            root.quickAddition = addition
+            root.quickPreview = addition
+            root.quickConfirming = true
+            root.quickError = ""
+            return true
+        }
+        if (stage === "apply") {
+            if (code !== 0) {
+                let message = root.quickSingleLineError(stderrText, "TODO write failed")
+                if (/stale|revision|changed/i.test(message)) {
+                    // Revision recheck fired: drop the preview so Enter
+                    // re-prepares against the fresh revision.
+                    root.quickConfirming = false
+                    root.quickApplyError = ""
+                    root.quickError = "Page changed; press Enter to retry"
+                } else {
+                    root.quickApplyError = message
+                }
+                return false
+            }
+            let targetName = root.quickTargetName || (root.quickTarget === "journal" ? "today's journal" : "project page")
+            root.quickConfirming = false
+            root.quickApplyError = ""
+            root.quickNotice = "TODO added to " + targetName
+            try {
+                quickAddField.text = ""
+            } catch (error) {}
+            root.quickText = ""
+            root.quickRequestText = ""
+            // Serial entry: stay open with a cleared input. Refresh the
+            // picker so the new open task appears.
+            if (root.agenda && !root.agenda.agendaBusy && !root.agenda.completionSaving) {
+                try {
+                    root.agenda.reload()
+                } catch (error) {}
+            }
+            return true
+        }
+        return false
+    }
+
+    function quickConfirmApply() {
+        if (!root.quickConfirming || root.quickBusy) return false
+        let current = ""
+        try {
+            current = String(quickAddField.text || "").trim()
+        } catch (error) {
+            current = ""
+        }
+        // Exact-preview discipline: the confirmed text must still match
+        // the input; a changed input needs a fresh prepare.
+        if (current !== root.quickRequestText) {
+            root.quickConfirming = false
+            root.quickError = "Text changed; press Enter to prepare again"
+            return false
+        }
+        if (root.quickTarget === "page") {
+            if (!root.quickProjectId || !root.quickRevision || !root.quickContent) {
+                root.quickConfirming = false
+                root.quickError = "Preview expired; press Enter to prepare again"
+                return false
+            }
+            return root.quickLaunch("apply",
+                ["python3", Quickshell.shellPath("scripts/project_planner.py"), "update"],
+                ({ project_id: root.quickProjectId, revision: root.quickRevision,
+                   content: root.quickContent }))
+        }
+        if (root.quickTarget === "journal") {
+            if (!root.quickDate || !root.quickRevision || !root.quickAddition) {
+                root.quickConfirming = false
+                root.quickError = "Preview expired; press Enter to prepare again"
+                return false
+            }
+            return root.quickLaunch("apply",
+                ["python3", Quickshell.shellPath("scripts/journal_assistant.py"), "append"],
+                ({ date: root.quickDate, revision: root.quickRevision,
+                   addition: root.quickAddition }))
+        }
+        root.quickConfirming = false
+        return false
+    }
+
+    function quickCancelConfirm() {
+        root.quickConfirming = false
+        root.quickApplyError = ""
+        try {
+            quickAddField.forceActiveFocus()
+        } catch (error) {}
+    }
+
+    function cancelQuickStage() {
+        if (!root.quickBusy) return false
+        if (root.quickStage === "apply") {
+            // A write is never killed on a wall-clock timeout: it may
+            // already have committed. Warn and keep waiting for the
+            // authoritative helper response.
+            root.quickApplyError = "TODO write is taking longer than expected; it will not be cancelled."
+            return false
+        }
+        root.quickBusy = false
+        root.quickGeneration++
+        if (quickProcess.running) {
+            try {
+                quickProcess.running = false
+            } catch (error) {}
+        }
+        root.quickError = "TODO prepare timed out; retry"
+        return true
+    }
+
+    function handleQuickRunningChanged() {
+        if (quickProcess.running) return false
+        if (!root.quickBusy || root.quickStarted) return false
+        quickWatchdog.stop()
+        root.quickBusy = false
+        root.quickApplying = false
+        root.quickStarted = false
+        root.quickError = "TODO helper failed to start"
+        return true
+    }
+
+    // Header: title + selected day + refresh. Card header rule (P4):
+    // Theme.text bold title, optional date context, actions as
+    // WidgetButtons showing Loading… while busy.
     RowLayout {
         Layout.fillWidth: true
         spacing: 8
@@ -70,9 +433,9 @@ ColumnLayout {
             font.pixelSize: 12
         }
         WidgetButton {
-            text: root.agenda && root.agenda.agendaBusy ? "Loading…" : "Reload"
+            text: root.agenda && root.agenda.agendaBusy ? "Loading…" : "Refresh"
             enabled: !!root.agenda && !root.agenda.agendaBusy && !root.agenda.agendaRetiring && !root.agenda.completionSaving
-            Accessible.name: "Reload daily agenda"
+            Accessible.name: "Refresh daily agenda"
             onClicked: root.agenda.reload()
         }
     }
@@ -314,7 +677,7 @@ ColumnLayout {
                 anchors.margins: 8
                 spacing: 8
                 Rectangle {
-                    width: 22; height: 22; radius: 6
+                    width: 22; height: 22; radius: Theme.chipRadius
                     color: modelData.done ? Theme.accent : Theme.mantle
                     border.color: modelData.done ? Theme.accent : Theme.subtext0
                     Text { anchors.centerIn: parent; text: modelData.done ? "✓" : ""; color: Theme.bg; font.bold: true }
@@ -451,7 +814,7 @@ ColumnLayout {
             }
             Text {
                 visible: !!root.agenda && root.agenda.completionTask !== null && root.agenda.isCompletionStale()
-                text: "The page changed elsewhere. Reload, then press Reselect on the current task below — your note is preserved."
+                text: "The page changed elsewhere. Refresh, then press Reselect on the current task below — your note is preserved."
                 color: Theme.subtext1
                 font.family: Theme.fontFamily
                 wrapMode: Text.Wrap
@@ -476,6 +839,30 @@ ColumnLayout {
                 }
             }
         }
+    }
+
+    // Captured inbox (planner Daily tab only, §6.3: hidden in the
+    // compact CalendarPopout; the full card set lives in one component
+    // and differs by the compact flag).
+    CaptureInbox {
+        Layout.fillWidth: true
+        visible: !root.compact && root.agenda !== null
+        agenda: root.agenda
+    }
+
+    // Evening review / morning plan (planner Daily tab only, §6.3).
+    ReviewCard {
+        Layout.fillWidth: true
+        visible: !root.compact && root.agenda !== null
+        agenda: root.agenda
+    }
+
+    // Session card (planner Daily tab only, §6.3).
+    SessionCard {
+        Layout.fillWidth: true
+        visible: !root.compact && root.agenda !== null
+        agenda: root.agenda
+        onOpenProjectRequested: (projectId) => root.projectPlanningRequested(projectId, "", "")
     }
 
     // Picker: all open project tasks + search.
@@ -579,5 +966,127 @@ ColumnLayout {
         font.family: Theme.fontFamily
         wrapMode: Text.Wrap
         Layout.fillWidth: true
+    }
+
+    // Quick-add TODO (compact CalendarPopout only, §6.3): bare `todo:`
+    // input routing into the current project page, else today's journal.
+    // Prepare → exact preview → Confirm; the write lands only on
+    // Confirm. Enter starts prepare, never confirms.
+    Text {
+        visible: root.compact
+        text: "Quick-add TODO"
+        color: Theme.accentMuted
+        font.family: Theme.fontFamily
+        font.bold: true
+        Layout.fillWidth: true
+    }
+
+    RowLayout {
+        visible: root.compact
+        Layout.fillWidth: true
+        spacing: 8
+        TextField {
+            id: quickAddField
+            Layout.fillWidth: true
+            placeholderText: "todo: Type a TODO · Enter previews"
+            color: Theme.text
+            font.family: Theme.fontFamily
+            placeholderTextColor: Theme.subtext0
+            Accessible.name: "Quick-add TODO"
+            Accessible.description: "Type a TODO, Enter previews the exact write, Confirm writes it"
+            enabled: !root.quickBusy
+            onAccepted: root.quickBegin()
+            background: Rectangle { color: Theme.base; radius: Theme.controlRadius; border.color: quickAddField.activeFocus ? Theme.focusBorder : Theme.border }
+        }
+        WidgetButton {
+            text: root.quickBusy ? "Preparing…" : "Add"
+            enabled: !root.quickBusy && !root.quickConfirming && String(quickAddField.text || "").trim() !== ""
+            Accessible.name: "Preview quick-add TODO"
+            onClicked: root.quickBegin()
+        }
+    }
+
+    Text {
+        visible: root.compact && root.quickError !== ""
+        text: String(root.quickError)
+        color: Theme.red
+        font.family: Theme.fontFamily
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
+    }
+
+    Text {
+        visible: root.compact && root.quickNotice !== "" && root.quickError === ""
+        text: String(root.quickNotice)
+        color: Theme.subtext1
+        font.family: Theme.fontFamily
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
+    }
+
+    PreviewPanel {
+        visible: root.compact && root.quickConfirming
+        destinationText: String(root.quickTargetName || "")
+        bodyText: String(root.quickPreview || "")
+        bodyAccessibleName: "Quick-add TODO preview"
+        bodyObjectName: "quickAddPreview"
+        applying: root.quickApplying
+        applyError: String(root.quickApplyError || "")
+        confirmEnabled: root.quickConfirming && !root.quickBusy
+        confirmObjectName: "quickAddConfirm"
+        cancelObjectName: "quickAddCancel"
+        confirmAccessibleName: "Confirm TODO quick-add"
+        cancelAccessibleName: "Cancel TODO quick-add"
+        onConfirmRequested: root.quickConfirmApply()
+        onCancelRequested: root.quickCancelConfirm()
+    }
+
+    // Quick-add backend: one serialized Process across the read stages
+    // plus the apply stage. List-form argv,
+    // workingDirectory shellPath("."), 12 s watchdog; the apply write is
+    // never killed on timeout (warn-only). Stdin JSON is written
+    // onStarted, then closed.
+    Process {
+        id: quickProcess
+        workingDirectory: Quickshell.shellPath(".")
+        stdinEnabled: false
+        stdout: StdioCollector { id: quickOutput; waitForEnd: true }
+        stderr: StdioCollector { id: quickErrorOut; waitForEnd: true }
+        onStarted: {
+            root.quickStarted = true
+            if (root.quickPayload !== null && root.quickPayload !== undefined) {
+                try {
+                    quickProcess.write(JSON.stringify(root.quickPayload) + "\n")
+                } catch (error) {}
+            }
+            try {
+                if (quickProcess.closeWriteChannel) quickProcess.closeWriteChannel()
+            } catch (error) {}
+            quickProcess.stdinEnabled = false
+        }
+        onRunningChanged: root.handleQuickRunningChanged()
+        onExited: (code) => {
+            let failed = root.quickStartFailed
+            let generation = root.quickProcessGeneration
+            let stage = root.quickStage
+            root.quickStarted = false
+            root.quickStartFailed = false
+            if (failed) {
+                quickWatchdog.stop()
+                root.quickBusy = false
+                root.quickApplying = false
+                root.quickError = "TODO helper failed to start"
+            } else {
+                root.finishQuickStage(code, quickOutput.text, quickErrorOut.text, generation, stage)
+            }
+        }
+    }
+
+    Timer {
+        id: quickWatchdog
+        interval: 12000
+        repeat: false
+        onTriggered: root.cancelQuickStage()
     }
 }

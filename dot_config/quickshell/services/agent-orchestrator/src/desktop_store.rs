@@ -369,6 +369,21 @@ pub fn normalize_project_id(id: &str) -> Result<String, StoreError> {
     Ok(id.to_lowercase())
 }
 
+/// Outcome of one successful append: the row id plus the immutable
+/// session assignment decided inside the same transaction.
+///
+/// `is_new_session` is true exactly when this event created its session
+/// (baseline capture must run immediately at this observation).
+/// `session_id` is the 32-hex session; `project_id` is the normalized
+/// lowercase UUID or `None` for unresolved sessions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendOutcome {
+    pub row_id: i64,
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub is_new_session: bool,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     InvalidArgument(String),
@@ -1867,6 +1882,21 @@ impl ActivityStore {
         source: &str,
         ctx: &DesktopContext,
     ) -> Result<i64, StoreError> {
+        self.append_with_outcome(kind, source, ctx)
+            .map(|o| o.row_id)
+    }
+
+    /// Append plus the immutable session assignment decided in the same
+    /// transaction (see [`AppendOutcome`]). Preferred by the collector so the
+    /// change sidecar can observe the assigned session without an extra
+    /// query. Behavior, validation, and atomicity are identical to
+    /// [`ActivityStore::append`].
+    pub fn append_with_outcome(
+        &self,
+        kind: &str,
+        source: &str,
+        ctx: &DesktopContext,
+    ) -> Result<AppendOutcome, StoreError> {
         validate_tag("kind", kind)?;
         validate_tag("source", source)?;
         if ctx.observed_at_ms < 0 {
@@ -1911,7 +1941,7 @@ impl ActivityStore {
         // fast when locked (nothing persisted) and rolls back on drop unless
         // committed.
         let tx = ImmediateTx::begin(&self.conn)?;
-        let res: Result<i64, StoreError> = (|| {
+        let res: Result<(i64, String, Option<String>, bool), StoreError> = (|| {
             // Device provenance (must exist after init).
             let device_id: String = self
                 .conn
@@ -2198,13 +2228,18 @@ impl ActivityStore {
                     )
                     .map_err(|e| StoreError::Sqlite(format!("FTS insert failed: {e}")))?;
             }
-            Ok(row_id)
+            Ok((row_id, session_id, project_id, is_new))
         })();
         match res {
             // The guard rolls back on drop for `Err`; an explicit rollback
             // on COMMIT failure covers a commit that leaves the transaction
             // open (see `ImmediateTx::commit`).
-            Ok(id) => tx.commit().map(|()| id),
+            Ok((row_id, session_id, project_id, is_new_session)) => tx.commit().map(|()| AppendOutcome {
+                row_id,
+                session_id,
+                project_id,
+                is_new_session,
+            }),
             Err(e) => Err(e),
         }
     }

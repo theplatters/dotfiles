@@ -72,10 +72,19 @@ const LAST_GOOD_MAX_ENTRIES: usize = 64;
 /// Bounded subprocess / socket timeouts.
 pub const GIT_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const KITTY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Bounded Okular D-Bus timeouts: per-`busctl` call plus an aggregate budget
+/// across service discovery and per-tab `currentDocument` probes.
+pub const OKULAR_TIMEOUT: Duration = Duration::from_millis(500);
+pub const OKULAR_BUDGET: Duration = Duration::from_millis(1200);
 /// Bounded input sizes.
 pub const MAX_RECORD_FILE_BYTES: u64 = 16 * 1024;
 pub const MAX_KITTY_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_GIT_OUTPUT_BYTES: usize = 8 * 1024;
+/// Bounded Okular D-Bus output (one `currentDocument` reply is a short
+/// `s "..."` string; `list` output is scanned line-wise) and per-tab probe
+/// cap (`/okular`, `/okular2`, ...).
+pub const MAX_OKULAR_OUTPUT_BYTES: usize = 4 * 1024;
+pub const OKULAR_MAX_OBJECTS: u32 = 8;
 pub const MAX_RECORD_FILES: usize = 128;
 pub const MAX_FOREGROUND_ENTRIES: usize = 32;
 
@@ -224,6 +233,15 @@ pub fn enrich_with_env(base: DesktopContext, env: &EnrichmentEnv, now: i64) -> D
             ProviderFresh::Unavailable => ProviderFresh::Unavailable,
             ProviderFresh::Mismatch => ProviderFresh::Mismatch,
         }
+    } else if app.contains("okular") {
+        match okular_fresh(win, now) {
+            ProviderFresh::Value(r) => ProviderFresh::Value(r),
+            // Unreachable bus/service stays transient (serve last-good);
+            // welcome-screen emptiness and ambiguous multi-tab titles are
+            // confirmed no-value outcomes that evict instead of guessing.
+            ProviderFresh::Unavailable => ProviderFresh::Unavailable,
+            ProviderFresh::Mismatch => ProviderFresh::Mismatch,
+        }
     } else {
         return base;
     };
@@ -304,14 +322,14 @@ fn peek_scoped_neovim(
         if e.resource.adapter != "neovim" {
             return None;
         }
-        if !(e.stored_at_ms > 0 && now >= e.stored_at_ms && now - e.stored_at_ms <= LAST_GOOD_TTL_MS)
+        if !(e.stored_at_ms > 0
+            && now >= e.stored_at_ms
+            && now - e.stored_at_ms <= LAST_GOOD_TTL_MS)
         {
             return None;
         }
         match &e.editor {
-            Some(id)
-                if id.kitty_window_id == kitty_window_id && id.nvim_pid == Some(nvim_pid) =>
-            {
+            Some(id) if id.kitty_window_id == kitty_window_id && id.nvim_pid == Some(nvim_pid) => {
                 Some(e.resource.clone())
             }
             _ => None,
@@ -379,12 +397,17 @@ fn apply_last_good(
                 // from the cache rather than resolved now. Carried fields
                 // never renew timestamps (no indefinite TTL refresh).
                 let mut carried = false;
-                let mut git_at = if r.git_branch.is_some() { Some(now) } else { None };
+                let mut git_at = if r.git_branch.is_some() {
+                    Some(now)
+                } else {
+                    None
+                };
                 if !git_confirmed_absent && r.git_branch.is_none() {
                     if let Some(cached) = store.get(key) {
-                        let git_ok = cached.git_at_ms.map(|g| {
-                            g > 0 && now >= g && now - g <= LAST_GOOD_TTL_MS
-                        }) == Some(true);
+                        let git_ok = cached
+                            .git_at_ms
+                            .map(|g| g > 0 && now >= g && now - g <= LAST_GOOD_TTL_MS)
+                            == Some(true);
                         let anchor_same = cached.resource.file == r.file
                             && cached.resource.cwd == r.cwd
                             && cached.resource.url == r.url
@@ -394,8 +417,7 @@ fn apply_last_good(
                                 r.git_root = cached.resource.git_root.clone();
                                 carried = true;
                             }
-                            if r.git_branch.is_none() && r.git_root == cached.resource.git_root
-                            {
+                            if r.git_branch.is_none() && r.git_root == cached.resource.git_root {
                                 r.git_branch = cached.resource.git_branch.clone();
                                 carried = true;
                             }
@@ -615,9 +637,8 @@ fn nvim_runtime_dir(env: &EnrichmentEnv) -> Option<PathBuf> {
     if let Some(d) = env.nvim_dir.clone() {
         return Some(d);
     }
-    std::env::var_os("XDG_RUNTIME_DIR").map(|r| {
-        PathBuf::from(r).join("quickshell").join("nvim-context")
-    })
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|r| PathBuf::from(r).join("quickshell").join("nvim-context"))
 }
 
 /// Read + parse at most MAX_RECORD_FILES validated private records.
@@ -1081,10 +1102,7 @@ fn kitty_fresh(
                             None,
                         );
                         if !r.is_empty() {
-                            return (
-                                ProviderFresh::Value(r),
-                                Some(scope(&pane, Some(pid))),
-                            );
+                            return (ProviderFresh::Value(r), Some(scope(&pane, Some(pid))));
                         }
                     }
                     // Same verified pane + editor PID, record missing/stale:
@@ -1094,10 +1112,7 @@ fn kitty_fresh(
                     // noise, never a foreign pane's file).
                     let key = focus_key(win);
                     if peek_scoped_neovim(&key, now, &pane.window_id, pid).is_some() {
-                        return (
-                            ProviderFresh::Unavailable,
-                            Some(scope(&pane, Some(pid))),
-                        );
+                        return (ProviderFresh::Unavailable, Some(scope(&pane, Some(pid))));
                     }
                     evict_last_good(&key);
                 }
@@ -1181,7 +1196,10 @@ fn selected_pane_entries(
         }
         let tabs = os.get("tabs").and_then(|t| t.as_array())?;
         let tab_idx = unique_focused_index(tabs)?;
-        let wins = tabs.get(tab_idx)?.get("windows").and_then(|w| w.as_array())?;
+        let wins = tabs
+            .get(tab_idx)?
+            .get("windows")
+            .and_then(|w| w.as_array())?;
         let win_idx = unique_focused_index(wins)?;
         return Some(foreground_entries(&wins[win_idx]));
     }
@@ -1242,10 +1260,7 @@ fn select_unique_nvim_record(
                 .file
                 .as_deref()
                 .map(|f| f.starts_with('/') && is_safe_path_str(f));
-            let cwd_ok = rec
-                .cwd
-                .as_deref()
-                .map(|c| sanitize_abs_path(c).is_some());
+            let cwd_ok = rec.cwd.as_deref().map(|c| sanitize_abs_path(c).is_some());
             let relative_ok = rec
                 .file
                 .as_deref()
@@ -1294,7 +1309,9 @@ fn nvim_direct_resource(
         return None;
     }
     let rec = matched.into_iter().next().expect("single");
-    let file = rec.file.and_then(|f| resolve_nvim_file(&f, rec.cwd.as_deref()));
+    let file = rec
+        .file
+        .and_then(|f| resolve_nvim_file(&f, rec.cwd.as_deref()));
     let cwd = rec.cwd.and_then(|c| sanitize_abs_path(&c));
     let r = ResourceContext::new(
         "neovim",
@@ -1407,7 +1424,12 @@ pub fn kitty_fs_path(socket: &Path) -> Option<PathBuf> {
 fn kitty_ls_via_socket(socket: &Path) -> Option<String> {
     let fs_path = kitty_fs_path(socket)?;
     let arg = normalize_kitty_socket_arg(&fs_path)?;
-    let out = run_bounded("kitty", &["@", "--to", &arg, "ls"], KITTY_TIMEOUT, MAX_KITTY_OUTPUT_BYTES)?;
+    let out = run_bounded(
+        "kitty",
+        &["@", "--to", &arg, "ls"],
+        KITTY_TIMEOUT,
+        MAX_KITTY_OUTPUT_BYTES,
+    )?;
     if out.trim().is_empty() {
         return None;
     }
@@ -1625,7 +1647,9 @@ fn read_zen_explicit(path: &Path, win: &FocusedWindow, now: i64) -> ZenRead {
 
 /// True for an 8-char Zotero key (`[A-Z0-9]{8}`: item/attachment/collection).
 pub fn is_zotero_key(s: &str) -> bool {
-    s.len() == 8 && s.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    s.len() == 8
+        && s.bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 /// True for a Zotero library id (digit string, `user/"0"` alias allowed).
@@ -1747,7 +1771,9 @@ fn read_zotero_explicit(path: &Path, win: &FocusedWindow, now: i64) -> ZoteroRea
 /// metadata is read: server/library/item/attachment keys, current direct
 /// memberships + ancestor collection keys, version, stable URI. Page numbers,
 /// annotations, and content are never read.
-pub fn parse_zotero_context(obj: &serde_json::Map<String, serde_json::Value>) -> Option<crate::desktop_context::ZoteroContext> {
+pub fn parse_zotero_context(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<crate::desktop_context::ZoteroContext> {
     let server_id = obj.get("server_id")?.as_str()?;
     if !is_zotero_server_id(server_id) {
         return None;
@@ -1817,9 +1843,7 @@ pub fn parse_zotero_context(obj: &serde_json::Map<String, serde_json::Value>) ->
     let uri = match obj.get("zotero_uri").or_else(|| obj.get("uri")) {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
-        Some(serde_json::Value::String(s)) if is_zotero_uri(s) => {
-            Some(s.trim().to_string())
-        }
+        Some(serde_json::Value::String(s)) if is_zotero_uri(s) => Some(s.trim().to_string()),
         // A malformed URI never fails the whole record: identity still binds,
         // display/search just omit the link.
         Some(serde_json::Value::String(_)) => None,
@@ -1905,6 +1929,336 @@ pub fn logseq_page_from_title(title: &str) -> Option<String> {
         return None;
     }
     Some(candidate.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Okular (D-Bus `currentDocument`, per-PID service)
+// ---------------------------------------------------------------------------
+//
+// Okular registers one per-process service on the user bus — natively
+// `org.kde.okular-<PID>` and additionally `org.kde.okular.Instance_<uuid>`
+// (also under Flatpak) — and one object per open tab (`/okular`,
+// `/okular2`, ...) on the `org.kde.okular` interface. Each tab answers
+// `currentDocument` with `s "<abs path>"` (`s ""` on the welcome screen;
+// a missing object/name fails the `busctl` call).
+//
+// Correlation rule: the bus service is bound by the focused compositor
+// client PID (`win.process_id`, Hyprland gives `org.kde.okular`-ish
+// `application` plus the client PID). The direct
+// `org.kde.okular-<pid>` name is tried first; when that fails,
+// `busctl --user list --no-legend` is scanned for `okular` names whose PID
+// column equals the focused PID (covers `Instance_*` and Flatpak).
+// Multi-tab ambiguity resolves to `Mismatch` (evict), never a guess — the
+// same fail-closed contract as the other providers. PDFs are not editor
+// contexts: no `attach_git` is called here; folder matching in the project
+// resolver is the desired association.
+
+// Test seam for `okular_fresh`: canned documents injected by unit and
+// integration tests so no live Okular/`busctl` is needed. `None` (default)
+// means no override — the real D-Bus path runs. `Some(docs)` replays the
+// discovery result verbatim: `Some(vec![...])` is a reached service
+// (possibly empty = welcome screen, confirmed no document) and `None`
+// forces transient unavailability.
+thread_local! {
+    static OKULAR_TEST_DOCS: RefCell<Option<Option<Vec<String>>>> = RefCell::new(None);
+}
+
+/// Inject canned Okular discovery output for the current thread (tests only;
+/// production never calls).
+pub fn set_okular_test_docs(docs: Option<Vec<String>>) {
+    OKULAR_TEST_DOCS.with(|c| *c.borrow_mut() = Some(docs));
+}
+
+/// Clear the injected Okular discovery output (tests only).
+pub fn clear_okular_test_docs() {
+    OKULAR_TEST_DOCS.with(|c| *c.borrow_mut() = None);
+}
+
+fn okular_test_docs() -> Option<Option<Vec<String>>> {
+    OKULAR_TEST_DOCS.with(|c| c.borrow().clone())
+}
+
+/// Parse one `busctl call ... currentDocument` reply (`s "<path>"`).
+/// Returns the sanitized absolute path, or `None` for empty
+/// (`s ""`, welcome screen), relative, or malformed replies.
+pub fn parse_okular_document_reply(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let inner = t.strip_prefix("s \"")?.strip_suffix('"')?;
+    if inner.is_empty() {
+        return None;
+    }
+    if inner.len() > 4096 {
+        return None;
+    }
+    // Unescape the `busctl` string escapes used inside `s "..."`: `\"`
+    // and `\\` (anything else keeps the backslash literally; paths with
+    // NUL/controls are rejected by the sanitizer below).
+    let mut unescaped = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => unescaped.push('"'),
+                Some('\\') => unescaped.push('\\'),
+                Some(other) => {
+                    unescaped.push('\\');
+                    unescaped.push(other);
+                }
+                None => {
+                    unescaped.push('\\');
+                }
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    sanitize_abs_path(&unescaped)
+}
+
+/// Select the Okular bus service for `pid` from `busctl --user list
+/// --no-legend` output. Each line carries the service name in column 0 and
+/// the owning PID in column 1; only `okular` names (case-insensitive) whose
+/// PID column equals `pid` are eligible. The native
+/// `org.kde.okular-<pid>` name wins when present, otherwise the first
+/// `Instance_*`/Flatpak match is used. Returns `None` when nothing matches.
+pub fn select_okular_service(list_output: &str, pid: u32) -> Option<String> {
+    let want = pid.to_string();
+    let native = format!("org.kde.okular-{pid}");
+    let mut fallback: Option<String> = None;
+    for line in list_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let name = match cols.next() {
+            Some(n) => n,
+            None => continue,
+        };
+        let pid_col = match cols.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        if pid_col != want {
+            continue;
+        }
+        if !name.to_lowercase().contains("okular") {
+            continue;
+        }
+        if name.len() > 256 || !is_okular_service_name(name) {
+            continue;
+        }
+        if name == native {
+            return Some(name.to_string());
+        }
+        if fallback.is_none() {
+            fallback = Some(name.to_string());
+        }
+    }
+    fallback
+}
+
+/// D-Bus service-name characters (`[A-Za-z0-9_.-]` plus `:` for the
+/// `busctl` owner-syntax edge); anything else is rejected so list output
+/// can never inject argv surprises.
+fn is_okular_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b':'))
+}
+
+/// File stem (no directory, no extension) used for the multi-tab
+/// title correlation. Returns `None` for empty stems.
+fn okular_stem(path: &str) -> Option<String> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    let t = stem.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// Select the focused document from the discovered tab paths (pure, no I/O).
+/// Exactly one document is used as-is; several resolve through a
+/// case-insensitive file-stem match against the focused window title
+/// (Okular titles look like `<doc title> — Okular`) with exactly one match
+/// winning. Anything else — no document (`s ""` welcome screen), no unique
+/// title match — is `None`: the caller treats it as a confirmed no-value
+/// outcome (evict) and never guesses a tab.
+pub fn select_okular_document(window_title: &str, paths: &[String]) -> Option<String> {
+    let mut uniq: Vec<&String> = Vec::new();
+    for p in paths {
+        if !uniq.contains(&p) {
+            uniq.push(p);
+        }
+    }
+    match uniq.len() {
+        0 => None,
+        1 => Some(uniq.into_iter().next().expect("single").clone()),
+        _ => {
+            let title_lower = window_title.to_lowercase();
+            let mut hits: Vec<String> = Vec::new();
+            for p in uniq {
+                let Some(stem) = okular_stem(p) else {
+                    continue;
+                };
+                let needle = stem.to_lowercase();
+                if needle.is_empty() {
+                    continue;
+                }
+                if title_lower.contains(&needle) {
+                    hits.push(p.clone());
+                }
+            }
+            if hits.len() == 1 {
+                hits.into_iter().next()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Build the Okular file resource for one absolute document path:
+/// `adapter: "okular"`, `file` plus the basename as `title`. Returns
+/// `None` for non-absolute paths.
+pub fn okular_resource_for(path: &str) -> Option<ResourceContext> {
+    let abs = sanitize_abs_path(path)?;
+    let title = Path::new(&abs)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty());
+    let r = ResourceContext::new("okular", Some(&abs), None, None, None, None, None, title);
+    if r.is_empty() {
+        None
+    } else {
+        Some(r)
+    }
+}
+
+/// Map discovered documents to a provider outcome for `win` (pure, no I/O):
+/// a selected document binds as a value; no document (welcome screen) and
+/// ambiguous multi-tab titles are confirmed no-value outcomes that evict
+/// stale last-good entries instead of serving them.
+fn okular_fresh_from_docs(win: &FocusedWindow, docs: Vec<String>) -> ProviderFresh {
+    match select_okular_document(&win.title, &docs) {
+        Some(path) => match okular_resource_for(&path) {
+            Some(r) if !r.is_empty() => ProviderFresh::Value(r),
+            _ => ProviderFresh::Unavailable,
+        },
+        // Empty discovery = welcome screen (`s ""`): confirmed no document.
+        // Non-empty but unselectable = ambiguous tabs: never guess. Both
+        // evict rather than serving a stale/wrong last-good document.
+        None => ProviderFresh::Mismatch,
+    }
+}
+
+/// Okular provider: the focused Okular window binds to the project folder
+/// containing the currently displayed PDF. No PID means instance identity
+/// cannot be established (transient, never a guess); an unreachable
+/// bus/service is transient (`Unavailable`, serve last-good); welcome-screen
+/// emptiness and ambiguous multi-tab titles are confirmed mismatches
+/// (evict, never serve stale). PDFs are not editor contexts, so no
+/// `attach_git` runs here — folder matching is the desired association.
+fn okular_fresh(win: &FocusedWindow, _now: i64) -> ProviderFresh {
+    if let Some(injected) = okular_test_docs() {
+        return match injected {
+            None => ProviderFresh::Unavailable,
+            Some(docs) => okular_fresh_from_docs(win, docs),
+        };
+    }
+    let Some(pid) = win.process_id else {
+        return ProviderFresh::Unavailable;
+    };
+    match okular_documents_with(&busctl_runner, pid) {
+        None => ProviderFresh::Unavailable,
+        Some(docs) => okular_fresh_from_docs(win, docs),
+    }
+}
+
+/// Real `busctl` runner (bounded time/output, argv only, no shell).
+fn busctl_runner(args: &[&str]) -> Option<String> {
+    run_bounded("busctl", args, OKULAR_TIMEOUT, MAX_OKULAR_OUTPUT_BYTES)
+}
+
+/// Discover current documents for `pid` through `runner` (test seam).
+/// `runner` receives `busctl` argv slices (without the binary name):
+/// `["--user", "call", <service>, <object>, "org.kde.okular",
+/// "currentDocument"]` probes and one `["--user", "list", "--no-legend"]`
+/// scan. Returns `None` when the service cannot be reached (transient) and
+/// `Some(docs)` when it was reached — possibly empty (welcome screen,
+/// confirmed no document). Probes stop early on the first unreachable
+/// object and respect the aggregate [`OKULAR_BUDGET`].
+fn okular_documents_with(
+    runner: &dyn Fn(&[&str]) -> Option<String>,
+    pid: u32,
+) -> Option<Vec<String>> {
+    let start = std::time::Instant::now();
+    let direct = format!("org.kde.okular-{pid}");
+    if let Some(docs) = query_okular_service(runner, &direct, &start) {
+        return Some(docs);
+    }
+    if start.elapsed() >= OKULAR_BUDGET {
+        return None;
+    }
+    let list = runner(&["--user", "list", "--no-legend"])?;
+    let service = select_okular_service(&list, pid)?;
+    if service == direct {
+        // Already probed above without reaching it; do not loop.
+        return None;
+    }
+    if start.elapsed() >= OKULAR_BUDGET {
+        return None;
+    }
+    query_okular_service(runner, &service, &start)
+}
+
+/// Probe `/okular`, `/okular2`, ... (up to [`OKULAR_MAX_OBJECTS`]) on one
+/// service. Returns `None` when the service/object was never reached and
+/// `Some(docs)` otherwise (deduped absolute paths; empties ignored).
+fn query_okular_service(
+    runner: &dyn Fn(&[&str]) -> Option<String>,
+    service: &str,
+    start: &std::time::Instant,
+) -> Option<Vec<String>> {
+    if service.is_empty() || service.len() > 256 || !is_okular_service_name(service) {
+        return None;
+    }
+    let mut docs: Vec<String> = Vec::new();
+    let mut reached = false;
+    for i in 0..OKULAR_MAX_OBJECTS {
+        if start.elapsed() >= OKULAR_BUDGET {
+            break;
+        }
+        let object = if i == 0 {
+            "/okular".to_string()
+        } else {
+            format!("/okular{}", i + 1)
+        };
+        let Some(raw) = runner(&[
+            "--user",
+            "call",
+            service,
+            &object,
+            "org.kde.okular",
+            "currentDocument",
+        ]) else {
+            // Missing object/name (busctl error): stop probing further tabs.
+            break;
+        };
+        reached = true;
+        if let Some(doc) = parse_okular_document_reply(&raw) {
+            if !docs.contains(&doc) {
+                docs.push(doc);
+            }
+        }
+    }
+    if reached {
+        Some(docs)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,12 +2403,10 @@ fn run_git_captured(args: &[&str]) -> Option<(bool, String, String)> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let (obuf, ebuf, over) =
-                    rx.recv_timeout(Duration::from_millis(200)).unwrap_or_default();
-                if over
-                    || obuf.len() > MAX_GIT_OUTPUT_BYTES
-                    || ebuf.len() > 2048
-                {
+                let (obuf, ebuf, over) = rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .unwrap_or_default();
+                if over || obuf.len() > MAX_GIT_OUTPUT_BYTES || ebuf.len() > 2048 {
                     return None;
                 }
                 let stdout = String::from_utf8(obuf).unwrap_or_default();
@@ -2183,7 +2535,9 @@ fn run_bounded(cmd: &str, args: &[&str], timeout: Duration, max_bytes: usize) ->
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let buf = rx.recv_timeout(Duration::from_millis(200)).unwrap_or_default();
+                let buf = rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .unwrap_or_default();
                 if !status.success() {
                     return None;
                 }
@@ -2294,6 +2648,29 @@ impl ResourceProvider for ZoteroProvider {
     }
 }
 
+/// Okular provider: focused Okular windows only. Binds the focused window
+/// to the currently displayed PDF via the per-PID D-Bus service (no title
+/// guessing on ambiguous multi-tab states).
+pub struct OkularProvider {
+    pub now: i64,
+}
+
+impl ResourceProvider for OkularProvider {
+    fn name(&self) -> &'static str {
+        "okular"
+    }
+    fn enrich(&self, ctx: &DesktopContext) -> Option<ResourceContext> {
+        let win = ctx.focused_window.as_ref()?;
+        if !ctx.available || !win.application.to_lowercase().contains("okular") {
+            return None;
+        }
+        match okular_fresh(win, self.now) {
+            ProviderFresh::Value(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2307,7 +2684,9 @@ mod tests {
         clear_last_good_cache();
         let ctx = DesktopContext::available(
             crate::desktop_context::Source::Hyprland,
-            Some(crate::desktop_context::FocusedWindow::new("0x1", "foot", "shell")),
+            Some(crate::desktop_context::FocusedWindow::new(
+                "0x1", "foot", "shell",
+            )),
             None,
             1,
         );
@@ -2321,7 +2700,11 @@ mod tests {
         clear_last_good_cache();
         let ctx = DesktopContext::available(
             crate::desktop_context::Source::Hyprland,
-            Some(crate::desktop_context::FocusedWindow::new("0x1", "zen", "Example Page — Zen")),
+            Some(crate::desktop_context::FocusedWindow::new(
+                "0x1",
+                "zen",
+                "Example Page — Zen",
+            )),
             None,
             1,
         );
@@ -2337,7 +2720,11 @@ mod tests {
         clear_last_good_cache();
         let ctx = DesktopContext::available(
             crate::desktop_context::Source::Hyprland,
-            Some(crate::desktop_context::FocusedWindow::new("0x1", "Logseq", "My Page - Logseq")),
+            Some(crate::desktop_context::FocusedWindow::new(
+                "0x1",
+                "Logseq",
+                "My Page - Logseq",
+            )),
             None,
             1,
         );
@@ -2427,7 +2814,10 @@ mod tests {
     #[test]
     fn kitty_socket_arg_requires_unix_prefix() {
         let argv = kitty_ls_argv(Path::new("/tmp/kitty.sock")).expect("argv");
-        assert_eq!(argv, vec!["kitty", "@", "--to", "unix:/tmp/kitty.sock", "ls"]);
+        assert_eq!(
+            argv,
+            vec!["kitty", "@", "--to", "unix:/tmp/kitty.sock", "ls"]
+        );
         assert!(normalize_kitty_socket_arg(Path::new("relative.sock")).is_none());
         assert!(normalize_kitty_socket_arg(Path::new("")).is_none());
     }
@@ -2473,7 +2863,10 @@ mod tests {
         // is impossible without `ls`; prime directly at the guard level,
         // then verify a confirmed mismatch evicts instead of serving.
         let key = focus_key(&crate::desktop_context::FocusedWindow::new_with_pid(
-            "0xM", "kitty", "t", Some(111),
+            "0xM",
+            "kitty",
+            "t",
+            Some(111),
         ));
         let primed = ResourceContext::new(
             "kitty",
@@ -2486,7 +2879,13 @@ mod tests {
             None,
         );
         assert_eq!(
-            apply_last_good(&key, ProviderFresh::Value(primed.clone()), 1000, false, None),
+            apply_last_good(
+                &key,
+                ProviderFresh::Value(primed.clone()),
+                1000,
+                false,
+                None
+            ),
             Some(primed.clone())
         );
         // Mismatch (peer belongs to another instance) evicts, returns None.
@@ -2503,7 +2902,8 @@ mod tests {
 
     #[test]
     fn git_nonrepo_is_none() {
-        let dir = std::env::temp_dir().join(format!("qs-norepo-{}-{}", std::process::id(), now_ms()));
+        let dir =
+            std::env::temp_dir().join(format!("qs-norepo-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.to_string_lossy().to_string();
         assert!(git_root_for(&s).is_none());
@@ -2543,7 +2943,13 @@ mod tests {
         );
         // Expired -> None.
         assert_eq!(
-            apply_last_good(&key, ProviderFresh::Unavailable, 1000 + LAST_GOOD_TTL_MS + 1, false, None),
+            apply_last_good(
+                &key,
+                ProviderFresh::Unavailable,
+                1000 + LAST_GOOD_TTL_MS + 1,
+                false,
+                None
+            ),
             None
         );
         // Partial git fill: fresh missing branch, same anchor -> restored.
@@ -2577,9 +2983,8 @@ mod tests {
             "git TTL must expire despite repeated partial resolutions"
         );
         // Confirmed non-repo stores as-is (evicts old git, no fill).
-        let norepo = ResourceContext::new(
-            "kitty", None, Some("/tmp"), None, None, None, None, None,
-        );
+        let norepo =
+            ResourceContext::new("kitty", None, Some("/tmp"), None, None, None, None, None);
         assert_eq!(
             apply_last_good(&key, v(norepo.clone()), 4000, true, None),
             Some(norepo),
@@ -2668,19 +3073,42 @@ mod tests {
     #[test]
     fn refresh_title_fallback_recomputes_only_fallbacks() {
         let zen_old = ResourceContext::new(
-            "zen-title", None, None, None, None, None, None, Some("Old Title"),
+            "zen-title",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("Old Title"),
         );
         // Same fallback kind, new title: recomputed synchronously.
         assert_eq!(
             refresh_title_fallback(&zen_old, "zen", "New Title"),
-            Some(ResourceContext::new(
-                "zen-title", None, None, None, None, None, None, Some("New Title")
-            )
-            .into()),
+            Some(
+                ResourceContext::new(
+                    "zen-title",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("New Title")
+                )
+                .into()
+            ),
             "stale fallback title must refresh, not correct later"
         );
         let log_old = ResourceContext::new(
-            "logseq-title", None, None, None, None, None, Some("Old"), Some("Old - Logseq"),
+            "logseq-title",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("Old"),
+            Some("Old - Logseq"),
         );
         assert_eq!(
             refresh_title_fallback(&log_old, "Logseq", "New - Logseq")
@@ -2694,11 +3122,21 @@ mod tests {
         assert_eq!(refresh_title_fallback(&zen_old, "zen", "   "), Some(None));
         // Non-fallback adapters are not touched: caller carries the overlay.
         let nvim = ResourceContext::new(
-            "neovim", Some("/tmp/a.md"), Some("/tmp"), None, None, None, None, None,
+            "neovim",
+            Some("/tmp/a.md"),
+            Some("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(refresh_title_fallback(&nvim, "kitty", "t"), None);
         // Adapter/app mismatch is not a fallback either.
-        assert_eq!(refresh_title_fallback(&zen_old, "logseq", "New - Logseq"), None);
+        assert_eq!(
+            refresh_title_fallback(&zen_old, "logseq", "New - Logseq"),
+            None
+        );
     }
 
     #[test]
@@ -2750,11 +3188,8 @@ mod tests {
     #[test]
     fn select_kitty_socket_matched_skips_unreachable_first() {
         // Hermetic temp dir only: never bind literal /tmp/kitty-<pid>.
-        let dir = std::env::temp_dir().join(format!(
-            "qs-kitty-sel-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("qs-kitty-sel-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("second.sock");
         let _ = std::fs::remove_file(&sock);
@@ -2782,11 +3217,8 @@ mod tests {
 
     #[test]
     fn select_kitty_socket_mismatch_and_unavailable() {
-        let dir = std::env::temp_dir().join(format!(
-            "qs-kitty-mis-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("qs-kitty-mis-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("only.sock");
         let _ = std::fs::remove_file(&sock);
@@ -2808,8 +3240,16 @@ mod tests {
         let _ = accept.join();
         // Nothing reachable at all: transient unavailability.
         let gone = vec![
-            std::env::temp_dir().join(format!("qs-kitty-gone-a-{}-{}", std::process::id(), now_ms())),
-            std::env::temp_dir().join(format!("qs-kitty-gone-b-{}-{}", std::process::id(), now_ms())),
+            std::env::temp_dir().join(format!(
+                "qs-kitty-gone-a-{}-{}",
+                std::process::id(),
+                now_ms()
+            )),
+            std::env::temp_dir().join(format!(
+                "qs-kitty-gone-b-{}-{}",
+                std::process::id(),
+                now_ms()
+            )),
         ];
         assert_eq!(
             select_kitty_socket(&gone, std::process::id()),
@@ -2862,5 +3302,253 @@ mod tests {
             unique_nvim_presence(&[entry(Some(1), "fish -l")]),
             NvimPresence::Absent
         );
+    }
+
+    #[test]
+    fn okular_reply_parsing() {
+        assert_eq!(
+            parse_okular_document_reply("s \"/home/user/doc.pdf\"").as_deref(),
+            Some("/home/user/doc.pdf")
+        );
+        assert_eq!(
+            parse_okular_document_reply("s \"/home/user/doc.pdf\"\n").as_deref(),
+            Some("/home/user/doc.pdf")
+        );
+        // Welcome screen: empty string is confirmed no document.
+        assert_eq!(parse_okular_document_reply("s \"\""), None);
+        // Malformed / non-absolute replies never bind.
+        assert_eq!(parse_okular_document_reply(""), None);
+        assert_eq!(parse_okular_document_reply("s "), None);
+        assert_eq!(parse_okular_document_reply("relative/doc.pdf"), None);
+        assert_eq!(parse_okular_document_reply("s \"relative/doc.pdf\""), None);
+        assert!(parse_okular_document_reply("Error: no such object").is_none());
+        // Escaped quotes round-trip.
+        assert_eq!(
+            parse_okular_document_reply("s \"/home/user/my\\\"doc.pdf\"").as_deref(),
+            Some("/home/user/my\"doc.pdf")
+        );
+        // NUL / control characters are rejected.
+        assert!(parse_okular_document_reply("s \"/home/user/bad\0.pdf\"").is_none());
+    }
+
+    #[test]
+    fn okular_service_discovery_prefers_native() {
+        let list = [
+            "org.kde.okular-4242 4242 user :1.10 org_kde_okular-4242 - - -",
+            "org.kde.okular.Instance_abc123 4242 user :1.11 - - - -",
+            "org.kde.dolphin-9999 9999 user :1.12 - - - -",
+            "org.kde.okular-7777 7777 user :1.13 - - - -",
+        ]
+        .join("\n");
+        assert_eq!(
+            select_okular_service(&list, 4242).as_deref(),
+            Some("org.kde.okular-4242")
+        );
+        // Instance_* fallback when the native name is absent.
+        let instance_only = "org.kde.okular.Instance_abc123 4242 user :1.11 - - - -\n";
+        assert_eq!(
+            select_okular_service(instance_only, 4242).as_deref(),
+            Some("org.kde.okular.Instance_abc123")
+        );
+        // PID column must match exactly (no substring matching).
+        assert_eq!(select_okular_service(&list, 424), None);
+        assert_eq!(select_okular_service(&list, 9999), None);
+        // Non-okular names never match even with the right PID.
+        let foreign = "org.kde.dolphin-4242 4242 user :1.12 - - - -\n";
+        assert_eq!(select_okular_service(foreign, 4242), None);
+        assert_eq!(select_okular_service("", 4242), None);
+    }
+
+    #[test]
+    fn okular_document_selection_rules() {
+        // Exactly one document wins without consulting the title.
+        let single = vec!["/home/user/doc.pdf".to_string()];
+        assert_eq!(
+            select_okular_document("Welcome — Okular", &single).as_deref(),
+            Some("/home/user/doc.pdf")
+        );
+        // No document (welcome screen) selects nothing.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(select_okular_document("Welcome — Okular", &empty), None);
+        // Multi-tab: unique case-insensitive file-stem match wins.
+        let tabs = vec![
+            "/home/user/alpha.pdf".to_string(),
+            "/home/user/beta.pdf".to_string(),
+        ];
+        assert_eq!(
+            select_okular_document("Beta — Okular", &tabs).as_deref(),
+            Some("/home/user/beta.pdf")
+        );
+        // Ambiguous: no stem in the title — never guess.
+        assert_eq!(select_okular_document("Untitled — Okular", &tabs), None);
+        // Ambiguous: two stems both match — never guess.
+        let overlap = vec![
+            "/home/user/report.pdf".to_string(),
+            "/home/user/report-final.pdf".to_string(),
+        ];
+        // "report" is a substring of both stems? Only exact-substring hits
+        // count: craft titles that contain both stems.
+        assert_eq!(
+            select_okular_document("report report-final — Okular", &overlap),
+            None
+        );
+        // Dedup: same path twice is one document.
+        let dup = vec![
+            "/home/user/doc.pdf".to_string(),
+            "/home/user/doc.pdf".to_string(),
+        ];
+        assert_eq!(
+            select_okular_document("Anything — Okular", &dup).as_deref(),
+            Some("/home/user/doc.pdf")
+        );
+    }
+
+    #[test]
+    fn okular_documents_with_runner_seams() {
+        // Direct native service answers; list is never consulted.
+        let direct = |args: &[&str]| -> Option<String> {
+            assert!(args.contains(&"call"));
+            if args.contains(&"/okular2") {
+                return None;
+            }
+            Some("s \"/home/user/doc.pdf\"".to_string())
+        };
+        assert_eq!(
+            okular_documents_with(&direct, 4242),
+            Some(vec!["/home/user/doc.pdf".to_string()])
+        );
+        // Direct missing, list yields the Instance_* service for our PID.
+        let fallback = |args: &[&str]| -> Option<String> {
+            if args.contains(&"list") {
+                return Some("org.kde.okular.Instance_xyz 4242 user :1.11 - - - -\n".to_string());
+            }
+            if args.contains(&"org.kde.okular-4242") {
+                return None;
+            }
+            if args.contains(&"/okular2") {
+                return None;
+            }
+            Some("s \"/home/user/other.pdf\"".to_string())
+        };
+        assert_eq!(
+            okular_documents_with(&fallback, 4242),
+            Some(vec!["/home/user/other.pdf".to_string()])
+        );
+        // Welcome screen: reached but empty (confirmed no document).
+        let welcome = |args: &[&str]| -> Option<String> {
+            if args.contains(&"list") {
+                return Some(String::new());
+            }
+            if args.contains(&"/okular2") {
+                return None;
+            }
+            Some("s \"\"".to_string())
+        };
+        assert_eq!(okular_documents_with(&welcome, 4242), Some(Vec::new()));
+        // Unreachable service: transient unavailability.
+        let down = |_: &[&str]| -> Option<String> { None };
+        assert_eq!(okular_documents_with(&down, 4242), None);
+    }
+
+    #[test]
+    fn okular_fresh_outcomes_and_windowed_resource() {
+        use crate::desktop_context::FocusedWindow;
+        clear_last_good_cache();
+        clear_okular_test_docs();
+        let win =
+            || FocusedWindow::new_with_pid("0xO", "org.kde.okular", "doc — Okular", Some(4242));
+        // Single injected document binds with adapter + basename title.
+        set_okular_test_docs(Some(vec!["/home/user/doc.pdf".to_string()]));
+        match okular_fresh(&win(), 1_000_000) {
+            ProviderFresh::Value(r) => {
+                assert_eq!(r.adapter, "okular");
+                assert_eq!(r.file.as_deref(), Some("/home/user/doc.pdf"));
+                assert_eq!(r.title.as_deref(), Some("doc.pdf"));
+            }
+            other => panic!("expected value, got {other:?}"),
+        }
+        // Full windowed path yields the same file resource.
+        let ctx = DesktopContext::available(
+            crate::desktop_context::Source::Hyprland,
+            Some(win()),
+            None,
+            1_000_000,
+        );
+        let out = enrich_with_env(ctx, &env_empty(), 1_000_000);
+        let r = out.resource.expect("okular resource");
+        assert_eq!(r.adapter, "okular");
+        assert_eq!(r.file.as_deref(), Some("/home/user/doc.pdf"));
+        // Welcome screen (empty) is a confirmed no-value outcome: evicts.
+        set_okular_test_docs(Some(Vec::new()));
+        assert!(matches!(
+            okular_fresh(&win(), 1_000_100),
+            ProviderFresh::Mismatch
+        ));
+        let key = focus_key(&win());
+        assert_eq!(
+            apply_last_good(
+                &key,
+                okular_fresh(&win(), 1_000_100),
+                1_000_100,
+                false,
+                None
+            ),
+            None,
+            "welcome screen must evict, not serve the previous document"
+        );
+        // Ambiguous multi-tab titles never guess (evict as well).
+        set_okular_test_docs(Some(vec![
+            "/home/user/alpha.pdf".to_string(),
+            "/home/user/beta.pdf".to_string(),
+        ]));
+        let vague =
+            FocusedWindow::new_with_pid("0xO", "org.kde.okular", "Untitled — Okular", Some(4242));
+        assert!(matches!(
+            okular_fresh(&vague, 1_000_200),
+            ProviderFresh::Mismatch
+        ));
+        clear_okular_test_docs();
+        // Transient bus failure stays Unavailable (last-good may serve).
+        assert!(matches!(
+            okular_fresh(&win(), 1_000_300),
+            ProviderFresh::Unavailable
+        ));
+        clear_last_good_cache();
+    }
+
+    #[test]
+    fn okular_branch_ignores_non_okular_apps() {
+        clear_last_good_cache();
+        // Even with injected Okular docs, a non-Okular window is unaffected.
+        set_okular_test_docs(Some(vec!["/home/user/doc.pdf".to_string()]));
+        let ctx = DesktopContext::available(
+            crate::desktop_context::Source::Hyprland,
+            Some(crate::desktop_context::FocusedWindow::new_with_pid(
+                "0x1",
+                "zen",
+                "Example Page — Zen",
+                Some(4242),
+            )),
+            None,
+            1_000_000,
+        );
+        let out = enrich_with_env(ctx, &env_empty(), 1_000_000);
+        let r = out.resource.expect("zen fallback still applies");
+        assert_eq!(r.adapter, "zen-title");
+        // Okular without a PID cannot bind: transient, no fabricated file.
+        clear_okular_test_docs();
+        let nopic = DesktopContext::available(
+            crate::desktop_context::Source::Hyprland,
+            Some(crate::desktop_context::FocusedWindow::new(
+                "0xO",
+                "okular",
+                "doc — Okular",
+            )),
+            None,
+            1_000_000,
+        );
+        let out2 = enrich_with_env(nopic, &env_empty(), 1_000_000);
+        assert_eq!(out2.resource, None);
+        clear_last_good_cache();
     }
 }

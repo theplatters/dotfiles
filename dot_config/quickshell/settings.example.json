@@ -1,3 +1,14 @@
 {
-    "logseqGraph": "/home/user/Nextcloud/Documents/Notes"
+    "logseqGraph": "/home/user/Nextcloud/Documents/Notes",
+    "memory": {
+        "enabled": true,
+        "tickSeconds": 60,
+        "workLog": true,
+        "sessionCapture": true,
+        "dailyReview": true,
+        "organise": false,
+        "minSessionMs": 300000,
+        "reviewTime": "18:00",
+        "morningTime": "07:00"
+    }
 }

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Find files for the command palette without inspecting their contents."""
 
-import argparse
 import json
 import os
 from pathlib import Path
 import sys
 import time
+
+import qscli
 
 
 DEFAULT_LIMIT = 40
@@ -121,34 +122,40 @@ def palette_files(query, root=None, limit=DEFAULT_LIMIT):
     return result[0] if isinstance(result, tuple) else result
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
+def _parse_args(argv):
+    parser = qscli.SafeParser()
     parser.add_argument("--query", required=True)
     parser.add_argument("--root")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    args = parser.parse_args(argv)
-    if args.limit < 0:
-        parser.error("--limit must not be negative")
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    try:
-        result = _search(args.query, args.root, args.limit)
-        # Keep the public function convenient while retaining traversal errors
-        # so the command line can report a partial traversal.
-        if isinstance(result, tuple):
-            payload, errors = result
-        else:
-            payload, errors = result, []
-        print(json.dumps(payload, ensure_ascii=False))
-        if errors:
-            noun = "directory" if len(errors) == 1 else "directories"
-            print(
-                f"warning: could not read {len(errors)} {noun}; results are partial",
-                file=sys.stderr,
-            )
-        return 0
-    except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+
+def _dispatch(args):
+    if args.limit < 0:
+        raise ValueError("--limit must not be negative")
+    result = _search(args.query, args.root, args.limit)
+    # Keep the public function convenient while retaining traversal errors
+    # so the command line can report a partial traversal.
+    if isinstance(result, tuple):
+        payload, errors = result
+    else:
+        payload, errors = result, []
+    if errors:
+        noun = "directory" if len(errors) == 1 else "directories"
+        print(
+            f"warning: could not read {len(errors)} {noun}; results are partial",
+            file=sys.stderr,
+        )
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+_BOUNDED_EXCEPTIONS = (OSError, ValueError)
+
+
+def main(argv=None):
+    return qscli.run_main(_parse_args, _dispatch, "palette files",
+                          _BOUNDED_EXCEPTIONS, argv=argv)
 
 
 if __name__ == "__main__":
