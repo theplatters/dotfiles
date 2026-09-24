@@ -22,17 +22,16 @@ QtObject {
     readonly property color focusBorder: "#33F5F5F5"
     readonly property color accent: "#D6D6D6"
     readonly property color accentMuted: "#969696"
-    // Dim layer behind modal backdrops (palette, planner, capture, password).
+
     readonly property color scrim: "#B0070707"
 
-    // Compatibility aliases for modules that use semantic state colors. They
-    // are intentionally muted so ordinary controls stay monochrome.
     readonly property color red: "#C59D9D"
-    readonly property color teal: "#008080"
-    readonly property color pink: "#ff69b4"
-    readonly property color blue: " #87ceeb "
     readonly property color green: "#A8B6A4"
     readonly property color mauve: "#C8C8C8"
+    readonly property color teal: "#A8B8B8"
+    readonly property color pink: "#BDBDBD"
+    readonly property color blue: "#AAB3BD"
+    readonly property color base3: "#F5F5F5"
 
     readonly property string fontFamily: Qt.fontFamilies().indexOf("Inter") >= 0 ? "Inter" : "Noto Sans"
     readonly property string fallbackFontFamily: "Noto Sans"
